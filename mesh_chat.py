@@ -120,6 +120,7 @@ class IPCClient:
         self._pending: dict[int, asyncio.Future] = {}
         self._req_counter = 0
         self._reader_task: asyncio.Task | None = None
+        self._closing = False
         self.whoami: tuple[str, str] | None = None
         self.whoami_id: int | None = None
 
@@ -143,10 +144,13 @@ class IPCClient:
                     fut = self._pending.pop(obj.get("req_id"), None)
                     if fut and not fut.done():
                         fut.set_result(obj)
+        except asyncio.CancelledError:
+            pass
         except Exception:
             pass
         finally:
-            print_formatted_text(HTML("<ansired>⚠ Соединение с логгером потеряно</ansired>"))
+            if not self._closing:
+                print_formatted_text(HTML("<ansired>⚠ Соединение с логгером потеряно</ansired>"))
 
     async def request(self, cmd: str, timeout: float = 10.0, **fields) -> dict:
         self._req_counter += 1
@@ -163,6 +167,7 @@ class IPCClient:
             return {"ok": False, "error": "timeout"}
 
     async def close(self) -> None:
+        self._closing = True
         if self._reader_task:
             self._reader_task.cancel()
         if self._writer:
