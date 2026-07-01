@@ -1,0 +1,15 @@
+[Unit]
+Description=Meshtastic chat logger
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qeewwu
+WorkingDirectory=/home/qeewwu/Mesh
+ExecStart=/home/qeewwu/Mesh/venv/bin/python3 /home/qeewwu/Mesh/mesh_logger.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
