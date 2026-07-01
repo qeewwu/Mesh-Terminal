@@ -17,6 +17,7 @@ from pubsub import pub
 from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.shortcuts import clear as pt_clear
 
 HOST = "meshtastic.local"
 LOG_FILE = Path("chat.log")
@@ -432,7 +433,7 @@ def _cmd_dm(args: str) -> None:
 
 
 def _cmd_clear() -> None:
-    print("\033[2J\033[H", end="", flush=True)
+    pt_clear()
 
 
 async def _cmd_updatenames() -> None:
