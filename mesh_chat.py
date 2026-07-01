@@ -2,32 +2,24 @@
 
 import asyncio
 import datetime
+import html
 import sys
 from pathlib import Path
 
 import meshtastic.tcp_interface
 from pubsub import pub
-from prompt_toolkit import PromptSession
+from prompt_toolkit import PromptSession, print_formatted_text
+from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.patch_stdout import patch_stdout
 
 HOST = "meshtastic.local"
 LOG_FILE = Path("chat.log")
 
-# ANSI colour codes — work safely with prompt_toolkit's patch_stdout
-DIM    = "\033[2m"
-RESET  = "\033[0m"
-BGREEN = "\033[1;32m"
-GREEN  = "\033[32m"
-BBLUE  = "\033[1;34m"
-BLUE   = "\033[34m"
-RED    = "\033[31m"
-CYAN   = "\033[36m"
-
 _interface = None
+_loop: asyncio.AbstractEventLoop | None = None
 
 
 def _node_names(node_id: int) -> tuple[str, str]:
-    """Return (long_name, short_name) for a node numeric ID."""
     if _interface and _interface.nodes:
         hex_id = f"!{node_id:08x}"
         node = _interface.nodes.get(node_id) or _interface.nodes.get(hex_id)
@@ -37,23 +29,27 @@ def _node_names(node_id: int) -> tuple[str, str]:
     return f"!{node_id:08x}", "???"
 
 
-def _render(time_str: str, long_name: str, short_name: str,
-            text: str, hops: int, own: bool = False) -> str:
-    name_c = BBLUE if own else BGREEN
-    short_c = BLUE if own else GREEN
-    return (
-        f"{DIM}[{time_str}]{RESET} "
-        f"{name_c}{long_name}{RESET} "
-        f"{short_c}({short_name}){RESET}"
-        f": {text} "
-        f"{DIM}| {hops}{RESET}"
-    )
+def _print(time_str: str, long_name: str, short_name: str,
+           text: str, hops: int, own: bool = False) -> None:
+    t  = html.escape(time_str)
+    ln = html.escape(long_name)
+    sn = html.escape(short_name)
+    tx = html.escape(text)
+    name_style  = "bold ansiblue"  if own else "bold ansigreen"
+    short_style = "ansiblue"       if own else "ansigreen"
+    print_formatted_text(HTML(
+        f"<ansiwhite>[{t}]</ansiwhite> "
+        f"<{name_style}>{ln}</{name_style}> "
+        f"<{short_style}>({sn})</{short_style}>"
+        f": {tx} "
+        f"<ansiwhite>| {hops}</ansiwhite>"
+    ))
 
 
-def _log_and_print(line: str, rendered: str) -> None:
+def _log(time_str: str, long_name: str, short_name: str,
+         text: str, hops: int) -> None:
     with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
-    print(rendered)
+        f.write(f"[{time_str}] {long_name} ({short_name}): {text} | {hops}\n")
 
 
 def on_receive(packet, interface):
@@ -62,43 +58,48 @@ def on_receive(packet, interface):
         if decoded.get("portnum") != "TEXT_MESSAGE_APP":
             return
 
-        text = decoded.get("text", "")
-        from_id = packet.get("from", 0)
+        text      = decoded.get("text", "")
+        from_id   = packet.get("from", 0)
         hop_limit = packet.get("hopLimit", 0)
         hop_start = packet.get("hopStart", hop_limit)
-        hops = hop_start - hop_limit
+        hops      = hop_start - hop_limit
 
         long_name, short_name = _node_names(from_id)
         now = datetime.datetime.now().strftime("%H:%M:%S")
 
-        log_line = f"[{now}] {long_name} ({short_name}): {text} | {hops}"
-        rendered = _render(now, long_name, short_name, text, hops)
-        _log_and_print(log_line, rendered)
+        _log(now, long_name, short_name, text, hops)
+        if _loop:
+            _loop.call_soon_threadsafe(_print, now, long_name, short_name, text, hops)
 
     except Exception as e:
-        print(f"{RED}[Ошибка при получении: {e}]{RESET}")
+        if _loop:
+            _loop.call_soon_threadsafe(
+                print_formatted_text,
+                HTML(f"<ansired>[Ошибка при получении: {html.escape(str(e))}]</ansired>")
+            )
 
 
 async def main() -> None:
-    global _interface
+    global _interface, _loop
+    _loop = asyncio.get_running_loop()
 
-    print(f"{DIM}Подключение к {CYAN}{HOST}{RESET}{DIM}...{RESET}")
+    print_formatted_text(HTML(f"<ansiwhite>Подключение к <ansicyan>{HOST}</ansicyan>...</ansiwhite>"))
     try:
         _interface = meshtastic.tcp_interface.TCPInterface(hostname=HOST)
         pub.subscribe(on_receive, "meshtastic.receive.text")
         my_id = _interface.myInfo.my_node_num
         long_name, short_name = _node_names(my_id)
-        print(
-            f"{BGREEN}Подключено.{RESET} "
-            f"Узел: {CYAN}{long_name} ({short_name}){RESET} "
-            f"{DIM}!{my_id:08x}{RESET}"
-        )
+        print_formatted_text(HTML(
+            f"<bold><ansigreen>Подключено.</ansigreen></bold> "
+            f"Узел: <ansicyan>{html.escape(long_name)} ({html.escape(short_name)})</ansicyan> "
+            f"<ansiwhite>!{my_id:08x}</ansiwhite>"
+        ))
     except Exception as e:
-        print(f"{RED}Не удалось подключиться: {e}{RESET}")
+        print_formatted_text(HTML(f"<ansired>Не удалось подключиться: {html.escape(str(e))}</ansired>"))
         sys.exit(1)
 
     session = PromptSession()
-    print(f"{DIM}Введите сообщение и нажмите Enter. Ctrl+C / Ctrl+D — выход.{RESET}\n")
+    print_formatted_text(HTML("<ansiwhite>Введите сообщение и нажмите Enter. Ctrl+C / Ctrl+D — выход.</ansiwhite>\n"))
 
     with patch_stdout():
         while True:
@@ -113,14 +114,13 @@ async def main() -> None:
                 my_id = _interface.myInfo.my_node_num
                 long_name, short_name = _node_names(my_id)
                 now = datetime.datetime.now().strftime("%H:%M:%S")
-                log_line = f"[{now}] {long_name} ({short_name}): {text} | 0"
-                rendered = _render(now, long_name, short_name, text, 0, own=True)
-                _log_and_print(log_line, rendered)
+                _log(now, long_name, short_name, text, 0)
+                _print(now, long_name, short_name, text, 0, own=True)
 
             except (KeyboardInterrupt, EOFError):
                 break
 
-    print(f"\n{DIM}Отключение...{RESET}")
+    print_formatted_text(HTML("\n<ansiwhite>Отключение...</ansiwhite>"))
     _interface.close()
 
 
