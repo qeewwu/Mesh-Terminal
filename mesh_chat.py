@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 
 import asyncio
+import collections
 import datetime
 import html
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 import meshtastic.tcp_interface
 from pubsub import pub
@@ -14,9 +16,30 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 HOST = "meshtastic.local"
 LOG_FILE = Path("chat.log")
+STORE_SIZE = 300
+QUOTE_MAX = 60
 
 _interface = None
 _loop: asyncio.AbstractEventLoop | None = None
+
+
+class MsgRecord(NamedTuple):
+    time_str: str
+    long_name: str
+    short_name: str
+    text: str
+
+
+# Хранилище сообщений: packet_id → MsgRecord
+_store: dict[int, MsgRecord] = {}
+_store_order: collections.deque[int] = collections.deque(maxlen=STORE_SIZE)
+
+
+def _store_message(packet_id: int, record: MsgRecord) -> None:
+    if len(_store_order) == STORE_SIZE and _store_order[0] in _store:
+        del _store[_store_order[0]]
+    _store[packet_id] = record
+    _store_order.append(packet_id)
 
 
 def _node_names(node_id: int) -> tuple[str, str]:
@@ -30,7 +53,19 @@ def _node_names(node_id: int) -> tuple[str, str]:
 
 
 def _print(time_str: str, long_name: str, short_name: str,
-           text: str, hops: int, own: bool = False) -> None:
+           text: str, hops: int, own: bool = False,
+           reply_to: MsgRecord | None = None) -> None:
+    if reply_to:
+        qt = reply_to.text
+        if len(qt) > QUOTE_MAX:
+            qt = qt[:QUOTE_MAX] + "…"
+        qln = html.escape(reply_to.long_name)
+        qsn = html.escape(reply_to.short_name)
+        qt  = html.escape(qt)
+        print_formatted_text(HTML(
+            f"<ansigray>  ┆ {qln} ({qsn}): {qt}</ansigray>"
+        ))
+
     t  = html.escape(time_str)
     ln = html.escape(long_name)
     sn = html.escape(short_name)
@@ -47,8 +82,12 @@ def _print(time_str: str, long_name: str, short_name: str,
 
 
 def _log(time_str: str, long_name: str, short_name: str,
-         text: str, hops: int) -> None:
+         text: str, hops: int,
+         reply_to: MsgRecord | None = None) -> None:
     with open(LOG_FILE, "a", encoding="utf-8") as f:
+        if reply_to:
+            qt = reply_to.text[:QUOTE_MAX] + ("…" if len(reply_to.text) > QUOTE_MAX else "")
+            f.write(f"  ┆ {reply_to.long_name} ({reply_to.short_name}): {qt}\n")
         f.write(f"[{time_str}] {long_name} ({short_name}): {text} | {hops}\n")
 
 
@@ -60,6 +99,8 @@ def on_receive(packet, interface):
 
         text      = decoded.get("text", "")
         from_id   = packet.get("from", 0)
+        packet_id = packet.get("id", 0)
+        reply_id  = decoded.get("replyId", 0)
         hop_limit = packet.get("hopLimit", 0)
         hop_start = packet.get("hopStart", hop_limit)
         hops      = hop_start - hop_limit
@@ -67,9 +108,16 @@ def on_receive(packet, interface):
         long_name, short_name = _node_names(from_id)
         now = datetime.datetime.now().strftime("%H:%M:%S")
 
-        _log(now, long_name, short_name, text, hops)
+        reply_to = _store.get(reply_id) if reply_id else None
+
+        record = MsgRecord(now, long_name, short_name, text)
+        if packet_id:
+            _store_message(packet_id, record)
+
+        _log(now, long_name, short_name, text, hops, reply_to)
         if _loop:
-            _loop.call_soon_threadsafe(_print, now, long_name, short_name, text, hops)
+            _loop.call_soon_threadsafe(_print, now, long_name, short_name,
+                                       text, hops, False, reply_to)
 
     except Exception as e:
         if _loop:
