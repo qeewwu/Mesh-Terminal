@@ -4,6 +4,7 @@ import asyncio
 import collections
 import datetime
 import html
+import re
 import sys
 from pathlib import Path
 from typing import NamedTuple
@@ -18,9 +19,14 @@ HOST = "meshtastic.local"
 LOG_FILE = Path("chat.log")
 STORE_SIZE = 300
 QUOTE_MAX = 60
+BROADCAST_ADDR = 0xFFFFFFFF
+
+# Characters invalid in XML 1.0 — would crash prompt_toolkit's HTML parser
+_XML_INVALID = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]")
 
 _interface = None
 _loop: asyncio.AbstractEventLoop | None = None
+_reconnect_event: asyncio.Event | None = None
 
 
 class MsgRecord(NamedTuple):
@@ -30,12 +36,18 @@ class MsgRecord(NamedTuple):
     text: str
 
 
-# Хранилище сообщений: packet_id → MsgRecord
 _store: dict[int, MsgRecord] = {}
 _store_order: collections.deque[int] = collections.deque(maxlen=STORE_SIZE)
 
 
-def _store_message(packet_id: int, record: MsgRecord) -> None:
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def _safe(text: str) -> str:
+    """Strip XML-invalid control characters, then HTML-escape."""
+    return html.escape(_XML_INVALID.sub("", text))
+
+
+def _store_msg(packet_id: int, record: MsgRecord) -> None:
     if len(_store_order) == STORE_SIZE and _store_order[0] in _store:
         del _store[_store_order[0]]
     _store[packet_id] = record
@@ -52,43 +64,91 @@ def _node_names(node_id: int) -> tuple[str, str]:
     return f"!{node_id:08x}", "???"
 
 
-def _print(time_str: str, long_name: str, short_name: str,
-           text: str, hops: int, own: bool = False,
-           reply_to: MsgRecord | None = None) -> None:
+def _find_node(query: str) -> tuple[int, str, str] | None:
+    """Find node by short/long name (case-insensitive). Returns (num_id, long, short)."""
+    if not _interface or not _interface.nodes:
+        return None
+    q = query.lower()
+    for nid, node in _interface.nodes.items():
+        if "user" not in node:
+            continue
+        u = node["user"]
+        if q in u.get("longName", "").lower() or q in u.get("shortName", "").lower():
+            if isinstance(nid, str) and nid.startswith("!"):
+                num = int(nid[1:], 16)
+            else:
+                num = int(nid)
+            return num, u.get("longName", str(nid)), u.get("shortName", "???")
+    return None
+
+
+# ── display ───────────────────────────────────────────────────────────────────
+
+def _print_msg(time_str: str, long_name: str, short_name: str,
+               text: str, hops: int, own: bool = False,
+               is_dm: bool = False,
+               reply_to: MsgRecord | None = None) -> None:
     if reply_to:
-        qt = reply_to.text
-        if len(qt) > QUOTE_MAX:
-            qt = qt[:QUOTE_MAX] + "…"
-        qln = html.escape(reply_to.long_name)
-        qsn = html.escape(reply_to.short_name)
-        qt  = html.escape(qt)
+        qt = reply_to.text if len(reply_to.text) <= QUOTE_MAX else reply_to.text[:QUOTE_MAX] + "…"
         print_formatted_text(HTML(
-            f"<ansigray>  ┆ {qln} ({qsn}): {qt}</ansigray>"
+            f"<ansigray>  ┆ {_safe(reply_to.long_name)} ({_safe(reply_to.short_name)})"
+            f": {_safe(qt)}</ansigray>"
         ))
 
-    t  = html.escape(time_str)
-    ln = html.escape(long_name)
-    sn = html.escape(short_name)
-    tx = html.escape(text)
-    color = "ansiblue" if own else "ansigreen"
-    print_formatted_text(HTML(
-        f"<ansiwhite>[{t}]</ansiwhite> "
-        f"<b><{color}>{ln}</{color}></b> "
-        f"<{color}>({sn})</{color}>"
-        f": {tx} "
-        f"<ansiwhite>| {hops}</ansiwhite>"
-    ))
+    t  = _safe(time_str)
+    ln = _safe(long_name)
+    sn = _safe(short_name)
+    tx = _safe(text)
+
+    if is_dm:
+        print_formatted_text(HTML(
+            f"<ansired>[{t}] DM <b>{ln}</b> ({sn}): {tx} "
+            f"| {hops}</ansired>"
+        ))
+    else:
+        color = "ansiblue" if own else "ansigreen"
+        print_formatted_text(HTML(
+            f"<ansiwhite>[{t}]</ansiwhite> "
+            f"<b><{color}>{ln}</{color}></b> "
+            f"<{color}>({sn})</{color}>"
+            f": {tx} "
+            f"<ansiwhite>| {hops}</ansiwhite>"
+        ))
 
 
 def _log(time_str: str, long_name: str, short_name: str,
-         text: str, hops: int,
+         text: str, hops: int, is_dm: bool = False,
          reply_to: MsgRecord | None = None) -> None:
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         if reply_to:
-            qt = reply_to.text[:QUOTE_MAX] + ("…" if len(reply_to.text) > QUOTE_MAX else "")
+            qt = reply_to.text if len(reply_to.text) <= QUOTE_MAX else reply_to.text[:QUOTE_MAX] + "…"
             f.write(f"  ┆ {reply_to.long_name} ({reply_to.short_name}): {qt}\n")
-        f.write(f"[{time_str}] {long_name} ({short_name}): {text} | {hops}\n")
+        prefix = "DM " if is_dm else ""
+        f.write(f"[{time_str}] {prefix}{long_name} ({short_name}): {text} | {hops}\n")
 
+
+def _ack_callback(ok: bool, error: str = "") -> None:
+    if ok:
+        print_formatted_text(HTML("<ansigreen>  ✓ Доставлено</ansigreen>"))
+    else:
+        print_formatted_text(HTML(
+            f"<ansired>  ✗ Не доставлено ({_safe(error)})</ansired>"
+        ))
+
+
+def _make_ack_handler():
+    """Returns an onResponse callback suitable for passing to sendText."""
+    def handler(packet):
+        decoded = packet.get("decoded", {}) if isinstance(packet, dict) else {}
+        routing = decoded.get("routing", {})
+        error = routing.get("errorReason", "NONE")
+        ok = (error == "NONE")
+        if _loop:
+            _loop.call_soon_threadsafe(_ack_callback, ok, error if not ok else "")
+    return handler
+
+
+# ── pubsub callbacks ──────────────────────────────────────────────────────────
 
 def on_receive(packet, interface):
     try:
@@ -98,55 +158,266 @@ def on_receive(packet, interface):
 
         text      = decoded.get("text", "")
         from_id   = packet.get("from", 0)
+        to_id     = packet.get("to", BROADCAST_ADDR)
         packet_id = packet.get("id", 0)
         reply_id  = decoded.get("replyId", 0)
         hop_limit = packet.get("hopLimit", 0)
         hop_start = packet.get("hopStart", hop_limit)
         hops      = hop_start - hop_limit
+        is_dm     = (to_id != BROADCAST_ADDR)
 
         long_name, short_name = _node_names(from_id)
         now = datetime.datetime.now().strftime("%H:%M:%S")
-
         reply_to = _store.get(reply_id) if reply_id else None
-
         record = MsgRecord(now, long_name, short_name, text)
         if packet_id:
-            _store_message(packet_id, record)
+            _store_msg(packet_id, record)
 
-        _log(now, long_name, short_name, text, hops, reply_to)
+        _log(now, long_name, short_name, text, hops, is_dm, reply_to)
         if _loop:
-            _loop.call_soon_threadsafe(_print, now, long_name, short_name,
-                                       text, hops, False, reply_to)
-
+            _loop.call_soon_threadsafe(
+                lambda: _print_msg(now, long_name, short_name,
+                                   text, hops, False, is_dm, reply_to)
+            )
     except Exception as e:
         if _loop:
             _loop.call_soon_threadsafe(
                 print_formatted_text,
-                HTML(f"<ansired>[Ошибка при получении: {html.escape(str(e))}]</ansired>")
+                HTML(f"<ansired>[Ошибка: {_safe(str(e))}]</ansired>")
             )
 
 
-async def main() -> None:
-    global _interface, _loop
-    _loop = asyncio.get_running_loop()
+def on_connection_lost(interface):
+    if _loop and _reconnect_event:
+        _loop.call_soon_threadsafe(
+            print_formatted_text,
+            HTML("<ansired>⚠ Соединение потеряно. Переподключаюсь...</ansired>")
+        )
+        _loop.call_soon_threadsafe(_reconnect_event.set)
 
-    print_formatted_text(HTML(f"<ansiwhite>Подключение к <ansicyan>{HOST}</ansicyan>...</ansiwhite>"))
+
+# ── connection management ─────────────────────────────────────────────────────
+
+_TOPICS = ("meshtastic.receive.text", "meshtastic.connection.lost")
+
+
+def _subscribe():
+    pub.subscribe(on_receive, "meshtastic.receive.text")
+    pub.subscribe(on_connection_lost, "meshtastic.connection.lost")
+
+
+def _unsubscribe():
+    for fn, topic in ((on_receive, "meshtastic.receive.text"),
+                      (on_connection_lost, "meshtastic.connection.lost")):
+        try:
+            pub.unsubscribe(fn, topic)
+        except Exception:
+            pass
+
+
+def _do_connect() -> bool:
+    global _interface
     try:
         _interface = meshtastic.tcp_interface.TCPInterface(hostname=HOST)
-        pub.subscribe(on_receive, "meshtastic.receive.text")
-        my_id = _interface.myInfo.my_node_num
-        long_name, short_name = _node_names(my_id)
-        print_formatted_text(HTML(
-            f"<bold><ansigreen>Подключено.</ansigreen></bold> "
-            f"Узел: <ansicyan>{html.escape(long_name)} ({html.escape(short_name)})</ansicyan> "
-            f"<ansiwhite>!{my_id:08x}</ansiwhite>"
-        ))
+        _subscribe()
+        return True
     except Exception as e:
-        print_formatted_text(HTML(f"<ansired>Не удалось подключиться: {html.escape(str(e))}</ansired>"))
+        if _loop:
+            _loop.call_soon_threadsafe(
+                print_formatted_text,
+                HTML(f"<ansired>Ошибка подключения: {_safe(str(e))}</ansired>")
+            )
+        return False
+
+
+async def _reconnect_loop() -> None:
+    delays = [3, 5, 10, 30, 60]
+    attempt = 0
+    while True:
+        await _reconnect_event.wait()
+        _reconnect_event.clear()
+
+        while True:
+            delay = delays[min(attempt, len(delays) - 1)]
+            print_formatted_text(HTML(
+                f"<ansiyellow>Переподключение через {delay}с "
+                f"(попытка {attempt + 1})...</ansiyellow>"
+            ))
+            await asyncio.sleep(delay)
+
+            _unsubscribe()
+            try:
+                if _interface:
+                    _interface.close()
+            except Exception:
+                pass
+
+            if _do_connect():
+                attempt = 0
+                print_formatted_text(HTML("<ansigreen>✓ Переподключено</ansigreen>"))
+                break
+            attempt += 1
+
+
+# ── commands ──────────────────────────────────────────────────────────────────
+
+def _cmd_nodes() -> None:
+    if not _interface or not _interface.nodes:
+        print_formatted_text(HTML("<ansiyellow>Нет данных об узлах</ansiyellow>"))
+        return
+
+    now_ts = datetime.datetime.now().timestamp()
+    print_formatted_text(HTML("<ansiwhite>─── Видимые узлы ───</ansiwhite>"))
+
+    for nid, node in _interface.nodes.items():
+        u  = node.get("user", {})
+        ln = _safe(u.get("longName", str(nid)))
+        sn = _safe(u.get("shortName", "???"))
+
+        metrics  = node.get("deviceMetrics", {})
+        battery  = metrics.get("batteryLevel")
+        bat_str  = f" 🔋{battery}%" if battery is not None else ""
+
+        snr      = node.get("snr")
+        snr_str  = f" SNR:{snr:.1f}" if snr is not None else ""
+
+        last     = node.get("lastHeard", 0)
+        if last:
+            ago = int(now_ts - last)
+            if ago < 60:
+                heard = f"{ago}с"
+                color = "ansigreen"
+            elif ago < 3600:
+                heard = f"{ago // 60}м"
+                color = "ansiyellow"
+            else:
+                heard = f"{ago // 3600}ч"
+                color = "ansigray"
+        else:
+            heard, color = "?", "ansigray"
+
+        print_formatted_text(HTML(
+            f"  <b><ansigreen>{ln}</ansigreen></b> <ansigreen>({sn})</ansigreen>"
+            f"<ansiwhite>{bat_str}{snr_str}</ansiwhite>"
+            f" <{color}>· {heard} назад</{color}>"
+        ))
+
+
+def _cmd_who() -> None:
+    if not _interface:
+        return
+    my_id = _interface.myInfo.my_node_num
+    ln, sn = _node_names(my_id)
+    print_formatted_text(HTML(
+        f"<ansiwhite>Я: </ansiwhite>"
+        f"<b><ansicyan>{_safe(ln)}</ansicyan></b> "
+        f"<ansicyan>({_safe(sn)})</ansicyan> "
+        f"<ansiwhite>!{my_id:08x}</ansiwhite>"
+    ))
+
+
+def _cmd_dm(args: str) -> None:
+    parts = args.strip().split(None, 1)
+    if len(parts) < 2:
+        print_formatted_text(HTML(
+            "<ansiyellow>Использование: /dm &lt;имя&gt; &lt;текст&gt;</ansiyellow>"
+        ))
+        return
+
+    target_name, text = parts
+    result = _find_node(target_name)
+    if not result:
+        print_formatted_text(HTML(
+            f"<ansired>Узел '{_safe(target_name)}' не найден. "
+            f"Проверьте /nodes</ansired>"
+        ))
+        return
+
+    dest_id, dest_ln, dest_sn = result
+    try:
+        _interface.sendText(
+            text,
+            destinationId=dest_id,
+            wantAck=True,
+            onResponse=_make_ack_handler(),
+            channelIndex=0,
+        )
+        now = datetime.datetime.now().strftime("%H:%M:%S")
+        print_formatted_text(HTML(
+            f"<ansired>[{_safe(now)}] → DM "
+            f"<b>{_safe(dest_ln)}</b> ({_safe(dest_sn)}): "
+            f"{_safe(text)}</ansired>"
+        ))
+        my_id = _interface.myInfo.my_node_num
+        ln, sn = _node_names(my_id)
+        _log(now, ln, sn, f"→ DM {dest_ln}: {text}", 0)
+    except Exception as e:
+        print_formatted_text(HTML(f"<ansired>Ошибка отправки: {_safe(str(e))}</ansired>"))
+
+
+def _cmd_clear() -> None:
+    print("\033[2J\033[H", end="", flush=True)
+
+
+def _cmd_help() -> None:
+    lines = [
+        "─── Команды ───────────────────────────────",
+        "  /nodes               список видимых узлов",
+        "  /who                 информация о себе",
+        "  /dm &lt;имя&gt; &lt;текст&gt;   личное сообщение",
+        "  /clear               очистить экран",
+        "  /help                эта справка",
+        "───────────────────────────────────────────",
+    ]
+    for line in lines:
+        print_formatted_text(HTML(f"<ansiwhite>{line}</ansiwhite>"))
+
+
+def _handle_command(text: str) -> None:
+    parts = text[1:].split(None, 1)
+    cmd   = parts[0].lower() if parts else ""
+    args  = parts[1] if len(parts) > 1 else ""
+
+    if   cmd == "nodes": _cmd_nodes()
+    elif cmd == "who":   _cmd_who()
+    elif cmd == "dm":    _cmd_dm(args)
+    elif cmd == "clear": _cmd_clear()
+    elif cmd == "help":  _cmd_help()
+    else:
+        print_formatted_text(HTML(
+            f"<ansiyellow>Неизвестная команда /{_safe(cmd)}. "
+            f"Введите /help</ansiyellow>"
+        ))
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+async def main() -> None:
+    global _interface, _loop, _reconnect_event
+    _loop = asyncio.get_running_loop()
+    _reconnect_event = asyncio.Event()
+
+    print_formatted_text(HTML(
+        f"<ansiwhite>Подключение к <ansicyan>{HOST}</ansicyan>...</ansiwhite>"
+    ))
+
+    if not _do_connect():
         sys.exit(1)
 
+    my_id = _interface.myInfo.my_node_num
+    ln, sn = _node_names(my_id)
+    print_formatted_text(HTML(
+        f"<b><ansigreen>Подключено.</ansigreen></b> "
+        f"Узел: <ansicyan>{_safe(ln)} ({_safe(sn)})</ansicyan> "
+        f"<ansiwhite>!{my_id:08x}</ansiwhite>"
+    ))
+
     session = PromptSession()
-    print_formatted_text(HTML("<ansiwhite>Введите сообщение и нажмите Enter. Ctrl+C / Ctrl+D — выход.</ansiwhite>\n"))
+    print_formatted_text(HTML(
+        "<ansiwhite>Сообщение или /help. Ctrl+C / Ctrl+D — выход.</ansiwhite>\n"
+    ))
+
+    reconnect_task = asyncio.create_task(_reconnect_loop())
 
     with patch_stdout():
         while True:
@@ -156,19 +427,32 @@ async def main() -> None:
                 if not text:
                     continue
 
-                _interface.sendText(text, channelIndex=0)
+                if text.startswith("/"):
+                    _handle_command(text)
+                    continue
 
+                _interface.sendText(
+                    text,
+                    wantAck=True,
+                    onResponse=_make_ack_handler(),
+                    channelIndex=0,
+                )
                 my_id = _interface.myInfo.my_node_num
-                long_name, short_name = _node_names(my_id)
+                ln, sn = _node_names(my_id)
                 now = datetime.datetime.now().strftime("%H:%M:%S")
-                _log(now, long_name, short_name, text, 0)
-                _print(now, long_name, short_name, text, 0, own=True)
+                _log(now, ln, sn, text, 0)
+                _print_msg(now, ln, sn, text, 0, own=True)
 
             except (KeyboardInterrupt, EOFError):
                 break
 
+    reconnect_task.cancel()
     print_formatted_text(HTML("\n<ansiwhite>Отключение...</ansiwhite>"))
-    _interface.close()
+    _unsubscribe()
+    try:
+        _interface.close()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
