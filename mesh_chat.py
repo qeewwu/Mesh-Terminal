@@ -70,12 +70,11 @@ def _print(time_str: str, long_name: str, short_name: str,
     ln = html.escape(long_name)
     sn = html.escape(short_name)
     tx = html.escape(text)
-    name_style  = "bold ansiblue"  if own else "bold ansigreen"
-    short_style = "ansiblue"       if own else "ansigreen"
+    color = "ansiblue" if own else "ansigreen"
     print_formatted_text(HTML(
         f"<ansiwhite>[{t}]</ansiwhite> "
-        f"<{name_style}>{ln}</{name_style}> "
-        f"<{short_style}>({sn})</{short_style}>"
+        f"<b><{color}>{ln}</{color}></b> "
+        f"<{color}>({sn})</{color}>"
         f": {tx} "
         f"<ansiwhite>| {hops}</ansiwhite>"
     ))
