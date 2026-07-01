@@ -1,15 +1,31 @@
 #!/usr/bin/env python3
-"""Shared constants and chat.log line format used by mesh_logger.py and mesh_chat.py."""
+"""Shared constants and log line format used by mesh_logger.py and mesh_chat.py."""
 
+import datetime
 import re
 from pathlib import Path
 from typing import NamedTuple
 
 HOST = "meshtastic.local"
-LOG_FILE = Path("chat.log")
+LOG_DIR = Path("logs")
 SOCKET_PATH = Path("/tmp/mesh_chat.sock")
 BROADCAST_ADDR = 0xFFFFFFFF
 QUOTE_MAX = 60
+
+
+def log_file_for(date: datetime.date) -> Path:
+    return LOG_DIR / f"chat-{date.isoformat()}.log"
+
+
+def current_log_file() -> Path:
+    return log_file_for(datetime.date.today())
+
+
+def list_log_files() -> list[Path]:
+    """All log files, newest date first."""
+    if not LOG_DIR.exists():
+        return []
+    return sorted(LOG_DIR.glob("chat-*.log"), reverse=True)
 
 
 class ParsedLine(NamedTuple):
@@ -45,7 +61,7 @@ _QUOTE_RE = re.compile(r"^  ┆ (?P<name>.+?) \((?P<short>[^)]*)\): (?P<text>.*)
 
 
 def parse_log_line(line: str):
-    """Parse one chat.log line into a ParsedLine, or None if unrecognised."""
+    """Parse one log line into a ParsedLine, or None if unrecognised."""
     line = line.rstrip("\n")
     if not line:
         return None

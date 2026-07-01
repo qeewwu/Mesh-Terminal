@@ -12,7 +12,7 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.shortcuts import clear as pt_clear
 
-from mesh_common import LOG_FILE, SOCKET_PATH, parse_log_line
+from mesh_common import SOCKET_PATH, list_log_files, parse_log_line
 
 NAME_CACHE_FILE = Path("node_names_cache.json")
 HISTORY_SIZE = 50
@@ -234,11 +234,8 @@ def _render_line(line: str) -> None:
 
 # ── history + live tail ────────────────────────────────────────────────────────
 
-def _print_initial_history(n: int = HISTORY_SIZE) -> None:
-    if not LOG_FILE.exists():
-        return
-    lines = LOG_FILE.read_text(encoding="utf-8").splitlines()
-
+def _split_into_units(lines: list[str]) -> list[tuple[str | None, str]]:
+    """Pair each quote line with the message line that follows it."""
     units: list[tuple[str | None, str]] = []
     i = 0
     while i < len(lines):
@@ -248,6 +245,19 @@ def _print_initial_history(n: int = HISTORY_SIZE) -> None:
         else:
             units.append((None, lines[i]))
             i += 1
+    return units
+
+
+def _print_initial_history(n: int = HISTORY_SIZE) -> None:
+    units: list[tuple[str | None, str]] = []
+    for path in list_log_files():  # newest date first
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            continue
+        units = _split_into_units(lines) + units
+        if len(units) >= n:
+            break
 
     for quote, msg in units[-n:]:
         if quote:

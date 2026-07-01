@@ -2,7 +2,7 @@
 """Lightweight always-on Meshtastic logger and IPC broker.
 
 Holds the single TCP connection to the Meshtastic device, appends every
-text message to chat.log, and exposes a Unix socket so other processes
+text message to a daily log file under logs/, and exposes a Unix socket so other processes
 (e.g. mesh_chat.py) can send messages and query node info without needing
 their own connection to the device.
 """
@@ -22,8 +22,9 @@ from pubsub import pub
 from mesh_common import (
     BROADCAST_ADDR,
     HOST,
-    LOG_FILE,
+    LOG_DIR,
     SOCKET_PATH,
+    current_log_file,
     format_message_line,
     format_quote_line,
 )
@@ -66,7 +67,7 @@ def _node_names(node_id: int) -> tuple[str, str]:
 
 
 def _log(*lines: str) -> None:
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
+    with open(current_log_file(), "a", encoding="utf-8") as f:
         for line in lines:
             f.write(line + "\n")
 
@@ -320,6 +321,7 @@ async def main() -> None:
     _loop = asyncio.get_running_loop()
     _reconnect_event = asyncio.Event()
 
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     _prepare_socket_path()
 
     print(f"[info] connecting to {HOST}...")
