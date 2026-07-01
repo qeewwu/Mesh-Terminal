@@ -129,6 +129,9 @@ def on_receive(packet, interface):
         _write_message(long_name, short_name, text, hops,
                        dm_tag=("DM " if is_dm else ""), reply_to=reply_to)
         print(f"[recv] {long_name} ({short_name}): {text}")
+        if reply_id:
+            status = f"resolved -> {reply_to.long_name}: {reply_to.text}" if reply_to else "NOT in store"
+            print(f"[debug] replyId={reply_id} ({status})", file=sys.stderr)
     except Exception as e:
         print(f"[error] on_receive: {e}", file=sys.stderr)
 
