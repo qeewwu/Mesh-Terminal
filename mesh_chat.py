@@ -4,8 +4,11 @@ import asyncio
 import collections
 import datetime
 import html
+import json
 import re
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import NamedTuple
 
@@ -17,9 +20,12 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 HOST = "meshtastic.local"
 LOG_FILE = Path("chat.log")
+NAME_CACHE_FILE = Path("node_names_cache.json")
 STORE_SIZE = 300
 QUOTE_MAX = 60
 BROADCAST_ADDR = 0xFFFFFFFF
+ONEMESH_API = "https://map.onemesh.ru/api/v1/nodes/{}"
+ONEMESH_DELAY = 0.25  # secs between requests, to be polite to the public API
 
 # Characters invalid in XML 1.0 — would crash prompt_toolkit's HTML parser
 _XML_INVALID = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]")
@@ -39,6 +45,11 @@ class MsgRecord(NamedTuple):
 _store: dict[int, MsgRecord] = {}
 _store_order: collections.deque[int] = collections.deque(maxlen=STORE_SIZE)
 
+# Names resolved from OneMesh, keyed by numeric node id — persisted to disk
+_name_cache: dict[int, tuple[str, str]] = {}
+# Node ids we've seen but couldn't resolve to a name locally
+_unresolved_ids: set[int] = set()
+
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -54,6 +65,15 @@ def _store_msg(packet_id: int, record: MsgRecord) -> None:
     _store_order.append(packet_id)
 
 
+def _packet_id(sent) -> int:
+    """Extract numeric ID from the object returned by sendText."""
+    if sent is None:
+        return 0
+    if isinstance(sent, dict):
+        return sent.get("id", 0)
+    return getattr(sent, "id", 0)
+
+
 def _node_names(node_id: int) -> tuple[str, str]:
     if _interface and _interface.nodes:
         hex_id = f"!{node_id:08x}"
@@ -61,7 +81,55 @@ def _node_names(node_id: int) -> tuple[str, str]:
         if node and "user" in node:
             u = node["user"]
             return u.get("longName", hex_id), u.get("shortName", "???")
+    if node_id in _name_cache:
+        return _name_cache[node_id]
+    _unresolved_ids.add(node_id)
     return f"!{node_id:08x}", "???"
+
+
+def _load_name_cache() -> None:
+    global _name_cache
+    if not NAME_CACHE_FILE.exists():
+        return
+    try:
+        raw = json.loads(NAME_CACHE_FILE.read_text(encoding="utf-8"))
+        _name_cache = {int(k): (v["long"], v["short"]) for k, v in raw.items()}
+    except Exception:
+        _name_cache = {}
+
+
+def _save_name_cache() -> None:
+    try:
+        raw = {str(k): {"long": v[0], "short": v[1]} for k, v in _name_cache.items()}
+        NAME_CACHE_FILE.write_text(
+            json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+def _fetch_onemesh_name(node_id: int) -> tuple[str, str] | None:
+    """Blocking HTTP call to the OneMesh public API. Run via asyncio.to_thread."""
+    req = urllib.request.Request(
+        ONEMESH_API.format(node_id),
+        headers={"User-Agent": "mesh-chat/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+    except Exception:
+        return None
+
+    node = data.get("node")
+    if not node:
+        return None
+    long_name = node.get("long_name") or f"!{node_id:08x}"
+    short_name = node.get("short_name") or "???"
+    return long_name, short_name
 
 
 def _find_node(query: str) -> tuple[int, str, str] | None:
@@ -270,9 +338,14 @@ def _cmd_nodes() -> None:
     print_formatted_text(HTML("<ansiwhite>─── Видимые узлы ───</ansiwhite>"))
 
     for nid, node in _interface.nodes.items():
-        u  = node.get("user", {})
-        ln = _safe(u.get("longName", str(nid)))
-        sn = _safe(u.get("shortName", "???"))
+        u = node.get("user", {})
+        if u:
+            ln = _safe(u.get("longName", str(nid)))
+            sn = _safe(u.get("shortName", "???"))
+        else:
+            num = nid if isinstance(nid, int) else int(str(nid).lstrip("!"), 16)
+            cached = _name_cache.get(num)
+            ln, sn = (_safe(cached[0]), _safe(cached[1])) if cached else (_safe(str(nid)), "???")
 
         metrics  = node.get("deviceMetrics", {})
         battery  = metrics.get("batteryLevel")
@@ -335,21 +408,24 @@ def _cmd_dm(args: str) -> None:
 
     dest_id, dest_ln, dest_sn = result
     try:
-        _interface.sendText(
+        sent = _interface.sendText(
             text,
             destinationId=dest_id,
             wantAck=True,
             onResponse=_make_ack_handler(),
             channelIndex=0,
         )
+        my_id = _interface.myInfo.my_node_num
+        ln, sn = _node_names(my_id)
         now = datetime.datetime.now().strftime("%H:%M:%S")
+        pid = _packet_id(sent)
+        if pid:
+            _store_msg(pid, MsgRecord(now, ln, sn, text))
         print_formatted_text(HTML(
             f"<ansired>[{_safe(now)}] → DM "
             f"<b>{_safe(dest_ln)}</b> ({_safe(dest_sn)}): "
             f"{_safe(text)}</ansired>"
         ))
-        my_id = _interface.myInfo.my_node_num
-        ln, sn = _node_names(my_id)
         _log(now, ln, sn, f"→ DM {dest_ln}: {text}", 0)
     except Exception as e:
         print_formatted_text(HTML(f"<ansired>Ошибка отправки: {_safe(str(e))}</ansired>"))
@@ -359,12 +435,52 @@ def _cmd_clear() -> None:
     print("\033[2J\033[H", end="", flush=True)
 
 
+async def _cmd_updatenames() -> None:
+    targets = set(_unresolved_ids)
+    if _interface and _interface.nodes:
+        for nid, node in _interface.nodes.items():
+            if not node.get("user"):
+                num = nid if isinstance(nid, int) else int(str(nid).lstrip("!"), 16)
+                if num not in _name_cache:
+                    targets.add(num)
+
+    if not targets:
+        print_formatted_text(HTML(
+            "<ansiyellow>Нечего обновлять — все видимые узлы уже с именами</ansiyellow>"
+        ))
+        return
+
+    targets = sorted(targets)
+    print_formatted_text(HTML(
+        f"<ansiwhite>Запрашиваю имена {len(targets)} узлов через OneMesh...</ansiwhite>"
+    ))
+
+    resolved = 0
+    for nid in targets:
+        result = await asyncio.to_thread(_fetch_onemesh_name, nid)
+        if result:
+            _name_cache[nid] = result
+            _unresolved_ids.discard(nid)
+            resolved += 1
+            print_formatted_text(HTML(
+                f"  <ansigreen>✓</ansigreen> !{nid:08x} → "
+                f"<b>{_safe(result[0])}</b> ({_safe(result[1])})"
+            ))
+        await asyncio.sleep(ONEMESH_DELAY)
+
+    _save_name_cache()
+    print_formatted_text(HTML(
+        f"<ansigreen>Готово: обновлено {resolved} из {len(targets)} имён</ansigreen>"
+    ))
+
+
 def _cmd_help() -> None:
     lines = [
         "─── Команды ───────────────────────────────",
         "  /nodes               список видимых узлов",
         "  /who                 информация о себе",
         "  /dm &lt;имя&gt; &lt;текст&gt;   личное сообщение",
+        "  /updatenames         подтянуть имена узлов с OneMesh",
         "  /clear               очистить экран",
         "  /help                эта справка",
         "───────────────────────────────────────────",
@@ -373,16 +489,17 @@ def _cmd_help() -> None:
         print_formatted_text(HTML(f"<ansiwhite>{line}</ansiwhite>"))
 
 
-def _handle_command(text: str) -> None:
+async def _handle_command(text: str) -> None:
     parts = text[1:].split(None, 1)
     cmd   = parts[0].lower() if parts else ""
     args  = parts[1] if len(parts) > 1 else ""
 
-    if   cmd == "nodes": _cmd_nodes()
-    elif cmd == "who":   _cmd_who()
-    elif cmd == "dm":    _cmd_dm(args)
-    elif cmd == "clear": _cmd_clear()
-    elif cmd == "help":  _cmd_help()
+    if   cmd == "nodes":       _cmd_nodes()
+    elif cmd == "who":         _cmd_who()
+    elif cmd == "dm":          _cmd_dm(args)
+    elif cmd == "updatenames": await _cmd_updatenames()
+    elif cmd == "clear":       _cmd_clear()
+    elif cmd == "help":        _cmd_help()
     else:
         print_formatted_text(HTML(
             f"<ansiyellow>Неизвестная команда /{_safe(cmd)}. "
@@ -396,6 +513,7 @@ async def main() -> None:
     global _interface, _loop, _reconnect_event
     _loop = asyncio.get_running_loop()
     _reconnect_event = asyncio.Event()
+    _load_name_cache()
 
     print_formatted_text(HTML(
         f"<ansiwhite>Подключение к <ansicyan>{HOST}</ansicyan>...</ansiwhite>"
@@ -428,10 +546,10 @@ async def main() -> None:
                     continue
 
                 if text.startswith("/"):
-                    _handle_command(text)
+                    await _handle_command(text)
                     continue
 
-                _interface.sendText(
+                sent = _interface.sendText(
                     text,
                     wantAck=True,
                     onResponse=_make_ack_handler(),
@@ -440,6 +558,9 @@ async def main() -> None:
                 my_id = _interface.myInfo.my_node_num
                 ln, sn = _node_names(my_id)
                 now = datetime.datetime.now().strftime("%H:%M:%S")
+                pid = _packet_id(sent)
+                if pid:
+                    _store_msg(pid, MsgRecord(now, ln, sn, text))
                 _log(now, ln, sn, text, 0)
                 _print_msg(now, ln, sn, text, 0, own=True)
 
