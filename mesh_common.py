@@ -55,7 +55,7 @@ def format_message_line(time_str: str, long_name: str, short_name: str,
 
 
 _MSG_RE = re.compile(
-    r"^(?P<channel>.+?) \[(?P<time>\d{2}:\d{2}:\d{2})\] "
+    r"^(?:(?P<channel>.+?) )?\[(?P<time>\d{2}:\d{2}:\d{2})\] "
     r"(?P<dm>DM (?:→ )?)?"
     r"(?P<name>.+?) \((?P<short>[^)]*)\): "
     r"(?P<text>.*) \| (?P<hops>-?\d+)$"
@@ -78,7 +78,7 @@ def parse_log_line(line: str):
             short_name=m.group("short"),
             text=m.group("text"),
             hops=int(m.group("hops")),
-            channel=m.group("channel"),
+            channel=m.group("channel") or "Primary",
         )
     m = _QUOTE_RE.match(line)
     if m:
