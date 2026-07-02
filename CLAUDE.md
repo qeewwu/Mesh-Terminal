@@ -71,13 +71,25 @@ quote line, which is expected, not a bug.
 
 Two line kinds, parsed by `parse_log_line` in `mesh_common.py`:
 ```
-  ┆ <name> (<short>): <quoted text>              # quote line (optional, precedes a reply)
-[HH:MM:SS] <DM tag><name> (<short>): <text> | <hops>   # message line
+  ┆ <name> (<short>): <quoted text>                          # quote line (optional, precedes a reply)
+<channel> [HH:MM:SS] <DM tag><name> (<short>): <text> | <hops>   # message line
 ```
-`<DM tag>` is empty for broadcast, `DM ` for an incoming DM, `DM → ` for an outgoing DM. This
-grammar is deliberately simple/regex-friendly since `mesh_chat.py` re-renders colored terminal
-output entirely by parsing these plain-text lines (from history file reads and from pushed
-"message" events) — it never has direct access to raw packet objects.
+`<channel>` is the channel's display name (`Channel.settings.name`, or `"Primary"` for channel 0
+when unnamed). `<DM tag>` is empty for broadcast, `DM ` for an incoming DM, `DM → ` for an
+outgoing DM. This grammar is deliberately simple/regex-friendly since `mesh_chat.py` re-renders
+colored terminal output entirely by parsing these plain-text lines (from history file reads and
+from pushed "message" events) — it never has direct access to raw packet objects.
+
+### Channels
+
+`mesh_logger.py` logs text messages from **every** channel (it doesn't filter by `channel`
+index), and resolves index → name via `_channel_name()` (reads `interface.localNode.channels`).
+`mesh_chat.py` run with no flags shows all channels at once (log lines rendered with the
+`<channel>` prefix visible) and sends to channel 0 (Primary). Run with a flag matching a channel
+name, e.g. `mesh_chat.py --ping`, it resolves that name to an index via the `channels` IPC
+command, restricts history/live display to that channel only (prefix hidden, since it's implied),
+and sends/DMs go out on that channel's index. The `send`/`dm` IPC commands both take an optional
+`channel` field (channel index, default 0) for this purpose.
 
 ### Node name resolution
 

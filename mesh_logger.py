@@ -67,6 +67,34 @@ def _node_names(node_id: int) -> tuple[str, str]:
     return f"!{node_id:08x}", "???"
 
 
+def _channel_name(index: int) -> str:
+    try:
+        channels = _interface.localNode.channels
+        if channels and 0 <= index < len(channels):
+            name = channels[index].settings.name
+            if name:
+                return name
+    except Exception:
+        pass
+    return "Primary" if index == 0 else f"Channel{index}"
+
+
+def _channels_payload() -> list[dict]:
+    out = []
+    try:
+        channels = _interface.localNode.channels or []
+    except Exception:
+        channels = []
+    for ch in channels:
+        role = ch.role
+        if role == 0:  # DISABLED
+            continue
+        out.append({"index": ch.index, "name": _channel_name(ch.index)})
+    if not out:
+        out.append({"index": 0, "name": "Primary"})
+    return out
+
+
 def _log(*lines: str) -> None:
     with open(current_log_file(), "a", encoding="utf-8") as f:
         for line in lines:
@@ -84,12 +112,14 @@ async def _broadcast(lines: list[str]) -> None:
 
 
 def _write_message(long_name: str, short_name: str, text: str, hops: int,
-                    dm_tag: str = "", reply_to: MsgRecord | None = None) -> None:
+                    dm_tag: str = "", reply_to: MsgRecord | None = None,
+                    channel_index: int = 0) -> None:
     now = datetime.datetime.now().strftime("%H:%M:%S")
     lines = []
     if reply_to:
         lines.append(format_quote_line(reply_to.long_name, reply_to.short_name, reply_to.text))
-    lines.append(format_message_line(now, long_name, short_name, text, hops, dm_tag))
+    lines.append(format_message_line(now, long_name, short_name, text, hops, dm_tag,
+                                      channel_name=_channel_name(channel_index)))
     _log(*lines)
     if _loop:
         # on_receive runs on meshtastic's background thread; schedule safely
@@ -121,6 +151,7 @@ def on_receive(packet, interface):
         hop_start = packet.get("hopStart", hop_limit)
         hops      = hop_start - hop_limit
         is_dm     = (to_id != BROADCAST_ADDR)
+        channel_index = packet.get("channel", 0)
 
         long_name, short_name = _node_names(from_id)
         reply_to = _store.get(reply_id) if reply_id else None
@@ -128,7 +159,8 @@ def on_receive(packet, interface):
             _store_msg(packet_id, MsgRecord(long_name, short_name, text))
 
         _write_message(long_name, short_name, text, hops,
-                       dm_tag=("DM " if is_dm else ""), reply_to=reply_to)
+                       dm_tag=("DM " if is_dm else ""), reply_to=reply_to,
+                       channel_index=channel_index)
         print(f"[recv] {long_name} ({short_name}): {text}")
     except Exception as e:
         print(f"[error] on_receive: {e}", file=sys.stderr)
@@ -248,11 +280,15 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 elif cmd == "nodes":
                     resp = {"req_id": req_id, "ok": True, "nodes": _nodes_payload()}
 
+                elif cmd == "channels":
+                    resp = {"req_id": req_id, "ok": True, "channels": _channels_payload()}
+
                 elif cmd in ("send", "dm"):
                     if not _interface:
                         resp["error"] = "not connected"
                     else:
                         text = req.get("text", "")
+                        channel_index = req.get("channel", 0)
                         pid_holder = {}
                         fired = {"done": False}
 
@@ -282,7 +318,7 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                             await asyncio.sleep(ACK_TIMEOUT_SECONDS)
                             _emit(None, "timeout")
 
-                        kwargs = dict(wantAck=True, channelIndex=0, onResponse=handler)
+                        kwargs = dict(wantAck=True, channelIndex=channel_index, onResponse=handler)
                         if cmd == "dm":
                             kwargs["destinationId"] = req.get("node_id")
                         sent = _interface.sendText(text, **kwargs)
@@ -297,9 +333,10 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
 
                         if cmd == "dm":
                             dest_ln, dest_sn = _node_names(req.get("node_id", 0))
-                            _write_message(dest_ln, dest_sn, text, 0, dm_tag="DM → ")
+                            _write_message(dest_ln, dest_sn, text, 0, dm_tag="DM → ",
+                                          channel_index=channel_index)
                         else:
-                            _write_message(ln, sn, text, 0)
+                            _write_message(ln, sn, text, 0, channel_index=channel_index)
 
                         resp = {"req_id": req_id, "ok": True, "packet_id": pid}
                 else:

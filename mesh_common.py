@@ -37,6 +37,7 @@ class ParsedLine(NamedTuple):
     short_name: str = ""
     text: str = ""
     hops: int = 0
+    channel: str = "Primary"
 
 
 def truncate(text: str, limit: int = QUOTE_MAX) -> str:
@@ -48,12 +49,13 @@ def format_quote_line(long_name: str, short_name: str, text: str) -> str:
 
 
 def format_message_line(time_str: str, long_name: str, short_name: str,
-                         text: str, hops: int, dm_tag: str = "") -> str:
-    return f"[{time_str}] {dm_tag}{long_name} ({short_name}): {text} | {hops}"
+                         text: str, hops: int, dm_tag: str = "",
+                         channel_name: str = "Primary") -> str:
+    return f"{channel_name} [{time_str}] {dm_tag}{long_name} ({short_name}): {text} | {hops}"
 
 
 _MSG_RE = re.compile(
-    r"^\[(?P<time>\d{2}:\d{2}:\d{2})\] "
+    r"^(?P<channel>.+?) \[(?P<time>\d{2}:\d{2}:\d{2})\] "
     r"(?P<dm>DM (?:→ )?)?"
     r"(?P<name>.+?) \((?P<short>[^)]*)\): "
     r"(?P<text>.*) \| (?P<hops>-?\d+)$"
@@ -76,6 +78,7 @@ def parse_log_line(line: str):
             short_name=m.group("short"),
             text=m.group("text"),
             hops=int(m.group("hops")),
+            channel=m.group("channel"),
         )
     m = _QUOTE_RE.match(line)
     if m:

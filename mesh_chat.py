@@ -28,6 +28,27 @@ _client: "IPCClient | None" = None
 _name_cache: dict[int, tuple[str, str]] = {}
 _unresolved_ids: set[int] = set()
 
+# None => show/send on every channel (send defaults to Primary); otherwise the
+# canonical channel name (and matching index) this session is restricted to.
+_channel_filter: str | None = None
+_channel_index: int = 0
+
+
+def _parse_channel_flag() -> str | None:
+    for arg in sys.argv[1:]:
+        if arg.startswith("--") and len(arg) > 2:
+            return arg[2:]
+    return None
+
+
+def _channel_matches(msg_line: str) -> bool:
+    if _channel_filter is None:
+        return True
+    parsed = parse_log_line(msg_line)
+    if not parsed:
+        return False
+    return parsed.channel.lower() == _channel_filter.lower()
+
 # Live "message" events pushed by the logger before history has finished
 # printing are buffered here, then flushed in order once history is done.
 _history_ready = False
@@ -197,6 +218,8 @@ def _handle_event(obj: dict) -> None:
             ))
     elif kind == "message":
         lines = obj.get("lines", [])
+        if not lines or not _channel_matches(lines[-1]):
+            return
         if _history_ready:
             for line in lines:
                 _render_line(line)
@@ -214,21 +237,23 @@ def _print_quote(long_name: str, short_name: str, text: str) -> None:
 
 
 def _print_msg(time_str: str, long_name: str, short_name: str,
-               text: str, hops: int, own: bool = False, is_dm: bool = False) -> None:
+               text: str, hops: int, own: bool = False, is_dm: bool = False,
+               channel_name: str = "") -> None:
     ln, sn = _resolve_display_name(long_name, short_name)
     t  = _safe(time_str)
     ln = _safe(ln)
     sn = _safe(sn)
     tx = _safe(text)
+    ch = f"<ansimagenta>{_safe(channel_name)}</ansimagenta> " if _channel_filter is None else ""
 
     if is_dm:
         print_formatted_text(HTML(
-            f"<ansired>[{t}] DM <b>{ln}</b> ({sn}): {tx} | {hops}</ansired>"
+            f"{ch}<ansired>[{t}] DM <b>{ln}</b> ({sn}): {tx} | {hops}</ansired>"
         ))
     else:
         color = "ansiblue" if own else "ansigreen"
         print_formatted_text(HTML(
-            f"<ansiwhite>[{t}]</ansiwhite> "
+            f"{ch}<ansiwhite>[{t}]</ansiwhite> "
             f"<b><{color}>{ln}</{color}></b> "
             f"<{color}>({sn})</{color}>"
             f": {tx} "
@@ -246,7 +271,8 @@ def _render_line(line: str) -> None:
         own = (_client.whoami is not None
               and (parsed.long_name, parsed.short_name) == _client.whoami)
         _print_msg(parsed.time_str, parsed.long_name, parsed.short_name,
-                   parsed.text, parsed.hops, own=own, is_dm=parsed.is_dm)
+                   parsed.text, parsed.hops, own=own, is_dm=parsed.is_dm,
+                   channel_name=parsed.channel)
 
 
 # ── history + live tail ────────────────────────────────────────────────────────
@@ -272,7 +298,10 @@ def _print_initial_history(n: int = HISTORY_SIZE) -> None:
             lines = path.read_text(encoding="utf-8").splitlines()
         except Exception:
             continue
-        units = _split_into_units(lines) + units
+        file_units = _split_into_units(lines)
+        if _channel_filter is not None:
+            file_units = [u for u in file_units if _channel_matches(u[1])]
+        units = file_units + units
         if len(units) >= n:
             break
 
@@ -362,7 +391,8 @@ async def _cmd_dm(args: str) -> None:
         ))
         return
 
-    send_resp = await _client.request("dm", node_id=node["node_id"], text=text)
+    send_resp = await _client.request("dm", node_id=node["node_id"], text=text,
+                                       channel=_channel_index)
     if not send_resp.get("ok"):
         print_formatted_text(HTML(
             f"<ansired>Ошибка отправки: {_safe(send_resp.get('error', ''))}</ansired>"
@@ -446,9 +476,10 @@ async def _handle_command(text: str) -> None:
 # ── main ──────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    global _loop, _client, _history_ready
+    global _loop, _client, _history_ready, _channel_filter, _channel_index
     _loop = asyncio.get_running_loop()
     _load_name_cache()
+    _channel_filter = _parse_channel_flag()
 
     if not SOCKET_PATH.exists():
         print_formatted_text(HTML(
@@ -479,6 +510,27 @@ async def main() -> None:
             "<ansiyellow>Логгер работает, но устройство пока не подключено</ansiyellow>"
         ))
 
+    if _channel_filter is not None:
+        chresp = await _client.request("channels")
+        channels = chresp.get("channels", []) if chresp.get("ok") else []
+        match = next((c for c in channels if c["name"].lower() == _channel_filter.lower()), None)
+        if not match:
+            available = ", ".join(c["name"] for c in channels) or "нет данных"
+            print_formatted_text(HTML(
+                f"<ansired>Канал '{_safe(_channel_filter)}' не найден. "
+                f"Доступные каналы: {_safe(available)}</ansired>"
+            ))
+            sys.exit(1)
+        _channel_index = match["index"]
+        _channel_filter = match["name"]
+        print_formatted_text(HTML(
+            f"<b><ansicyan>Канал: {_safe(_channel_filter)}</ansicyan></b>"
+        ))
+    else:
+        print_formatted_text(HTML(
+            "<ansiwhite>Показываю сообщения со всех каналов (отправка — в Primary)</ansiwhite>"
+        ))
+
     _print_initial_history(HISTORY_SIZE)
     _history_ready = True
     for lines in _pending_live:
@@ -503,7 +555,7 @@ async def main() -> None:
                     await _handle_command(text)
                     continue
 
-                resp = await _client.request("send", text=text)
+                resp = await _client.request("send", text=text, channel=_channel_index)
                 if not resp.get("ok"):
                     print_formatted_text(HTML(
                         f"<ansired>Ошибка отправки: {_safe(resp.get('error', ''))}</ansired>"
