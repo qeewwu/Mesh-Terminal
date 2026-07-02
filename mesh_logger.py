@@ -20,6 +20,7 @@ import meshtastic.tcp_interface
 from pubsub import pub
 
 from mesh_common import (
+    ACK_TIMEOUT_SECONDS,
     BROADCAST_ADDR,
     HOST,
     LOG_DIR,
@@ -253,19 +254,33 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                     else:
                         text = req.get("text", "")
                         pid_holder = {}
+                        fired = {"done": False}
 
-                        def handler(ack_packet, _holder=pid_holder, _writer=writer, _lock=write_lock):
+                        def emit_delivery(ok, error=None, _holder=pid_holder, _writer=writer,
+                                           _lock=write_lock, _text=text, _fired=fired):
+                            # Runs only on the event loop thread (either via call_soon_threadsafe
+                            # from the meshtastic callback thread, or directly from the timeout
+                            # task), so this check-and-set is race-free.
+                            if _fired["done"]:
+                                return
+                            _fired["done"] = True
+                            event = {"event": "delivery", "packet_id": _holder.get("pid"),
+                                      "ok": ok, "text": _text}
+                            if error:
+                                event["error"] = error
+                            _loop.create_task(_send_json(_writer, event, _lock))
+
+                        def handler(ack_packet, _emit=emit_delivery):
                             decoded = ack_packet.get("decoded", {}) if isinstance(ack_packet, dict) else {}
                             routing = decoded.get("routing", {})
                             error = routing.get("errorReason", "NONE")
                             ok = (error == "NONE")
-                            event = {"event": "delivery", "packet_id": _holder.get("pid"), "ok": ok}
-                            if not ok:
-                                event["error"] = error
                             if _loop:
-                                _loop.call_soon_threadsafe(
-                                    lambda: _loop.create_task(_send_json(_writer, event, _lock))
-                                )
+                                _loop.call_soon_threadsafe(_emit, ok, None if ok else error)
+
+                        async def ack_timeout_watcher(_emit=emit_delivery):
+                            await asyncio.sleep(ACK_TIMEOUT_SECONDS)
+                            _emit(None, "timeout")
 
                         kwargs = dict(wantAck=True, channelIndex=0, onResponse=handler)
                         if cmd == "dm":
@@ -273,6 +288,7 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                         sent = _interface.sendText(text, **kwargs)
                         pid = _packet_id(sent)
                         pid_holder["pid"] = pid
+                        _loop.create_task(ack_timeout_watcher())
 
                         my_id = _interface.myInfo.my_node_num
                         ln, sn = _node_names(my_id)

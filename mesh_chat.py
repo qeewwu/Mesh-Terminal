@@ -174,14 +174,26 @@ class IPCClient:
             self._writer.close()
 
 
+def _snippet(text: str, limit: int = 30) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 def _handle_event(obj: dict) -> None:
     kind = obj.get("event")
     if kind == "delivery":
-        if obj.get("ok"):
-            print_formatted_text(HTML("<ansigreen>  ✓ Доставлено</ansigreen>"))
+        ref = f' "{_safe(_snippet(obj.get("text", "")))}"'
+        ok = obj.get("ok")
+        if ok is True:
+            print_formatted_text(HTML(f"<ansigreen>  ✓ Доставлено{ref}</ansigreen>"))
+        elif ok is False:
+            print_formatted_text(HTML(
+                f"<ansired>  ✗ Не доставлено ({_safe(str(obj.get('error', '')))}){ref}</ansired>"
+            ))
         else:
             print_formatted_text(HTML(
-                f"<ansired>  ✗ Не доставлено ({_safe(str(obj.get('error', '')))})</ansired>"
+                f"<ansiyellow>  ⏳ Нет подтверждения доставки{ref} "
+                f"(мог дойти, но ACK не получен)</ansiyellow>"
             ))
     elif kind == "message":
         lines = obj.get("lines", [])

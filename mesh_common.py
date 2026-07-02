@@ -11,6 +11,7 @@ LOG_DIR = Path("logs")
 SOCKET_PATH = Path("/tmp/mesh_chat.sock")
 BROADCAST_ADDR = 0xFFFFFFFF
 QUOTE_MAX = 60
+ACK_TIMEOUT_SECONDS = 60  # how long to wait for a mesh ACK/NAK before reporting "unknown"
 
 
 def log_file_for(date: datetime.date) -> Path:
