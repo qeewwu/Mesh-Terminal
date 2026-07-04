@@ -29,6 +29,17 @@ ONEMESH_DELAY = 0.25
 
 _XML_INVALID = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]")
 _HEX_ID_RE = re.compile(r"^!([0-9a-f]{8})$")
+# Heuristic for tapback reactions read back from a log file (no "emoji" bit is
+# stored in the log format itself): a short quoted reply whose text is nothing
+# but emoji is almost certainly a reaction, not a real message.
+_EMOJI_ONLY_RE = re.compile(
+    "^[\U0001F300-\U0001FAFF☀-➿⬀-⯿️‍\\s]{1,8}$"
+)
+
+
+def _is_reaction_text(text: str) -> bool:
+    t = text.strip()
+    return bool(t) and bool(_EMOJI_ONLY_RE.match(t))
 
 _loop: asyncio.AbstractEventLoop | None = None
 _client: "IPCClient | None" = None
@@ -159,7 +170,7 @@ def _resolve_display_name(long_name: str, short_name: str) -> tuple[str, str]:
 
 # ── tab completion ────────────────────────────────────────────────────────────
 
-COMMANDS = ["/nodes", "/who", "/dm", "/reply", "/ch", "/search",
+COMMANDS = ["/nodes", "/who", "/dm", "/reply", "/ch", "/search", "/trace",
             "/updatenames", "/clear", "/help"]
 
 
@@ -177,7 +188,7 @@ class MeshCompleter(Completer):
             return
         cmd, _, arg = text.partition(" ")
         cmd = cmd.lower()
-        if cmd == "/dm":
+        if cmd in ("/dm", "/trace"):
             probe = arg.lstrip('"').lower()
             for cand in _completion_nodes:
                 if cand.strip('"').lower().startswith(probe):
@@ -321,8 +332,8 @@ def _handle_event(obj: dict) -> None:
                 "line": lines[-1],
             })
         if _history_ready:
-            for line in lines:
-                _render_line(line)
+            quote = lines[0] if len(lines) == 2 else None
+            _render_unit(quote, lines[-1])
         else:
             _pending_live.append(lines)
 
@@ -338,13 +349,15 @@ def _print_quote(long_name: str, short_name: str, text: str) -> None:
 
 def _print_msg(time_str: str, long_name: str, short_name: str,
                text: str, hops: int, own: bool = False, is_dm: bool = False,
-               dm_out: bool = False, channel_name: str = "") -> None:
+               dm_out: bool = False, channel_name: str = "",
+               snr: float | None = None) -> None:
     ln, sn = _resolve_display_name(long_name, short_name)
     t  = _safe(time_str)
     ln = _safe(ln)
     sn = _safe(sn)
     tx = _safe(text)
     ch = f"<ansimagenta>{_safe(channel_name)}</ansimagenta> " if _channel_filter is None else ""
+    snr_str = f" SNR:{snr:.1f}" if snr is not None else ""
 
     if is_dm:
         # outgoing DM: the logged name is the recipient, so mark direction and
@@ -352,7 +365,7 @@ def _print_msg(time_str: str, long_name: str, short_name: str,
         dm_color = "ansiblue" if dm_out else "ansired"
         arrow = "→ " if dm_out else ""
         print_formatted_text(HTML(
-            f"{ch}<{dm_color}>[{t}] DM {arrow}<b>{ln}</b> ({sn}): {tx} | {hops}</{dm_color}>"
+            f"{ch}<{dm_color}>[{t}] DM {arrow}<b>{ln}</b> ({sn}): {tx} | {hops}{snr_str}</{dm_color}>"
         ))
     else:
         color = "ansiblue" if own else "ansigreen"
@@ -361,8 +374,18 @@ def _print_msg(time_str: str, long_name: str, short_name: str,
             f"<b><{color}>{ln}</{color}></b> "
             f"<{color}>({sn})</{color}>"
             f": {tx} "
-            f"<ansiwhite>| {hops}</ansiwhite>"
+            f"<ansiwhite>| {hops}{snr_str}</ansiwhite>"
         ))
+
+
+def _print_reaction(parsed, quote_parsed) -> None:
+    """Compact one-line rendering of a tapback reaction on top of its quote."""
+    ln, sn = _resolve_display_name(parsed.long_name, parsed.short_name)
+    qln, _ = _resolve_display_name(quote_parsed.long_name, quote_parsed.short_name)
+    print_formatted_text(HTML(
+        f"<ansigray>  {_safe(parsed.text)} <b>{_safe(ln)}</b> → "
+        f"{_safe(qln)}: «{_safe(_snippet(quote_parsed.text, 40))}»</ansigray>"
+    ))
 
 
 def _render_line(line: str) -> None:
@@ -376,7 +399,19 @@ def _render_line(line: str) -> None:
               and (parsed.long_name, parsed.short_name) == _client.whoami)
         _print_msg(parsed.time_str, parsed.long_name, parsed.short_name,
                    parsed.text, parsed.hops, own=own, is_dm=parsed.is_dm,
-                   dm_out=parsed.dm_out, channel_name=parsed.channel)
+                   dm_out=parsed.dm_out, channel_name=parsed.channel, snr=parsed.snr)
+
+
+def _render_unit(quote: str | None, msg: str) -> None:
+    """Render a (quote, message) pair, compacting tapback reactions to one line."""
+    parsed = parse_log_line(msg)
+    quote_parsed = parse_log_line(quote) if quote else None
+    if parsed and parsed.kind == "message" and quote_parsed and _is_reaction_text(parsed.text):
+        _print_reaction(parsed, quote_parsed)
+        return
+    if quote:
+        _render_line(quote)
+    _render_line(msg)
 
 
 # ── history + live tail ────────────────────────────────────────────────────────
@@ -410,9 +445,7 @@ def _print_initial_history(n: int = HISTORY_SIZE) -> None:
             break
 
     for quote, msg in units[-n:]:
-        if quote:
-            _render_line(quote)
-        _render_line(msg)
+        _render_unit(quote, msg)
 
 
 # ── reconnect to logger ───────────────────────────────────────────────────────
@@ -453,9 +486,7 @@ def _replay_missed(lost_at: datetime.datetime) -> None:
                 continue
             if not _channel_matches(msg):
                 continue
-            if quote:
-                _render_line(quote)
-            _render_line(msg)
+            _render_unit(quote, msg)
 
 
 async def _reconnect_logger(lost_at: datetime.datetime) -> None:
@@ -545,6 +576,19 @@ def _cmd_who() -> None:
     ))
 
 
+def _handle_send_response(resp: dict, text: str) -> None:
+    if resp.get("ok"):
+        if resp.get("queued"):
+            print_formatted_text(HTML(
+                f"<ansiyellow>  ⏳ В очереди: «{_safe(_snippet(text, 60))}» — устройство "
+                f"офлайн, отправлю сразу при переподключении</ansiyellow>"
+            ))
+        return
+    print_formatted_text(HTML(
+        f"<ansired>Ошибка отправки: {_safe(resp.get('error', ''))}</ansired>"
+    ))
+
+
 def _split_dm_args(args: str) -> tuple[str | None, str | None]:
     """`/dm Имя текст` или `/dm "Имя С Пробелами" текст`."""
     args = args.strip()
@@ -583,9 +627,67 @@ async def _cmd_dm(args: str) -> None:
 
     send_resp = await _client.request("dm", node_id=node["node_id"], text=text,
                                        channel=_channel_index)
-    if not send_resp.get("ok"):
+    _handle_send_response(send_resp, text)
+
+
+TRACE_TIMEOUT = 45.0  # a bit above the logger's own TRACE_TIMEOUT (40s)
+
+
+def _fmt_trace_hop(h: dict) -> str:
+    ln, sn = _resolve_display_name(h.get("long_name") or "", h.get("short_name") or "???")
+    snr = h.get("snr")
+    snr_str = f" ({snr:+.1f}dB)" if snr is not None else " (?dB)"
+    return f"{_safe(ln)} ({_safe(sn)}){snr_str}"
+
+
+async def _cmd_trace(args: str) -> None:
+    target_name = args.strip()
+    if not target_name:
         print_formatted_text(HTML(
-            f"<ansired>Ошибка отправки: {_safe(send_resp.get('error', ''))}</ansired>"
+            "<ansiyellow>Использование: /trace &lt;имя узла&gt;</ansiyellow>"
+        ))
+        return
+
+    resp = await _client.request("nodes")
+    if not resp.get("ok"):
+        print_formatted_text(HTML(
+            f"<ansired>Не удалось получить список узлов: {_safe(resp.get('error', ''))}</ansired>"
+        ))
+        return
+    node = _find_node_in_list(resp["nodes"], target_name)
+    if not node:
+        print_formatted_text(HTML(
+            f"<ansired>Узел '{_safe(target_name)}' не найден. Проверьте /nodes</ansired>"
+        ))
+        return
+
+    print_formatted_text(HTML(
+        f"<ansiwhite>Трассирую до {_safe(node.get('long_name') or '?')} — "
+        f"может занять до {int(TRACE_TIMEOUT)}с...</ansiwhite>"
+    ))
+    trace_resp = await _client.request("trace", node_id=node["node_id"],
+                                        timeout=TRACE_TIMEOUT)
+    if not trace_resp.get("ok"):
+        print_formatted_text(HTML(
+            f"<ansired>Traceroute не удался: {_safe(trace_resp.get('error', ''))}</ansired>"
+        ))
+        return
+
+    towards = trace_resp.get("towards", [])
+    back = trace_resp.get("back", [])
+    if towards:
+        print_formatted_text(HTML(
+            f"<ansiwhite>Маршрут туда:</ansiwhite> "
+            + " → ".join(_fmt_trace_hop(h) for h in towards)
+        ))
+    if back:
+        print_formatted_text(HTML(
+            f"<ansiwhite>Маршрут обратно:</ansiwhite> "
+            + " → ".join(_fmt_trace_hop(h) for h in back)
+        ))
+    else:
+        print_formatted_text(HTML(
+            "<ansigray>(обратный маршрут не получен)</ansigray>"
         ))
 
 
@@ -661,10 +763,7 @@ async def _cmd_reply(args: str) -> None:
             resp = await _client.request("send", **fields)
     else:
         resp = await _client.request("send", **fields)
-    if not resp.get("ok"):
-        print_formatted_text(HTML(
-            f"<ansired>Ошибка отправки: {_safe(resp.get('error', ''))}</ansired>"
-        ))
+    _handle_send_response(resp, text)
 
 
 async def _cmd_ch(args: str) -> None:
@@ -756,9 +855,7 @@ def _cmd_search(args: str) -> None:
         if date_str != last_date:
             print_formatted_text(HTML(f"<ansigray>── {date_str} ──</ansigray>"))
             last_date = date_str
-        if quote:
-            _render_line(quote)
-        _render_line(msg)
+        _render_unit(quote, msg)
 
 
 def _cmd_clear() -> None:
@@ -814,6 +911,7 @@ def _cmd_help() -> None:
         "  /reply #N &lt;текст&gt;    ответ на сообщение №N из списка /reply",
         "  /ch [имя|all]        показать/сменить канал",
         "  /search &lt;текст&gt;     поиск по истории (учитывает текущий канал)",
+        "  /trace &lt;имя&gt;        маршрут пакетов до узла (traceroute)",
         "  /updatenames         подтянуть имена узлов с OneMesh",
         "  /clear               очистить экран",
         "  /help                эта справка",
@@ -835,6 +933,7 @@ async def _handle_command(text: str) -> None:
     elif cmd == "reply":       await _cmd_reply(args)
     elif cmd == "ch":          await _cmd_ch(args)
     elif cmd == "search":      _cmd_search(args)
+    elif cmd == "trace":       await _cmd_trace(args)
     elif cmd == "updatenames": await _cmd_updatenames()
     elif cmd == "clear":       _cmd_clear()
     elif cmd == "help":        _cmd_help()
@@ -906,8 +1005,8 @@ async def main() -> None:
     _print_initial_history(history_size)
     _history_ready = True
     for lines in _pending_live:
-        for line in lines:
-            _render_line(line)
+        quote = lines[0] if len(lines) == 2 else None
+        _render_unit(quote, lines[-1])
     _pending_live.clear()
 
     await _refresh_completions()
@@ -934,10 +1033,7 @@ async def main() -> None:
                     continue
 
                 resp = await _client.request("send", text=text, channel=_channel_index)
-                if not resp.get("ok"):
-                    print_formatted_text(HTML(
-                        f"<ansired>Ошибка отправки: {_safe(resp.get('error', ''))}</ansired>"
-                    ))
+                _handle_send_response(resp, text)
 
             except (KeyboardInterrupt, EOFError):
                 break

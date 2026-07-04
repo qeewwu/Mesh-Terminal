@@ -67,6 +67,32 @@ class TestMessageRoundTrip(unittest.TestCase):
         p = parse_log_line(format_message_line("11:00:00", "A", "AA", "x", -1))
         self.assertEqual(p.hops, -1)
 
+    def test_snr_present(self):
+        line = format_message_line("12:00:00", "A", "AA", "привет", 3, snr=5.25)
+        p = parse_log_line(line)
+        self.assertEqual(p.snr, 5.25)
+        self.assertEqual(p.hops, 3)
+
+    def test_snr_absent_is_none(self):
+        p = parse_log_line(format_message_line("12:00:00", "A", "AA", "привет", 3))
+        self.assertIsNone(p.snr)
+
+    def test_snr_negative(self):
+        p = parse_log_line(format_message_line("11:00:00", "A", "AA", "x", 0, snr=-12.0))
+        self.assertEqual(p.snr, -12.0)
+
+    def test_legacy_line_has_no_snr(self):
+        p = parse_log_line("[09:00:00] Old (ON): старое | 2")
+        self.assertIsNone(p.snr)
+        self.assertEqual(p.hops, 2)
+
+    def test_text_with_pipe_and_snr(self):
+        line = format_message_line("11:00:00", "A", "AA", "ping | 5", 2, snr=-3.5)
+        p = parse_log_line(line)
+        self.assertEqual(p.text, "ping | 5")
+        self.assertEqual(p.hops, 2)
+        self.assertEqual(p.snr, -3.5)
+
 
 class TestSanitize(unittest.TestCase):
     def test_newlines_collapsed(self):

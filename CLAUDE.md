@@ -71,6 +71,18 @@ shapes flow back to a client:
   parameter; the logger checks via `inspect.signature` and returns a clear error otherwise.
   For sent messages the logger includes `is_dm` and (for DMs) `to_id` in the event metadata,
   so `/reply` can route outgoing DMs correctly.
+- If the device is disconnected, `send`/`dm` don't error out: the logger appends the request
+  (with its writer/lock so a later delivery event can still reach the same client) to `_outbox`
+  (bounded, `OUTBOX_MAX`) and responds `{"ok": true, "queued": true}`. `_flush_outbox()` runs
+  automatically from `_do_connect()` on every successful (re)connect, actually transmitting each
+  queued item via the same `_send_message()` helper the live path uses.
+- `cmd == "trace"` runs `_do_traceroute()`, a from-scratch traceroute (not the library's built-in
+  `sendTraceRoute`, which blocks and prints straight to stdout instead of returning structured
+  data) built on `sendData(portNum=TRACEROUTE_APP)` + a custom `onResponse`. Response packet
+  field semantics are non-obvious and easy to get backwards: `p["to"]` is *us* (the original
+  requester) and `p["from"]` is the *traced node* — mirrors meshtastic's own
+  `onResponseTraceRoute`. `towards` = [us, ...route hops with SNR, traced node]; `back` = [traced
+  node, ...routeBack hops, us] (empty if the far end never sent a return path).
 
 ### Reply/quote handling
 
@@ -88,6 +100,13 @@ Note: many community "ping bots" embed the target's hex node ID as plain text in
 (e.g. `🤖 Pong !1ba60314`) instead of using the real `replyId` field — these will never show a
 quote line, which is expected, not a bug.
 
+Tapback reactions (meshtastic sets `decoded.emoji` truthy) are just a reply whose text is the
+emoji itself, so they get the same quote-line treatment in the log — no format change needed.
+`mesh_chat.py` additionally compacts a (quote, message) pair into one line when the message text
+looks like nothing but emoji (`_is_reaction_text`, a regex heuristic — the log format has no
+"is this a reaction" bit to read back after a restart, so both live and history rendering use the
+same heuristic for consistency rather than trusting the logger's more precise live `is_emoji` meta).
+
 ### Log line format
 
 Two line kinds, parsed by `parse_log_line` in `mesh_common.py`:
@@ -97,9 +116,11 @@ Two line kinds, parsed by `parse_log_line` in `mesh_common.py`:
 ```
 `<channel>` is the channel's display name (`Channel.settings.name`, or `"Primary"` for channel 0
 when unnamed). `<DM tag>` is empty for broadcast, `DM ` for an incoming DM, `DM → ` for an
-outgoing DM. This grammar is deliberately simple/regex-friendly since `mesh_chat.py` re-renders
-colored terminal output entirely by parsing these plain-text lines (from history file reads and
-from pushed "message" events) — it never has direct access to raw packet objects.
+outgoing DM. An optional ` SNR:<float>` suffix follows `<hops>` when the device reported
+`rxSnr` on the packet (absent for locally-sent messages and old log lines — `ParsedLine.snr` is
+`None` in both cases). This grammar is deliberately simple/regex-friendly since `mesh_chat.py`
+re-renders colored terminal output entirely by parsing these plain-text lines (from history file
+reads and from pushed "message" events) — it never has direct access to raw packet objects.
 
 ### Channels
 

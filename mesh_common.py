@@ -40,6 +40,7 @@ class ParsedLine(NamedTuple):
     text: str = ""
     hops: int = 0
     channel: str = "Primary"
+    snr: float | None = None
 
 
 def truncate(text: str, limit: int = QUOTE_MAX) -> str:
@@ -61,16 +62,18 @@ def format_quote_line(long_name: str, short_name: str, text: str) -> str:
 
 def format_message_line(time_str: str, long_name: str, short_name: str,
                          text: str, hops: int, dm_tag: str = "",
-                         channel_name: str = "Primary") -> str:
+                         channel_name: str = "Primary",
+                         snr: float | None = None) -> str:
+    snr_suffix = f" SNR:{snr:.2f}" if snr is not None else ""
     return (f"{channel_name} [{time_str}] {dm_tag}{long_name} ({short_name}): "
-            f"{sanitize_text(text)} | {hops}")
+            f"{sanitize_text(text)} | {hops}{snr_suffix}")
 
 
 _MSG_RE = re.compile(
     r"^(?:(?P<channel>.+?) )?\[(?P<time>\d{2}:\d{2}:\d{2})\] "
     r"(?P<dm>DM (?:→ )?)?"
     r"(?P<name>.+?) \((?P<short>[^)]*)\): "
-    r"(?P<text>.*) \| (?P<hops>-?\d+)$"
+    r"(?P<text>.*) \| (?P<hops>-?\d+)(?: SNR:(?P<snr>-?\d+(?:\.\d+)?))?$"
 )
 _QUOTE_RE = re.compile(r"^  ┆ (?P<name>.+?) \((?P<short>[^)]*)\): (?P<text>.*)$")
 
@@ -83,6 +86,7 @@ def parse_log_line(line: str):
     m = _MSG_RE.match(line)
     if m:
         dm_tag = m.group("dm") or ""
+        snr_str = m.group("snr")
         return ParsedLine(
             kind="message",
             time_str=m.group("time"),
@@ -93,6 +97,7 @@ def parse_log_line(line: str):
             text=m.group("text"),
             hops=int(m.group("hops")),
             channel=m.group("channel") or "Primary",
+            snr=float(snr_str) if snr_str is not None else None,
         )
     m = _QUOTE_RE.match(line)
     if m:
