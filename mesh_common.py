@@ -56,8 +56,10 @@ def sanitize_text(text: str) -> str:
     return _NEWLINES.sub(" ⏎ ", text)
 
 
-def format_quote_line(long_name: str, short_name: str, text: str) -> str:
-    return f"  ┆ {long_name} ({short_name}): {truncate(sanitize_text(text))}"
+def format_quote_line(long_name: str, short_name: str, text: str,
+                       time_str: str = "") -> str:
+    time_prefix = f"[{time_str}] " if time_str else ""
+    return f"  ┆ {time_prefix}{long_name} ({short_name}): {truncate(sanitize_text(text))}"
 
 
 def format_message_line(time_str: str, long_name: str, short_name: str,
@@ -75,7 +77,10 @@ _MSG_RE = re.compile(
     r"(?P<name>.+?) \((?P<short>[^)]*)\): "
     r"(?P<text>.*) \| (?P<hops>-?\d+)(?: SNR:(?P<snr>-?\d+(?:\.\d+)?))?$"
 )
-_QUOTE_RE = re.compile(r"^  ┆ (?P<name>.+?) \((?P<short>[^)]*)\): (?P<text>.*)$")
+_QUOTE_RE = re.compile(
+    r"^  ┆ (?:\[(?P<time>\d{2}:\d{2}:\d{2})\] )?"
+    r"(?P<name>.+?) \((?P<short>[^)]*)\): (?P<text>.*)$"
+)
 
 
 def parse_log_line(line: str):
@@ -103,6 +108,7 @@ def parse_log_line(line: str):
     if m:
         return ParsedLine(
             kind="quote",
+            time_str=m.group("time") or "",
             long_name=m.group("name"),
             short_name=m.group("short"),
             text=m.group("text"),

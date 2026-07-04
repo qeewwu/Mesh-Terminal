@@ -23,6 +23,7 @@ NAME_CACHE_FILE = BASE_DIR / "node_names_cache.json"
 HISTORY_SIZE = 100
 CH_SWITCH_HISTORY = 10   # сколько истории показать после /ch
 SEARCH_LIMIT = 20
+ONLINE_THRESHOLD_SECONDS = 15 * 60  # узел считается «онлайн», если был на связи недавнее этого
 RECONNECT_DELAY = 3  # seconds between attempts to re-reach the logger socket
 ONEMESH_API = "https://map.onemesh.ru/api/v1/nodes/{}"
 ONEMESH_DELAY = 0.25
@@ -170,7 +171,7 @@ def _resolve_display_name(long_name: str, short_name: str) -> tuple[str, str]:
 
 # ── tab completion ────────────────────────────────────────────────────────────
 
-COMMANDS = ["/nodes", "/who", "/dm", "/reply", "/ch", "/search", "/trace",
+COMMANDS = ["/nodes", "/who", "/dm", "/reply", "/ch", "/send", "/search", "/trace",
             "/updatenames", "/clear", "/help"]
 
 
@@ -193,10 +194,20 @@ class MeshCompleter(Completer):
             for cand in _completion_nodes:
                 if cand.strip('"').lower().startswith(probe):
                     yield Completion(cand, start_position=-len(arg))
+        elif cmd == "/nodes":
+            for cand in NODE_SORT_MODES:
+                if cand.startswith(arg.lower()):
+                    yield Completion(cand, start_position=-len(arg))
         elif cmd == "/ch":
             for cand in _completion_channels + ["all"]:
                 if cand.lower().startswith(arg.lower()):
                     yield Completion(cand, start_position=-len(arg))
+        elif cmd == "/send":
+            # completes only the first token (channel name); leaves the text alone
+            if " " not in arg:
+                for cand in _completion_channels:
+                    if cand.lower().startswith(arg.lower()):
+                        yield Completion(cand, start_position=-len(arg))
 
 
 def _update_node_completions(nodes: list[dict]) -> None:
@@ -340,10 +351,11 @@ def _handle_event(obj: dict) -> None:
 
 # ── display ───────────────────────────────────────────────────────────────────
 
-def _print_quote(long_name: str, short_name: str, text: str) -> None:
+def _print_quote(long_name: str, short_name: str, text: str, time_str: str = "") -> None:
     ln, sn = _resolve_display_name(long_name, short_name)
+    t = f"[{_safe(time_str)}] " if time_str else ""
     print_formatted_text(HTML(
-        f"<ansigray>  ┆ {_safe(ln)} ({_safe(sn)}): {_safe(text)}</ansigray>"
+        f"<ansigray>  ┆ {t}{_safe(ln)} ({_safe(sn)}): {_safe(text)}</ansigray>"
     ))
 
 
@@ -382,9 +394,10 @@ def _print_reaction(parsed, quote_parsed) -> None:
     """Compact one-line rendering of a tapback reaction on top of its quote."""
     ln, sn = _resolve_display_name(parsed.long_name, parsed.short_name)
     qln, _ = _resolve_display_name(quote_parsed.long_name, quote_parsed.short_name)
+    qt = f"[{_safe(quote_parsed.time_str)}] " if quote_parsed.time_str else ""
     print_formatted_text(HTML(
         f"<ansigray>  {_safe(parsed.text)} <b>{_safe(ln)}</b> → "
-        f"{_safe(qln)}: «{_safe(_snippet(quote_parsed.text, 40))}»</ansigray>"
+        f"{qt}{_safe(qln)}: «{_safe(_snippet(quote_parsed.text, 40))}»</ansigray>"
     ))
 
 
@@ -393,7 +406,7 @@ def _render_line(line: str) -> None:
     if not parsed:
         return
     if parsed.kind == "quote":
-        _print_quote(parsed.long_name, parsed.short_name, parsed.text)
+        _print_quote(parsed.long_name, parsed.short_name, parsed.text, parsed.time_str)
     else:
         own = (_client.whoami is not None
               and (parsed.long_name, parsed.short_name) == _client.whoami)
@@ -520,45 +533,79 @@ async def _reconnect_logger(lost_at: datetime.datetime) -> None:
 
 # ── commands ──────────────────────────────────────────────────────────────────
 
-async def _cmd_nodes() -> None:
+NODE_SORT_MODES = ("online", "names", "hops")
+
+
+def _node_sort_key(n: dict, mode: str = "online"):
+    is_online = n["seconds_ago"] is not None and n["seconds_ago"] < ONLINE_THRESHOLD_SECONDS
+    name_key = n["display_long"].lower()
+    hops = n.get("hops_away")
+    hops_key = hops if hops is not None else 999
+    if mode == "names":
+        return (name_key, not is_online, hops_key)
+    if mode == "hops":
+        return (hops_key, not is_online, name_key)
+    return (not is_online, name_key, hops_key)  # mode == "online" (default)
+
+
+async def _cmd_nodes(args: str = "") -> None:
+    mode = args.strip().lower() or "online"
+    if mode not in NODE_SORT_MODES:
+        print_formatted_text(HTML(
+            f"<ansiyellow>Неизвестная сортировка '{_safe(mode)}'. "
+            f"Доступные: {', '.join(NODE_SORT_MODES)}</ansiyellow>"
+        ))
+        return
+
     resp = await _client.request("nodes")
     if not resp.get("ok") or not resp.get("nodes"):
         print_formatted_text(HTML("<ansiyellow>Нет данных об узлах</ansiyellow>"))
         return
 
     _update_node_completions(resp["nodes"])
-    print_formatted_text(HTML("<ansiwhite>─── Видимые узлы ───</ansiwhite>"))
+
+    enriched = []
     for n in resp["nodes"]:
         if n["has_user"]:
-            ln, sn = _safe(n["long_name"]), _safe(n["short_name"])
+            ln, sn = n["long_name"], n["short_name"]
         else:
             cached = _name_cache.get(n["node_id"])
             if cached:
-                ln, sn = _safe(cached[0]), _safe(cached[1])
+                ln, sn = cached
             else:
                 ln, sn = f"!{n['node_id']:08x}", "???"
                 _unresolved_ids.add(n["node_id"])
+        enriched.append({**n, "display_long": ln, "display_short": sn})
+
+    enriched.sort(key=lambda n: _node_sort_key(n, mode))
+
+    print_formatted_text(HTML("<ansiwhite>─── Видимые узлы ───</ansiwhite>"))
+    for n in enriched:
+        ln, sn = _safe(n["display_long"]), _safe(n["display_short"])
 
         battery = n.get("battery")
         bat_str = f" 🔋{battery}%" if battery is not None else ""
         snr = n.get("snr")
         snr_str = f" SNR:{snr:.1f}" if snr is not None else ""
+        hops = n.get("hops_away")
+        hops_str = f" · {hops} хоп{'' if hops == 1 else 'а' if 2 <= hops <= 4 else 'ов'}" \
+            if hops is not None else ""
 
-        ago = n.get("seconds_ago")
-        if ago is not None:
-            if ago < 60:
-                heard, color = f"{ago}с", "ansigreen"
-            elif ago < 3600:
-                heard, color = f"{ago // 60}м", "ansiyellow"
+        ago = n["seconds_ago"]
+        if ago is not None and ago < ONLINE_THRESHOLD_SECONDS:
+            heard, color = "Онлайн", "ansigreen"
+        elif ago is not None:
+            if ago < 3600:
+                heard, color = f"{ago // 60}м назад", "ansiyellow"
             else:
-                heard, color = f"{ago // 3600}ч", "ansigray"
+                heard, color = f"{ago // 3600}ч назад", "ansigray"
         else:
             heard, color = "?", "ansigray"
 
         print_formatted_text(HTML(
             f"  <b><ansigreen>{ln}</ansigreen></b> <ansigreen>({sn})</ansigreen>"
-            f"<ansiwhite>{bat_str}{snr_str}</ansiwhite>"
-            f" <{color}>· {heard} назад</{color}>"
+            f"<ansiwhite>{bat_str}{snr_str}{hops_str}</ansiwhite>"
+            f" <{color}>· {heard}</{color}>"
         ))
 
 
@@ -812,6 +859,32 @@ async def _cmd_ch(args: str) -> None:
     _print_initial_history(CH_SWITCH_HISTORY)
 
 
+async def _cmd_send(args: str) -> None:
+    """One-off send to a specific channel without switching the session's
+    current channel (unlike /ch, which changes what /reply and history filter to)."""
+    parts = args.strip().split(None, 1)
+    if len(parts) < 2:
+        print_formatted_text(HTML(
+            "<ansiyellow>Использование: /send &lt;канал&gt; &lt;текст&gt;</ansiyellow>"
+        ))
+        return
+    channel_name, text = parts
+
+    resp = await _client.request("channels")
+    channels = resp.get("channels", []) if resp.get("ok") else []
+    match = next((c for c in channels if c["name"].lower() == channel_name.lower()), None)
+    if not match:
+        available = ", ".join(c["name"] for c in channels) or "нет данных"
+        print_formatted_text(HTML(
+            f"<ansired>Канал '{_safe(channel_name)}' не найден. "
+            f"Доступные: {_safe(available)}</ansired>"
+        ))
+        return
+
+    send_resp = await _client.request("send", text=text, channel=match["index"])
+    _handle_send_response(send_resp, text)
+
+
 def _cmd_search(args: str) -> None:
     query = args.strip().lower()
     if not query:
@@ -903,13 +976,14 @@ async def _cmd_updatenames() -> None:
 def _cmd_help() -> None:
     lines = [
         "─── Команды ───────────────────────────────────────────────",
-        "  /nodes               список видимых узлов",
+        "  /nodes [online|names|hops]  список видимых узлов (сортировка, по умолчанию online)",
         "  /who                 информация о себе",
         "  /dm &lt;имя&gt; &lt;текст&gt;   личное сообщение (имя с пробелами — в кавычках)",
         "  /reply               список недавних сообщений, на которые можно ответить",
         "  /reply &lt;текст&gt;       ответ (с цитатой) на последнее полученное сообщение",
         "  /reply #N &lt;текст&gt;    ответ на сообщение №N из списка /reply",
         "  /ch [имя|all]        показать/сменить канал",
+        "  /send &lt;канал&gt; &lt;текст&gt; разовая отправка в канал без переключения сессии",
         "  /search &lt;текст&gt;     поиск по истории (учитывает текущий канал)",
         "  /trace &lt;имя&gt;        маршрут пакетов до узла (traceroute)",
         "  /updatenames         подтянуть имена узлов с OneMesh",
@@ -927,11 +1001,12 @@ async def _handle_command(text: str) -> None:
     cmd  = parts[0].lower() if parts else ""
     args = parts[1] if len(parts) > 1 else ""
 
-    if   cmd == "nodes":       await _cmd_nodes()
+    if   cmd == "nodes":       await _cmd_nodes(args)
     elif cmd == "who":         _cmd_who()
     elif cmd == "dm":          await _cmd_dm(args)
     elif cmd == "reply":       await _cmd_reply(args)
     elif cmd == "ch":          await _cmd_ch(args)
+    elif cmd == "send":        await _cmd_send(args)
     elif cmd == "search":      _cmd_search(args)
     elif cmd == "trace":       await _cmd_trace(args)
     elif cmd == "updatenames": await _cmd_updatenames()

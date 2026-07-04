@@ -125,6 +125,24 @@ class TestQuoteRoundTrip(unittest.TestCase):
         self.assertEqual(len(q.text), QUOTE_MAX + 1)  # limit + "…"
         self.assertTrue(q.text.endswith("…"))
 
+    def test_with_time(self):
+        q = parse_log_line(format_quote_line("Вася", "ВП", "исходный текст", "00:52:56"))
+        self.assertEqual(q.time_str, "00:52:56")
+        self.assertEqual(q.long_name, "Вася")
+        self.assertEqual(q.text, "исходный текст")
+
+    def test_without_time_is_empty_string(self):
+        q = parse_log_line(format_quote_line("A", "AA", "текст"))
+        self.assertEqual(q.time_str, "")
+
+    def test_legacy_quote_line_has_no_time(self):
+        # старые записи в логах, сделанные до появления времени в цитатах
+        q = parse_log_line("  ┆ Вася (ВП): старая цитата без времени")
+        self.assertEqual(q.kind, "quote")
+        self.assertEqual(q.time_str, "")
+        self.assertEqual(q.long_name, "Вася")
+        self.assertEqual(q.text, "старая цитата без времени")
+
 
 class TestUnparseable(unittest.TestCase):
     def test_garbage_and_empty(self):

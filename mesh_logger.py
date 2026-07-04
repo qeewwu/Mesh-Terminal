@@ -51,6 +51,7 @@ class MsgRecord(NamedTuple):
     long_name: str
     short_name: str
     text: str
+    time_str: str = ""
 
 
 _store: dict[int, MsgRecord] = {}
@@ -135,11 +136,15 @@ async def _broadcast(lines: list[str], meta: dict | None = None) -> None:
 def _write_message(long_name: str, short_name: str, text: str, hops: int,
                     dm_tag: str = "", reply_to: MsgRecord | None = None,
                     channel_index: int = 0, meta: dict | None = None,
-                    snr: float | None = None) -> None:
-    now = datetime.datetime.now().strftime("%H:%M:%S")
+                    snr: float | None = None, time_str: str | None = None) -> None:
+    # accepts an explicit time_str so callers can reuse the exact timestamp
+    # they already stored in _store for this message (no clock-skew mismatch
+    # between the message line and a later reply's quoted time)
+    now = time_str or datetime.datetime.now().strftime("%H:%M:%S")
     lines = []
     if reply_to:
-        lines.append(format_quote_line(reply_to.long_name, reply_to.short_name, reply_to.text))
+        lines.append(format_quote_line(reply_to.long_name, reply_to.short_name,
+                                       reply_to.text, reply_to.time_str))
     lines.append(format_message_line(now, long_name, short_name, text, hops, dm_tag,
                                       channel_name=_channel_name(channel_index), snr=snr))
     _log(*lines)
@@ -179,14 +184,15 @@ def on_receive(packet, interface):
 
         long_name, short_name = _node_names(from_id)
         reply_to = _store.get(reply_id) if reply_id else None
+        now = datetime.datetime.now().strftime("%H:%M:%S")
         if packet_id:
-            _store_msg(packet_id, MsgRecord(long_name, short_name, text))
+            _store_msg(packet_id, MsgRecord(long_name, short_name, text, now))
 
         # meta lets clients offer "/reply" on this message (packet id → replyId)
         # and render tapback reactions (emoji=True) compactly
         _write_message(long_name, short_name, text, hops,
                        dm_tag=("DM " if is_dm else ""), reply_to=reply_to,
-                       channel_index=channel_index, snr=snr,
+                       channel_index=channel_index, snr=snr, time_str=now,
                        meta={"packet_id": packet_id, "from_id": from_id,
                              "is_dm": is_dm, "channel_index": channel_index,
                              "is_emoji": is_emoji})
@@ -307,6 +313,7 @@ def _nodes_payload() -> list[dict]:
             "has_user": bool(u),
             "battery": metrics.get("batteryLevel"),
             "snr": node.get("snr"),
+            "hops_away": node.get("hopsAway"),
             "seconds_ago": int(now_ts - last_heard) if last_heard else None,
         })
     return out
@@ -368,20 +375,21 @@ async def _send_message(cmd: str, text: str, channel_index: int, reply_id: int =
 
     my_id = _interface.myInfo.my_node_num
     ln, sn = _node_names(my_id)
+    now = datetime.datetime.now().strftime("%H:%M:%S")
     if pid:
-        _store_msg(pid, MsgRecord(ln, sn, text))
+        _store_msg(pid, MsgRecord(ln, sn, text, now))
 
     # our own reply gets the same quote line in the log
     reply_rec = _store.get(reply_id) if reply_id else None
     if cmd == "dm":
         dest_ln, dest_sn = _node_names(node_id)
         _write_message(dest_ln, dest_sn, text, 0, dm_tag="DM → ",
-                       reply_to=reply_rec, channel_index=channel_index,
+                       reply_to=reply_rec, channel_index=channel_index, time_str=now,
                        meta={"packet_id": pid, "from_id": my_id, "to_id": node_id,
                              "is_dm": True, "channel_index": channel_index})
     else:
         _write_message(ln, sn, text, 0, reply_to=reply_rec,
-                       channel_index=channel_index,
+                       channel_index=channel_index, time_str=now,
                        meta={"packet_id": pid, "from_id": my_id, "is_dm": False,
                              "channel_index": channel_index})
 

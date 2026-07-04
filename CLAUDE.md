@@ -111,7 +111,7 @@ same heuristic for consistency rather than trusting the logger's more precise li
 
 Two line kinds, parsed by `parse_log_line` in `mesh_common.py`:
 ```
-  ┆ <name> (<short>): <quoted text>                          # quote line (optional, precedes a reply)
+  ┆ [HH:MM:SS] <name> (<short>): <quoted text>                    # quote line (optional, precedes a reply)
 <channel> [HH:MM:SS] <DM tag><name> (<short>): <text> | <hops>   # message line
 ```
 `<channel>` is the channel's display name (`Channel.settings.name`, or `"Primary"` for channel 0
@@ -122,6 +122,14 @@ outgoing DM. An optional ` SNR:<float>` suffix follows `<hops>` when the device 
 re-renders colored terminal output entirely by parsing these plain-text lines (from history file
 reads and from pushed "message" events) — it never has direct access to raw packet objects.
 
+The quote line's `[HH:MM:SS]` prefix is the *original* message's time (when it was first logged),
+not the time of the reply — `_QUOTE_RE` in `mesh_common.py` makes this group optional so old log
+lines written before this existed (no time in the quote) still parse fine, just with
+`ParsedLine.time_str == ""`. `mesh_logger.py`'s `MsgRecord` (the `_store` value type) carries a
+`time_str` field for exactly this: `on_receive` and `_send_message` compute the timestamp once,
+store it in `MsgRecord`, and pass the same string into `_write_message(time_str=...)` so the
+message line and any later reply's quote never drift from each other or from real time.
+
 ### Channels
 
 `mesh_logger.py` logs text messages from **every** channel (it doesn't filter by `channel`
@@ -131,8 +139,12 @@ index), and resolves index → name via `_channel_name()` (reads `interface.loca
 the legacy shorthand `--<name>`, e.g. `mesh_chat.py --ping`), it resolves that name to an index
 via the `channels` IPC command, restricts history/live display to that channel only (prefix
 hidden, since it's implied), and sends/DMs go out on that channel's index. `--history N` sets
-how much history is shown at startup (default 50). The `send`/`dm` IPC commands both take an optional
-`channel` field (channel index, default 0) for this purpose.
+how much history is shown at startup (default `HISTORY_SIZE`, currently 100). The `send`/`dm`
+IPC commands both take an optional `channel` field (channel index, default 0) for this purpose.
+`/send <channel> <text>` (`_cmd_send`) is a one-off send to an arbitrary channel by name — it
+looks up the channel via the same `channels` IPC command `/ch` uses, but unlike `/ch` it never
+touches `_channel_filter`/`_channel_index`, so the session's current channel, history filter,
+and `/reply` targets are unaffected.
 
 ### Node name resolution
 
@@ -141,6 +153,24 @@ mesh) via the public OneMesh API (`https://map.onemesh.ru/api/v1/nodes/{decimal_
 triggered by the `/updatenames` command. Results are cached in `node_names_cache.json` so they
 persist across restarts. This resolution happens only in the display layer — it does not touch
 `logs/`, so historical log lines keep whatever name was known to the device at write time.
+
+### `/nodes` sorting and online status
+
+`mesh_logger.py`'s `_nodes_payload()` includes `hops_away` (from the protobuf `NodeInfo.hops_away`,
+appears as `hopsAway` in the `MessageToDict`-converted node dict — absent for nodes the firmware
+hasn't reported it for). `mesh_chat.py`'s `_cmd_nodes()` first resolves display names (same
+OneMesh-cache logic as before) into each node dict as `display_long`/`display_short`, *then* sorts
+via `_node_sort_key(n, mode)`. Sorting happens after name resolution specifically so the
+alphabetical order matches what's on screen, not raw `!hex` node IDs for unresolved nodes.
+
+`/nodes [online|names|hops]` (`NODE_SORT_MODES`) picks which key is primary — the other two
+still apply as tiebreakers, just demoted:
+- `online` (default): online status desc → name → hops
+- `names`: name → online status desc → hops
+- `hops`: hops asc (`None` last) → online status desc → name
+
+A node counts as "online" when `seconds_ago < ONLINE_THRESHOLD_SECONDS` (15 minutes) — this is a
+display-layer heuristic in `mesh_chat.py`, not something the device/logger reports.
 
 ### Deploying changes
 
