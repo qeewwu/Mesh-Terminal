@@ -59,7 +59,20 @@ def sanitize_text(text: str) -> str:
 def format_quote_line(long_name: str, short_name: str, text: str,
                        time_str: str = "") -> str:
     time_prefix = f"[{time_str}] " if time_str else ""
-    return f"  ┆ {time_prefix}{long_name} ({short_name}): {truncate(sanitize_text(text))}"
+    return (f"  ┆ {time_prefix}{long_name or '?'} ({short_name}): "
+            f"{truncate(sanitize_text(text))}")
+
+
+def _escape_name(long_name: str, dm_tag: str) -> str:
+    """`<DM tag><name>` is ambiguous when the name itself could extend the tag
+    ("DM Master" broadcast, or "→ X" after an incoming-DM tag) — the parser
+    would misread it as a DM marker. Swap the ambiguous space for a
+    non-breaking one; an empty name would not parse at all, so fall back."""
+    if not dm_tag and long_name.startswith("DM "):
+        long_name = "DM\u00a0" + long_name[3:]
+    elif dm_tag == "DM " and long_name.startswith("→ "):
+        long_name = "→\u00a0" + long_name[2:]
+    return long_name or "?"
 
 
 def format_message_line(time_str: str, long_name: str, short_name: str,
@@ -67,8 +80,8 @@ def format_message_line(time_str: str, long_name: str, short_name: str,
                          channel_name: str = "Primary",
                          snr: float | None = None) -> str:
     snr_suffix = f" SNR:{snr:.2f}" if snr is not None else ""
-    return (f"{channel_name} [{time_str}] {dm_tag}{long_name} ({short_name}): "
-            f"{sanitize_text(text)} | {hops}{snr_suffix}")
+    return (f"{channel_name} [{time_str}] {dm_tag}{_escape_name(long_name, dm_tag)} "
+            f"({short_name}): {sanitize_text(text)} | {hops}{snr_suffix}")
 
 
 _MSG_RE = re.compile(

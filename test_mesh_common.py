@@ -63,6 +63,27 @@ class TestMessageRoundTrip(unittest.TestCase):
         self.assertEqual(p.long_name, "Bob (admin)")
         self.assertEqual(p.short_name, "BB")
 
+    def test_name_with_dm_prefix_is_not_a_dm(self):
+        # узел с именем «DM Master» не должен парситься как входящий DM
+        line = format_message_line("12:00:00", "DM Master", "DMM", "hi", 0)
+        p = parse_log_line(line)
+        self.assertFalse(p.is_dm)
+        self.assertEqual(p.short_name, "DMM")
+        # пробел после «DM» заменён на неразрывный (\u00a0), отображение почти не меняется
+        self.assertEqual(p.long_name, "DM\u00a0Master")
+
+    def test_dm_from_node_with_arrow_prefix_is_not_outgoing(self):
+        line = format_message_line("12:00:00", "→ Стрелка", "СТ", "hi", 0, dm_tag="DM ")
+        p = parse_log_line(line)
+        self.assertTrue(p.is_dm)
+        self.assertFalse(p.dm_out)
+
+    def test_empty_long_name_still_parses(self):
+        p = parse_log_line(format_message_line("12:00:00", "", "AB", "hi", 0))
+        self.assertIsNotNone(p)
+        self.assertEqual(p.long_name, "?")
+        self.assertEqual(p.short_name, "AB")
+
     def test_negative_hops(self):
         p = parse_log_line(format_message_line("11:00:00", "A", "AA", "x", -1))
         self.assertEqual(p.hops, -1)

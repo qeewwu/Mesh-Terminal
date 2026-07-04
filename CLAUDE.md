@@ -41,6 +41,9 @@ connection:
   for `SILENCE_TIMEOUT` → heartbeat probe → forced reconnect on failure), appends every text
   message to a daily log file under `logs/`, and exposes a Unix socket (`SOCKET_PATH` in
   `mesh_common.py`, default `/tmp/mesh_chat.sock`, chmod 0600) as an IPC broker.
+  In the reconnect loop, `_do_connect()`/`close()` run via `asyncio.to_thread` — the
+  `TCPInterface` constructor blocks for seconds (DNS + connect + config wait), and running it on
+  the event loop would freeze all IPC clients for the duration.
 - **`mesh_chat.py`** — the interactive prompt_toolkit TUI. Never touches the device directly.
   Talks to the logger exclusively over the Unix socket: sending messages, DMs, and node queries
   are all RPC calls (`send`, `dm`, `nodes`, `whoami`) over a newline-delimited JSON protocol.
@@ -61,7 +64,10 @@ shapes flow back to a client:
   pending `asyncio.Future` in the client's `IPCClient._pending` dict.
 - **Events** (unsolicited, pushed by the logger): `{"event": "delivery", ...}` for ACK/NAK after
   a send, and `{"event": "message", "lines": [...]}` broadcast to every connected client the
-  instant a new message is logged. For received messages the event also carries `packet_id`,
+  instant a new message is logged. Every per-client write (broadcast and response alike) is
+  bounded by `CLIENT_SEND_TIMEOUT`: a client that stopped reading (e.g. a suspended terminal)
+  fills its socket buffer and would otherwise hold its write lock in `drain()` forever, stalling
+  broadcasts to everyone else — instead it gets disconnected. For received messages the event also carries `packet_id`,
   `from_id`, `is_dm`, `channel_index` — the client tracks the latest one as the `/reply` target.
   There is no polling — the logger pushes live updates directly, so `mesh_chat.py` only reads
   history once at startup (last 50 messages, walking `logs/` files newest-first via
@@ -122,6 +128,14 @@ outgoing DM. An optional ` SNR:<float>` suffix follows `<hops>` when the device 
 re-renders colored terminal output entirely by parsing these plain-text lines (from history file
 reads and from pushed "message" events) — it never has direct access to raw packet objects.
 
+`<DM tag><name>` is inherently ambiguous when the name could extend the tag (a node named
+"DM Master", or "→ X" after an incoming-DM tag) — the parser cannot recover this, so
+`_escape_name` in `mesh_common.py` fixes it at write time by swapping the ambiguous space for a
+non-breaking one (U+00A0, visually identical). It also substitutes `?` for an empty long name
+(an empty name makes the line unparseable, and the message would silently vanish from clients);
+`_node_names` in `mesh_logger.py` guards the same case at the source with `or`-fallbacks, since
+firmware can report `longName`/`shortName` keys holding empty strings.
+
 The quote line's `[HH:MM:SS]` prefix is the *original* message's time (when it was first logged),
 not the time of the reply — `_QUOTE_RE` in `mesh_common.py` makes this group optional so old log
 lines written before this existed (no time in the quote) still parse fine, just with
@@ -145,6 +159,11 @@ IPC commands both take an optional `channel` field (channel index, default 0) fo
 looks up the channel via the same `channels` IPC command `/ch` uses, but unlike `/ch` it never
 touches `_channel_filter`/`_channel_index`, so the session's current channel, history filter,
 and `/reply` targets are unaffected.
+
+Incoming DMs arrive on channel index 0, so a session filtered with `--channel <name>` (or `/ch`)
+does **not** display them — this is a deliberate decision, not a bug: a filtered session is meant
+to be a clean view of that one channel. Run an unfiltered client (multiple clients can share the
+logger) to watch DMs; nothing is lost — DMs are always in `logs/` regardless of any client's filter.
 
 ### Node name resolution
 

@@ -39,6 +39,9 @@ STORE_SIZE = 300
 # (a silently dead WiFi link doesn't always fire connection.lost)
 SILENCE_TIMEOUT = 600
 OUTBOX_MAX = 50  # queued sends while the device is disconnected
+# a client that stopped reading (suspended terminal) fills its socket buffer;
+# past this timeout it is disconnected so it can't stall pushes to everyone else
+CLIENT_SEND_TIMEOUT = 5
 TRACE_TIMEOUT = 40  # a traceroute is a full round trip across the mesh, can be slow
 
 _interface = None
@@ -77,7 +80,9 @@ def _node_names(node_id: int) -> tuple[str, str]:
         node = _interface.nodes.get(node_id) or _interface.nodes.get(hex_id)
         if node and "user" in node:
             u = node["user"]
-            return u.get("longName", hex_id), u.get("shortName", "???")
+            # `or`, not a dict default: firmware can report the key with an
+            # empty string, and an empty name makes the log line unparseable
+            return u.get("longName") or hex_id, u.get("shortName") or "???"
     return f"!{node_id:08x}", "???"
 
 
@@ -127,10 +132,20 @@ async def _broadcast(lines: list[str], meta: dict | None = None) -> None:
         event.update(meta)
     data = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
     for writer, lock in list(_clients.items()):
-        async with lock:
-            with contextlib.suppress(Exception):
+
+        async def _push():
+            async with lock:
                 writer.write(data)
                 await writer.drain()
+
+        try:
+            # the timeout covers the lock too: a stuck client holds its lock in
+            # drain(), and without a bound every later broadcast piles up on it
+            await asyncio.wait_for(_push(), timeout=CLIENT_SEND_TIMEOUT)
+        except Exception:
+            _clients.pop(writer, None)
+            with contextlib.suppress(Exception):
+                writer.close()
 
 
 def _write_message(long_name: str, short_name: str, text: str, hops: int,
@@ -257,8 +272,10 @@ async def _reconnect_loop() -> None:
             _unsubscribe()
             with contextlib.suppress(Exception):
                 if _interface:
-                    _interface.close()
-            if _do_connect():
+                    await asyncio.to_thread(_interface.close)
+            # TCPInterface() blocks for seconds (DNS + connect + config wait) —
+            # in a thread so IPC clients keep getting responses meanwhile
+            if await asyncio.to_thread(_do_connect):
                 attempt = 0
                 break
             attempt += 1
@@ -289,10 +306,10 @@ async def _watchdog() -> None:
 
 async def _send_json(writer: asyncio.StreamWriter, obj: dict, lock: asyncio.Lock) -> None:
     data = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
-    async with lock:
-        with contextlib.suppress(Exception):
+    with contextlib.suppress(Exception):
+        async with lock:
             writer.write(data)
-            await writer.drain()
+            await asyncio.wait_for(writer.drain(), timeout=CLIENT_SEND_TIMEOUT)
 
 
 def _nodes_payload() -> list[dict]:
