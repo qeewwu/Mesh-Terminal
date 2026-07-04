@@ -20,7 +20,7 @@ from prompt_toolkit.shortcuts import clear as pt_clear
 from mesh_common import BASE_DIR, SOCKET_PATH, list_log_files, parse_log_line
 
 NAME_CACHE_FILE = BASE_DIR / "node_names_cache.json"
-HISTORY_SIZE = 50
+HISTORY_SIZE = 100
 CH_SWITCH_HISTORY = 10   # сколько истории показать после /ch
 SEARCH_LIMIT = 20
 RECONNECT_DELAY = 3  # seconds between attempts to re-reach the logger socket
@@ -749,7 +749,7 @@ async def _cmd_reply(args: str) -> None:
     parsed = parse_log_line(r["line"])
     if parsed:
         print_formatted_text(HTML(
-            f"<ansigray>Отвечаю на: {_safe(parsed.long_name)} — "
+            f"<ansigray>Отвечаю на: [{_safe(parsed.time_str)}] {_safe(parsed.long_name)} — "
             f"{_safe(_snippet(parsed.text))}</ansigray>"
         ))
     fields = dict(text=text, reply_id=r["packet_id"], channel=r["channel_index"])
