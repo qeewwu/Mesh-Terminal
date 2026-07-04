@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import collections
 import contextlib
 import datetime
 import html
@@ -40,10 +41,11 @@ _unresolved_ids: set[int] = set()
 _channel_filter: str | None = None
 _channel_index: int = 0
 
-# Последнее полученное live-сообщение с packet_id — цель для /reply.
-# История из файлов id не содержит, поэтому реплай доступен только на
-# сообщения, пришедшие после запуска клиента.
-_last_replyable: dict | None = None
+# Последние полученные live-сообщения с packet_id — цели для /reply
+# (новые в конце). История из файлов id не содержит, поэтому реплай доступен
+# только на сообщения, пришедшие после запуска клиента.
+REPLYABLE_SIZE = 20
+_replyables: collections.deque[dict] = collections.deque(maxlen=REPLYABLE_SIZE)
 
 # Кандидаты для tab-автодополнения (обновляются из ответов логгера)
 _completion_nodes: list[str] = []
@@ -306,18 +308,18 @@ def _handle_event(obj: dict) -> None:
                 f"(мог дойти, но ACK не получен)</ansiyellow>"
             ))
     elif kind == "message":
-        global _last_replyable
         lines = obj.get("lines", [])
         if not lines or not _channel_matches(lines[-1]):
             return
         if obj.get("packet_id"):
-            _last_replyable = {
+            _replyables.append({
                 "packet_id": obj["packet_id"],
                 "from_id": obj.get("from_id"),
+                "to_id": obj.get("to_id"),
                 "is_dm": obj.get("is_dm", False),
                 "channel_index": obj.get("channel_index", 0),
                 "line": lines[-1],
-            }
+            })
         if _history_ready:
             for line in lines:
                 _render_line(line)
@@ -587,21 +589,60 @@ async def _cmd_dm(args: str) -> None:
         ))
 
 
+def _reply_label(r: dict, num: int) -> str:
+    parsed = parse_log_line(r["line"])
+    if not parsed:
+        return f"#{num}"
+    ln, _ = _resolve_display_name(parsed.long_name, parsed.short_name)
+    dm = "DM " if parsed.is_dm else ""
+    return (f"  #{num} [{_safe(parsed.time_str)}] {dm}<b>{_safe(ln)}</b>: "
+            f"{_safe(_snippet(parsed.text, 50))}")
+
+
+def _list_replyables() -> None:
+    print_formatted_text(HTML(
+        "<ansiwhite>─── На что можно ответить (#1 — самое свежее) ───</ansiwhite>"
+    ))
+    for num, r in enumerate(reversed(_replyables), start=1):
+        print_formatted_text(HTML(f"<ansiwhite>{_reply_label(r, num)}</ansiwhite>"))
+    print_formatted_text(HTML(
+        "<ansigray>Ответить: /reply #&lt;номер&gt; &lt;текст&gt; — "
+        "или /reply &lt;текст&gt; на #1</ansigray>"
+    ))
+
+
 async def _cmd_reply(args: str) -> None:
-    text = args.strip()
-    if not text:
-        print_formatted_text(HTML(
-            "<ansiyellow>Использование: /reply &lt;текст&gt; — ответ на последнее "
-            "полученное сообщение</ansiyellow>"
-        ))
-        return
-    r = _last_replyable
-    if not r:
+    args = args.strip()
+    if not _replyables:
         print_formatted_text(HTML(
             "<ansiyellow>Пока нечего цитировать: /reply работает для сообщений, "
             "полученных после запуска клиента</ansiyellow>"
         ))
         return
+
+    if not args:
+        _list_replyables()
+        return
+
+    if args.startswith("#"):
+        num_str, _, text = args[1:].partition(" ")
+        text = text.strip()
+        if not num_str.isdigit() or not text:
+            print_formatted_text(HTML(
+                "<ansiyellow>Использование: /reply #&lt;номер&gt; &lt;текст&gt; "
+                "(номера — в /reply без аргументов)</ansiyellow>"
+            ))
+            return
+        num = int(num_str)
+        if not 1 <= num <= len(_replyables):
+            print_formatted_text(HTML(
+                f"<ansired>Нет сообщения #{num} — доступны #1…#{len(_replyables)}</ansired>"
+            ))
+            return
+        r = _replyables[-num]
+    else:
+        r = _replyables[-1]
+        text = args
 
     parsed = parse_log_line(r["line"])
     if parsed:
@@ -610,8 +651,14 @@ async def _cmd_reply(args: str) -> None:
             f"{_safe(_snippet(parsed.text))}</ansigray>"
         ))
     fields = dict(text=text, reply_id=r["packet_id"], channel=r["channel_index"])
-    if r["is_dm"] and r.get("from_id"):
-        resp = await _client.request("dm", node_id=r["from_id"], **fields)
+    if r["is_dm"]:
+        # For both incoming and outgoing DM: use to_id if it exists (outgoing),
+        # otherwise from_id (incoming)
+        target = r.get("to_id") or r.get("from_id")
+        if target:
+            resp = await _client.request("dm", node_id=target, **fields)
+        else:
+            resp = await _client.request("send", **fields)
     else:
         resp = await _client.request("send", **fields)
     if not resp.get("ok"):
@@ -621,7 +668,7 @@ async def _cmd_reply(args: str) -> None:
 
 
 async def _cmd_ch(args: str) -> None:
-    global _channel_filter, _channel_index, _completion_channels, _last_replyable
+    global _channel_filter, _channel_index, _completion_channels
     name = args.strip()
     resp = await _client.request("channels")
     channels = resp.get("channels", []) if resp.get("ok") else []
@@ -656,7 +703,10 @@ async def _cmd_ch(args: str) -> None:
 
     _channel_filter = match["name"]
     _channel_index = match["index"]
-    _last_replyable = None  # реплай из другого канала после переключения удивил бы
+    # цели /reply из других каналов после переключения удивили бы
+    kept = [r for r in _replyables if r["channel_index"] == match["index"]]
+    _replyables.clear()
+    _replyables.extend(kept)
     print_formatted_text(HTML(
         f"<b><ansicyan>Канал: {_safe(_channel_filter)}</ansicyan></b>"
     ))
@@ -759,7 +809,9 @@ def _cmd_help() -> None:
         "  /nodes               список видимых узлов",
         "  /who                 информация о себе",
         "  /dm &lt;имя&gt; &lt;текст&gt;   личное сообщение (имя с пробелами — в кавычках)",
+        "  /reply               список недавних сообщений, на которые можно ответить",
         "  /reply &lt;текст&gt;       ответ (с цитатой) на последнее полученное сообщение",
+        "  /reply #N &lt;текст&gt;    ответ на сообщение №N из списка /reply",
         "  /ch [имя|all]        показать/сменить канал",
         "  /search &lt;текст&gt;     поиск по истории (учитывает текущий канал)",
         "  /updatenames         подтянуть имена узлов с OneMesh",

@@ -394,12 +394,17 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                         # our own reply gets the same quote line in the log
                         reply_rec = _store.get(reply_id) if reply_id else None
                         if cmd == "dm":
-                            dest_ln, dest_sn = _node_names(req.get("node_id", 0))
+                            dest_id = req.get("node_id", 0)
+                            dest_ln, dest_sn = _node_names(dest_id)
                             _write_message(dest_ln, dest_sn, text, 0, dm_tag="DM → ",
-                                          reply_to=reply_rec, channel_index=channel_index)
+                                          reply_to=reply_rec, channel_index=channel_index,
+                                          meta={"packet_id": pid, "from_id": my_id, "to_id": dest_id,
+                                                "is_dm": True, "channel_index": channel_index})
                         else:
                             _write_message(ln, sn, text, 0, reply_to=reply_rec,
-                                          channel_index=channel_index)
+                                          channel_index=channel_index,
+                                          meta={"packet_id": pid, "from_id": my_id,
+                                                "is_dm": False, "channel_index": channel_index})
 
                         resp = {"req_id": req_id, "ok": True, "packet_id": pid}
                 else:

@@ -69,6 +69,8 @@ shapes flow back to a client:
 - The `send`/`dm` commands accept an optional `reply_id` (a packet id) which is passed to
   `sendText(replyId=...)` — requires a meshtastic lib version whose `sendText` has that
   parameter; the logger checks via `inspect.signature` and returns a clear error otherwise.
+  For sent messages the logger includes `is_dm` and (for DMs) `to_id` in the event metadata,
+  so `/reply` can route outgoing DMs correctly.
 
 ### Reply/quote handling
 
@@ -77,8 +79,11 @@ message's packet `id`. `mesh_logger.py` keeps an in-memory `_store` (bounded deq
 = 300) of recent packet IDs → sender/text, populated both from `on_receive` (others' messages) and
 from the socket handler when *this* node sends a message. When a reply's `replyId` resolves in
 `_store`, `_write_message` prepends a quote line (`format_quote_line`) before the message line.
-The client's `/reply` command sends a real reply: it uses the `packet_id` from the latest
-pushed "message" event, so it only targets messages received while the client was running.
+The client's `/reply` command sends a real reply: it keeps a deque of the last 20 pushed
+"message" events (with their `packet_id`), `/reply` alone lists them numbered (#1 = newest),
+`/reply #N <text>` targets one, `/reply <text>` targets #1. Only messages received while the
+client was running are replyable (log files carry no packet ids). Switching channels via
+`/ch` drops targets from other channels.
 Note: many community "ping bots" embed the target's hex node ID as plain text in their reply
 (e.g. `🤖 Pong !1ba60314`) instead of using the real `replyId` field — these will never show a
 quote line, which is expected, not a bug.
