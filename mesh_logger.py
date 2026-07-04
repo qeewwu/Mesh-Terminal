@@ -14,6 +14,7 @@ import datetime
 import json
 import socket
 import sys
+import threading
 from typing import NamedTuple
 
 import meshtastic.tcp_interface
@@ -95,8 +96,14 @@ def _channels_payload() -> list[dict]:
     return out
 
 
+# _write_message runs both on the meshtastic callback thread (on_receive) and
+# the event loop thread (send/dm) — without a lock a quote+message pair could
+# interleave with a concurrent write.
+_log_lock = threading.Lock()
+
+
 def _log(*lines: str) -> None:
-    with open(current_log_file(), "a", encoding="utf-8") as f:
+    with _log_lock, open(current_log_file(), "a", encoding="utf-8") as f:
         for line in lines:
             f.write(line + "\n")
 
@@ -321,7 +328,10 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                         kwargs = dict(wantAck=True, channelIndex=channel_index, onResponse=handler)
                         if cmd == "dm":
                             kwargs["destinationId"] = req.get("node_id")
-                        sent = _interface.sendText(text, **kwargs)
+                        # sendText does a synchronous socket write — if the device
+                        # link is stalled it would freeze the whole event loop
+                        iface = _interface
+                        sent = await asyncio.to_thread(iface.sendText, text, **kwargs)
                         pid = _packet_id(sent)
                         pid_holder["pid"] = pid
                         _loop.create_task(ack_timeout_watcher())

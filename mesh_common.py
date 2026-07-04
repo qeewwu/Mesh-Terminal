@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import NamedTuple
 
 HOST = "meshtastic.local"
-LOG_DIR = Path("logs")
+BASE_DIR = Path(__file__).resolve().parent
+LOG_DIR = BASE_DIR / "logs"
 SOCKET_PATH = Path("/tmp/mesh_chat.sock")
 BROADCAST_ADDR = 0xFFFFFFFF
 QUOTE_MAX = 60
@@ -33,6 +34,7 @@ class ParsedLine(NamedTuple):
     kind: str  # "quote" | "message"
     time_str: str = ""
     is_dm: bool = False
+    dm_out: bool = False
     long_name: str = ""
     short_name: str = ""
     text: str = ""
@@ -44,14 +46,24 @@ def truncate(text: str, limit: int = QUOTE_MAX) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
+_NEWLINES = re.compile(r"[\r\n]+")
+
+
+def sanitize_text(text: str) -> str:
+    """The log format is one line per message — embedded newlines would both
+    break parsing and let a remote node forge extra log lines."""
+    return _NEWLINES.sub(" ⏎ ", text)
+
+
 def format_quote_line(long_name: str, short_name: str, text: str) -> str:
-    return f"  ┆ {long_name} ({short_name}): {truncate(text)}"
+    return f"  ┆ {long_name} ({short_name}): {truncate(sanitize_text(text))}"
 
 
 def format_message_line(time_str: str, long_name: str, short_name: str,
                          text: str, hops: int, dm_tag: str = "",
                          channel_name: str = "Primary") -> str:
-    return f"{channel_name} [{time_str}] {dm_tag}{long_name} ({short_name}): {text} | {hops}"
+    return (f"{channel_name} [{time_str}] {dm_tag}{long_name} ({short_name}): "
+            f"{sanitize_text(text)} | {hops}")
 
 
 _MSG_RE = re.compile(
@@ -70,10 +82,12 @@ def parse_log_line(line: str):
         return None
     m = _MSG_RE.match(line)
     if m:
+        dm_tag = m.group("dm") or ""
         return ParsedLine(
             kind="message",
             time_str=m.group("time"),
-            is_dm=bool(m.group("dm")),
+            is_dm=bool(dm_tag),
+            dm_out="→" in dm_tag,
             long_name=m.group("name"),
             short_name=m.group("short"),
             text=m.group("text"),

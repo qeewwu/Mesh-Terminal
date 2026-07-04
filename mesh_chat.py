@@ -12,9 +12,9 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.shortcuts import clear as pt_clear
 
-from mesh_common import SOCKET_PATH, list_log_files, parse_log_line
+from mesh_common import BASE_DIR, SOCKET_PATH, list_log_files, parse_log_line
 
-NAME_CACHE_FILE = Path("node_names_cache.json")
+NAME_CACHE_FILE = BASE_DIR / "node_names_cache.json"
 HISTORY_SIZE = 50
 ONEMESH_API = "https://map.onemesh.ru/api/v1/nodes/{}"
 ONEMESH_DELAY = 0.25
@@ -83,7 +83,6 @@ def _save_name_cache() -> None:
 
 
 def _fetch_onemesh_name(node_id: int) -> tuple[str, str] | None:
-    import urllib.error
     import urllib.request
 
     req = urllib.request.Request(
@@ -93,10 +92,6 @@ def _fetch_onemesh_name(node_id: int) -> tuple[str, str] | None:
     try:
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return None
-        raise
     except Exception:
         return None
 
@@ -142,11 +137,13 @@ class IPCClient:
         self._req_counter = 0
         self._reader_task: asyncio.Task | None = None
         self._closing = False
+        self.connected = False
         self.whoami: tuple[str, str] | None = None
         self.whoami_id: int | None = None
 
     async def connect(self) -> None:
         self._reader, self._writer = await asyncio.open_unix_connection(str(SOCKET_PATH))
+        self.connected = True
         self._reader_task = asyncio.create_task(self._read_loop())
 
     async def _read_loop(self) -> None:
@@ -170,17 +167,28 @@ class IPCClient:
         except Exception:
             pass
         finally:
+            self.connected = False
             if not self._closing:
-                print_formatted_text(HTML("<ansired>⚠ Соединение с логгером потеряно</ansired>"))
+                print_formatted_text(HTML(
+                    "<ansired>⚠ Соединение с логгером потеряно. "
+                    "Перезапустите mesh_chat.py.</ansired>"
+                ))
 
     async def request(self, cmd: str, timeout: float = 10.0, **fields) -> dict:
+        if not self.connected:
+            return {"ok": False, "error": "нет соединения с логгером"}
         self._req_counter += 1
         req_id = self._req_counter
         fut = self._loop.create_future()
         self._pending[req_id] = fut
         payload = {"req_id": req_id, "cmd": cmd, **fields}
-        self._writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
-        await self._writer.drain()
+        try:
+            self._writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+            await self._writer.drain()
+        except Exception:
+            self.connected = False
+            self._pending.pop(req_id, None)
+            return {"ok": False, "error": "нет соединения с логгером"}
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
@@ -238,7 +246,7 @@ def _print_quote(long_name: str, short_name: str, text: str) -> None:
 
 def _print_msg(time_str: str, long_name: str, short_name: str,
                text: str, hops: int, own: bool = False, is_dm: bool = False,
-               channel_name: str = "") -> None:
+               dm_out: bool = False, channel_name: str = "") -> None:
     ln, sn = _resolve_display_name(long_name, short_name)
     t  = _safe(time_str)
     ln = _safe(ln)
@@ -247,8 +255,12 @@ def _print_msg(time_str: str, long_name: str, short_name: str,
     ch = f"<ansimagenta>{_safe(channel_name)}</ansimagenta> " if _channel_filter is None else ""
 
     if is_dm:
+        # outgoing DM: the logged name is the recipient, so mark direction and
+        # use the own-message colour; incoming DM stays red
+        dm_color = "ansiblue" if dm_out else "ansired"
+        arrow = "→ " if dm_out else ""
         print_formatted_text(HTML(
-            f"{ch}<ansired>[{t}] DM <b>{ln}</b> ({sn}): {tx} | {hops}</ansired>"
+            f"{ch}<{dm_color}>[{t}] DM {arrow}<b>{ln}</b> ({sn}): {tx} | {hops}</{dm_color}>"
         ))
     else:
         color = "ansiblue" if own else "ansigreen"
@@ -272,7 +284,7 @@ def _render_line(line: str) -> None:
               and (parsed.long_name, parsed.short_name) == _client.whoami)
         _print_msg(parsed.time_str, parsed.long_name, parsed.short_name,
                    parsed.text, parsed.hops, own=own, is_dm=parsed.is_dm,
-                   channel_name=parsed.channel)
+                   dm_out=parsed.dm_out, channel_name=parsed.channel)
 
 
 # ── history + live tail ────────────────────────────────────────────────────────
@@ -552,7 +564,12 @@ async def main() -> None:
                     continue
 
                 if text.startswith("/"):
-                    await _handle_command(text)
+                    try:
+                        await _handle_command(text)
+                    except Exception as e:
+                        print_formatted_text(HTML(
+                            f"<ansired>Ошибка команды: {_safe(str(e))}</ansired>"
+                        ))
                     continue
 
                 resp = await _client.request("send", text=text, channel=_channel_index)

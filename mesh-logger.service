@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 User=qeewwu
 WorkingDirectory=/home/qeewwu/Mesh
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/qeewwu/Mesh/venv/bin/python3 /home/qeewwu/Mesh/mesh_logger.py
 Restart=always
 RestartSec=5
