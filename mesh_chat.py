@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 
+import argparse
 import asyncio
+import contextlib
+import datetime
 import html
 import json
 import re
@@ -8,6 +11,7 @@ import sys
 from pathlib import Path
 
 from prompt_toolkit import PromptSession, print_formatted_text
+from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.shortcuts import clear as pt_clear
@@ -16,6 +20,9 @@ from mesh_common import BASE_DIR, SOCKET_PATH, list_log_files, parse_log_line
 
 NAME_CACHE_FILE = BASE_DIR / "node_names_cache.json"
 HISTORY_SIZE = 50
+CH_SWITCH_HISTORY = 10   # сколько истории показать после /ch
+SEARCH_LIMIT = 20
+RECONNECT_DELAY = 3  # seconds between attempts to re-reach the logger socket
 ONEMESH_API = "https://map.onemesh.ru/api/v1/nodes/{}"
 ONEMESH_DELAY = 0.25
 
@@ -33,12 +40,34 @@ _unresolved_ids: set[int] = set()
 _channel_filter: str | None = None
 _channel_index: int = 0
 
+# Последнее полученное live-сообщение с packet_id — цель для /reply.
+# История из файлов id не содержит, поэтому реплай доступен только на
+# сообщения, пришедшие после запуска клиента.
+_last_replyable: dict | None = None
 
-def _parse_channel_flag() -> str | None:
-    for arg in sys.argv[1:]:
-        if arg.startswith("--") and len(arg) > 2:
-            return arg[2:]
-    return None
+# Кандидаты для tab-автодополнения (обновляются из ответов логгера)
+_completion_nodes: list[str] = []
+_completion_channels: list[str] = []
+
+
+def _parse_args() -> tuple[str | None, int]:
+    ap = argparse.ArgumentParser(
+        description="Терминальный чат-клиент Meshtastic (работает через mesh_logger.py)",
+        allow_abbrev=False,
+    )
+    ap.add_argument("-c", "--channel", metavar="ИМЯ",
+                    help="показывать и отправлять только в этот канал")
+    ap.add_argument("-n", "--history", type=int, default=HISTORY_SIZE, metavar="N",
+                    help=f"сколько сообщений истории показать (по умолчанию {HISTORY_SIZE})")
+    args, rest = ap.parse_known_args()
+    channel = args.channel
+    if channel is None:
+        # обратная совместимость: `mesh_chat.py --ping` == `--channel ping`
+        for arg in rest:
+            if arg.startswith("--") and len(arg) > 2:
+                channel = arg[2:]
+                break
+    return channel, max(1, args.history)
 
 
 def _channel_matches(msg_line: str) -> bool:
@@ -126,6 +155,60 @@ def _resolve_display_name(long_name: str, short_name: str) -> tuple[str, str]:
     return long_name, short_name
 
 
+# ── tab completion ────────────────────────────────────────────────────────────
+
+COMMANDS = ["/nodes", "/who", "/dm", "/reply", "/ch", "/search",
+            "/updatenames", "/clear", "/help"]
+
+
+class MeshCompleter(Completer):
+    """Completes command names, node names after /dm, channel names after /ch."""
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if not text.startswith("/"):
+            return
+        if " " not in text:
+            for c in COMMANDS:
+                if c.startswith(text.lower()):
+                    yield Completion(c, start_position=-len(text))
+            return
+        cmd, _, arg = text.partition(" ")
+        cmd = cmd.lower()
+        if cmd == "/dm":
+            probe = arg.lstrip('"').lower()
+            for cand in _completion_nodes:
+                if cand.strip('"').lower().startswith(probe):
+                    yield Completion(cand, start_position=-len(arg))
+        elif cmd == "/ch":
+            for cand in _completion_channels + ["all"]:
+                if cand.lower().startswith(arg.lower()):
+                    yield Completion(cand, start_position=-len(arg))
+
+
+def _update_node_completions(nodes: list[dict]) -> None:
+    global _completion_nodes
+    out = set()
+    for n in nodes:
+        sn, ln = n.get("short_name"), n.get("long_name")
+        if sn and sn != "???":
+            out.add(sn)
+        if ln:
+            # имя с пробелом дополняем в кавычках — /dm понимает такой синтаксис
+            out.add(f'"{ln}"' if " " in ln else ln)
+    _completion_nodes = sorted(out)
+
+
+async def _refresh_completions() -> None:
+    global _completion_channels
+    resp = await _client.request("nodes")
+    if resp.get("ok"):
+        _update_node_completions(resp.get("nodes", []))
+    resp = await _client.request("channels")
+    if resp.get("ok"):
+        _completion_channels = [c["name"] for c in resp.get("channels", [])]
+
+
 # ── IPC client ───────────────────────────────────────────────────────────────
 
 class IPCClient:
@@ -138,6 +221,7 @@ class IPCClient:
         self._reader_task: asyncio.Task | None = None
         self._closing = False
         self.connected = False
+        self.on_disconnect = None  # called once when the link to the logger dies
         self.whoami: tuple[str, str] | None = None
         self.whoami_id: int | None = None
 
@@ -168,11 +252,8 @@ class IPCClient:
             pass
         finally:
             self.connected = False
-            if not self._closing:
-                print_formatted_text(HTML(
-                    "<ansired>⚠ Соединение с логгером потеряно. "
-                    "Перезапустите mesh_chat.py.</ansired>"
-                ))
+            if not self._closing and self.on_disconnect:
+                self.on_disconnect()
 
     async def request(self, cmd: str, timeout: float = 10.0, **fields) -> dict:
         if not self.connected:
@@ -225,9 +306,18 @@ def _handle_event(obj: dict) -> None:
                 f"(мог дойти, но ACK не получен)</ansiyellow>"
             ))
     elif kind == "message":
+        global _last_replyable
         lines = obj.get("lines", [])
         if not lines or not _channel_matches(lines[-1]):
             return
+        if obj.get("packet_id"):
+            _last_replyable = {
+                "packet_id": obj["packet_id"],
+                "from_id": obj.get("from_id"),
+                "is_dm": obj.get("is_dm", False),
+                "channel_index": obj.get("channel_index", 0),
+                "line": lines[-1],
+            }
         if _history_ready:
             for line in lines:
                 _render_line(line)
@@ -323,6 +413,78 @@ def _print_initial_history(n: int = HISTORY_SIZE) -> None:
         _render_line(msg)
 
 
+# ── reconnect to logger ───────────────────────────────────────────────────────
+
+_reconnecting = False
+
+
+def _on_logger_lost() -> None:
+    global _reconnecting
+    if _reconnecting:
+        return
+    _reconnecting = True
+    print_formatted_text(HTML(
+        "<ansired>⚠ Соединение с логгером потеряно — переподключаюсь...</ansired>"
+    ))
+    _loop.create_task(_reconnect_logger(datetime.datetime.now()))
+
+
+def _replay_missed(lost_at: datetime.datetime) -> None:
+    """Render messages that were logged while we were disconnected."""
+    cutoff_time = lost_at.strftime("%H:%M:%S")
+    for path in sorted(list_log_files()):  # oldest date first
+        try:
+            file_date = datetime.date.fromisoformat(path.stem.removeprefix("chat-"))
+        except ValueError:
+            continue
+        if file_date < lost_at.date():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            continue
+        for quote, msg in _split_into_units(lines):
+            parsed = parse_log_line(msg)
+            if not parsed:
+                continue
+            if file_date == lost_at.date() and parsed.time_str < cutoff_time:
+                continue
+            if not _channel_matches(msg):
+                continue
+            if quote:
+                _render_line(quote)
+            _render_line(msg)
+
+
+async def _reconnect_logger(lost_at: datetime.datetime) -> None:
+    global _client, _reconnecting
+    old = _client
+    while True:
+        await asyncio.sleep(RECONNECT_DELAY)
+        if not SOCKET_PATH.exists():
+            continue
+        client = IPCClient(_loop)
+        try:
+            await client.connect()
+            break
+        except Exception:
+            continue
+    with contextlib.suppress(Exception):
+        await old.close()
+    client.on_disconnect = _on_logger_lost
+    client.whoami, client.whoami_id = old.whoami, old.whoami_id
+    who = await client.request("whoami")
+    if who.get("ok"):
+        client.whoami = (who["long_name"], who["short_name"])
+        client.whoami_id = who["node_id"]
+    _client = client
+    _reconnecting = False
+    print_formatted_text(HTML(
+        "<ansigreen>✓ Соединение с логгером восстановлено</ansigreen>"
+    ))
+    _replay_missed(lost_at)
+
+
 # ── commands ──────────────────────────────────────────────────────────────────
 
 async def _cmd_nodes() -> None:
@@ -331,6 +493,7 @@ async def _cmd_nodes() -> None:
         print_formatted_text(HTML("<ansiyellow>Нет данных об узлах</ansiyellow>"))
         return
 
+    _update_node_completions(resp["nodes"])
     print_formatted_text(HTML("<ansiwhite>─── Видимые узлы ───</ansiwhite>"))
     for n in resp["nodes"]:
         if n["has_user"]:
@@ -380,15 +543,28 @@ def _cmd_who() -> None:
     ))
 
 
-async def _cmd_dm(args: str) -> None:
-    parts = args.strip().split(None, 1)
+def _split_dm_args(args: str) -> tuple[str | None, str | None]:
+    """`/dm Имя текст` или `/dm "Имя С Пробелами" текст`."""
+    args = args.strip()
+    if args.startswith('"'):
+        end = args.find('"', 1)
+        if end > 1:
+            return args[1:end], args[end + 1:].strip() or None
+        return None, None
+    parts = args.split(None, 1)
     if len(parts) < 2:
+        return None, None
+    return parts[0], parts[1]
+
+
+async def _cmd_dm(args: str) -> None:
+    target_name, text = _split_dm_args(args)
+    if not target_name or not text:
         print_formatted_text(HTML(
-            "<ansiyellow>Использование: /dm &lt;имя&gt; &lt;текст&gt;</ansiyellow>"
+            "<ansiyellow>Использование: /dm &lt;имя&gt; &lt;текст&gt; "
+            "(имя с пробелами — в кавычках)</ansiyellow>"
         ))
         return
-
-    target_name, text = parts
     resp = await _client.request("nodes")
     if not resp.get("ok"):
         print_formatted_text(HTML(
@@ -409,6 +585,130 @@ async def _cmd_dm(args: str) -> None:
         print_formatted_text(HTML(
             f"<ansired>Ошибка отправки: {_safe(send_resp.get('error', ''))}</ansired>"
         ))
+
+
+async def _cmd_reply(args: str) -> None:
+    text = args.strip()
+    if not text:
+        print_formatted_text(HTML(
+            "<ansiyellow>Использование: /reply &lt;текст&gt; — ответ на последнее "
+            "полученное сообщение</ansiyellow>"
+        ))
+        return
+    r = _last_replyable
+    if not r:
+        print_formatted_text(HTML(
+            "<ansiyellow>Пока нечего цитировать: /reply работает для сообщений, "
+            "полученных после запуска клиента</ansiyellow>"
+        ))
+        return
+
+    parsed = parse_log_line(r["line"])
+    if parsed:
+        print_formatted_text(HTML(
+            f"<ansigray>Отвечаю на: {_safe(parsed.long_name)} — "
+            f"{_safe(_snippet(parsed.text))}</ansigray>"
+        ))
+    fields = dict(text=text, reply_id=r["packet_id"], channel=r["channel_index"])
+    if r["is_dm"] and r.get("from_id"):
+        resp = await _client.request("dm", node_id=r["from_id"], **fields)
+    else:
+        resp = await _client.request("send", **fields)
+    if not resp.get("ok"):
+        print_formatted_text(HTML(
+            f"<ansired>Ошибка отправки: {_safe(resp.get('error', ''))}</ansired>"
+        ))
+
+
+async def _cmd_ch(args: str) -> None:
+    global _channel_filter, _channel_index, _completion_channels, _last_replyable
+    name = args.strip()
+    resp = await _client.request("channels")
+    channels = resp.get("channels", []) if resp.get("ok") else []
+    if channels:
+        _completion_channels = [c["name"] for c in channels]
+
+    if not name:
+        current = _channel_filter or "все"
+        print_formatted_text(HTML(
+            f"<ansiwhite>Сейчас: <b>{_safe(current)}</b>. Каналы: "
+            f"{_safe(', '.join(c['name'] for c in channels) or 'нет данных')}. "
+            f"Переключение: /ch &lt;имя&gt; или /ch all</ansiwhite>"
+        ))
+        return
+
+    if name.lower() in ("all", "*", "все"):
+        _channel_filter = None
+        _channel_index = 0
+        print_formatted_text(HTML(
+            "<b><ansicyan>Все каналы (отправка — в Primary)</ansicyan></b>"
+        ))
+        return
+
+    match = next((c for c in channels if c["name"].lower() == name.lower()), None)
+    if not match:
+        available = ", ".join(c["name"] for c in channels) or "нет данных"
+        print_formatted_text(HTML(
+            f"<ansired>Канал '{_safe(name)}' не найден. "
+            f"Доступные: {_safe(available)}</ansired>"
+        ))
+        return
+
+    _channel_filter = match["name"]
+    _channel_index = match["index"]
+    _last_replyable = None  # реплай из другого канала после переключения удивил бы
+    print_formatted_text(HTML(
+        f"<b><ansicyan>Канал: {_safe(_channel_filter)}</ansicyan></b>"
+    ))
+    _print_initial_history(CH_SWITCH_HISTORY)
+
+
+def _cmd_search(args: str) -> None:
+    query = args.strip().lower()
+    if not query:
+        print_formatted_text(HTML(
+            "<ansiyellow>Использование: /search &lt;текст&gt;</ansiyellow>"
+        ))
+        return
+
+    matches: list[tuple[str, str | None, str]] = []  # (date, quote, msg)
+    for path in list_log_files():  # newest date first
+        date_str = path.stem.removeprefix("chat-")
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            continue
+        found = []
+        for quote, msg in _split_into_units(lines):
+            parsed = parse_log_line(msg)
+            if not parsed or not _channel_matches(msg):
+                continue
+            if (query in parsed.text.lower() or query in parsed.long_name.lower()
+                    or query in parsed.short_name.lower()):
+                found.append((date_str, quote, msg))
+        matches = found + matches
+        if len(matches) >= SEARCH_LIMIT:
+            break
+
+    if not matches:
+        print_formatted_text(HTML(
+            f"<ansiyellow>По запросу «{_safe(query)}» ничего не найдено</ansiyellow>"
+        ))
+        return
+
+    shown = matches[-SEARCH_LIMIT:]
+    suffix = f" (показаны последние {SEARCH_LIMIT})" if len(matches) > SEARCH_LIMIT else ""
+    print_formatted_text(HTML(
+        f"<ansiwhite>─── Поиск: «{_safe(query)}»{_safe(suffix)} ───</ansiwhite>"
+    ))
+    last_date = None
+    for date_str, quote, msg in shown:
+        if date_str != last_date:
+            print_formatted_text(HTML(f"<ansigray>── {date_str} ──</ansigray>"))
+            last_date = date_str
+        if quote:
+            _render_line(quote)
+        _render_line(msg)
 
 
 def _cmd_clear() -> None:
@@ -455,14 +755,18 @@ async def _cmd_updatenames() -> None:
 
 def _cmd_help() -> None:
     lines = [
-        "─── Команды ───────────────────────────────",
+        "─── Команды ───────────────────────────────────────────────",
         "  /nodes               список видимых узлов",
         "  /who                 информация о себе",
-        "  /dm &lt;имя&gt; &lt;текст&gt;   личное сообщение",
+        "  /dm &lt;имя&gt; &lt;текст&gt;   личное сообщение (имя с пробелами — в кавычках)",
+        "  /reply &lt;текст&gt;       ответ (с цитатой) на последнее полученное сообщение",
+        "  /ch [имя|all]        показать/сменить канал",
+        "  /search &lt;текст&gt;     поиск по истории (учитывает текущий канал)",
         "  /updatenames         подтянуть имена узлов с OneMesh",
         "  /clear               очистить экран",
         "  /help                эта справка",
-        "───────────────────────────────────────────",
+        "  Tab                  автодополнение команд, имён узлов и каналов",
+        "────────────────────────────────────────────────────────────",
     ]
     for line in lines:
         print_formatted_text(HTML(f"<ansiwhite>{line}</ansiwhite>"))
@@ -476,6 +780,9 @@ async def _handle_command(text: str) -> None:
     if   cmd == "nodes":       await _cmd_nodes()
     elif cmd == "who":         _cmd_who()
     elif cmd == "dm":          await _cmd_dm(args)
+    elif cmd == "reply":       await _cmd_reply(args)
+    elif cmd == "ch":          await _cmd_ch(args)
+    elif cmd == "search":      _cmd_search(args)
     elif cmd == "updatenames": await _cmd_updatenames()
     elif cmd == "clear":       _cmd_clear()
     elif cmd == "help":        _cmd_help()
@@ -491,7 +798,7 @@ async def main() -> None:
     global _loop, _client, _history_ready, _channel_filter, _channel_index
     _loop = asyncio.get_running_loop()
     _load_name_cache()
-    _channel_filter = _parse_channel_flag()
+    _channel_filter, history_size = _parse_args()
 
     if not SOCKET_PATH.exists():
         print_formatted_text(HTML(
@@ -501,6 +808,7 @@ async def main() -> None:
         sys.exit(1)
 
     _client = IPCClient(_loop)
+    _client.on_disconnect = _on_logger_lost
     try:
         await _client.connect()
     except Exception as e:
@@ -543,14 +851,15 @@ async def main() -> None:
             "<ansiwhite>Показываю сообщения со всех каналов (отправка — в Primary)</ansiwhite>"
         ))
 
-    _print_initial_history(HISTORY_SIZE)
+    _print_initial_history(history_size)
     _history_ready = True
     for lines in _pending_live:
         for line in lines:
             _render_line(line)
     _pending_live.clear()
 
-    session = PromptSession()
+    await _refresh_completions()
+    session = PromptSession(completer=MeshCompleter(), complete_while_typing=False)
     print_formatted_text(HTML(
         "\n<ansiwhite>Сообщение или /help. Ctrl+C / Ctrl+D — выход.</ansiwhite>\n"
     ))

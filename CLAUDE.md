@@ -21,7 +21,13 @@ python3 mesh_logger.py   # 1. background daemon — start first, leave running
 python3 mesh_chat.py     # 2. interactive client — start/stop freely
 ```
 
-There is no build step, linter, or test suite in this repo.
+There is no build step or linter. Tests (pure stdlib, no device needed):
+
+```bash
+python3 -m unittest test_mesh_common -v
+```
+
+Run them after any change to the log line format or parser in `mesh_common.py`.
 
 ## Architecture
 
@@ -31,13 +37,16 @@ connection:
 
 - **`mesh_logger.py`** — the only process that opens `meshtastic.tcp_interface.TCPInterface` to
   the device. Runs continuously (deployed via `mesh-logger.service`, a systemd unit). Owns
-  reconnect logic, appends every text message to a daily log file under `logs/`, and exposes a
-  Unix socket (`SOCKET_PATH` in `mesh_common.py`, default `/tmp/mesh_chat.sock`) as an IPC broker.
+  reconnect logic (both on `connection.lost` and via a silence watchdog: no packets of any kind
+  for `SILENCE_TIMEOUT` → heartbeat probe → forced reconnect on failure), appends every text
+  message to a daily log file under `logs/`, and exposes a Unix socket (`SOCKET_PATH` in
+  `mesh_common.py`, default `/tmp/mesh_chat.sock`, chmod 0600) as an IPC broker.
 - **`mesh_chat.py`** — the interactive prompt_toolkit TUI. Never touches the device directly.
   Talks to the logger exclusively over the Unix socket: sending messages, DMs, and node queries
   are all RPC calls (`send`, `dm`, `nodes`, `whoami`) over a newline-delimited JSON protocol.
   Can be started and stopped freely, and multiple instances can connect to the same logger
-  simultaneously.
+  simultaneously. If the logger goes away (e.g. `systemctl restart mesh-logger`), the client
+  auto-reconnects to the socket and replays messages logged during the gap from `logs/`.
 - **`mesh_common.py`** — shared source of truth for both processes: the daily log file naming
   scheme (`logs/chat-YYYY-MM-DD.log`, computed from the current date so rotation is automatic —
   no explicit rollover logic needed), and the log line format/parser (`format_message_line`,
@@ -52,9 +61,14 @@ shapes flow back to a client:
   pending `asyncio.Future` in the client's `IPCClient._pending` dict.
 - **Events** (unsolicited, pushed by the logger): `{"event": "delivery", ...}` for ACK/NAK after
   a send, and `{"event": "message", "lines": [...]}` broadcast to every connected client the
-  instant a new message is logged. There is no polling — the logger pushes live updates directly,
-  so `mesh_chat.py` only reads history once at startup (last 50 messages, walking `logs/` files
-  newest-first via `list_log_files()`) and then relies entirely on pushed events.
+  instant a new message is logged. For received messages the event also carries `packet_id`,
+  `from_id`, `is_dm`, `channel_index` — the client tracks the latest one as the `/reply` target.
+  There is no polling — the logger pushes live updates directly, so `mesh_chat.py` only reads
+  history once at startup (last 50 messages, walking `logs/` files newest-first via
+  `list_log_files()`) and then relies entirely on pushed events.
+- The `send`/`dm` commands accept an optional `reply_id` (a packet id) which is passed to
+  `sendText(replyId=...)` — requires a meshtastic lib version whose `sendText` has that
+  parameter; the logger checks via `inspect.signature` and returns a clear error otherwise.
 
 ### Reply/quote handling
 
@@ -63,6 +77,8 @@ message's packet `id`. `mesh_logger.py` keeps an in-memory `_store` (bounded deq
 = 300) of recent packet IDs → sender/text, populated both from `on_receive` (others' messages) and
 from the socket handler when *this* node sends a message. When a reply's `replyId` resolves in
 `_store`, `_write_message` prepends a quote line (`format_quote_line`) before the message line.
+The client's `/reply` command sends a real reply: it uses the `packet_id` from the latest
+pushed "message" event, so it only targets messages received while the client was running.
 Note: many community "ping bots" embed the target's hex node ID as plain text in their reply
 (e.g. `🤖 Pong !1ba60314`) instead of using the real `replyId` field — these will never show a
 quote line, which is expected, not a bug.
@@ -85,10 +101,11 @@ from pushed "message" events) — it never has direct access to raw packet objec
 `mesh_logger.py` logs text messages from **every** channel (it doesn't filter by `channel`
 index), and resolves index → name via `_channel_name()` (reads `interface.localNode.channels`).
 `mesh_chat.py` run with no flags shows all channels at once (log lines rendered with the
-`<channel>` prefix visible) and sends to channel 0 (Primary). Run with a flag matching a channel
-name, e.g. `mesh_chat.py --ping`, it resolves that name to an index via the `channels` IPC
-command, restricts history/live display to that channel only (prefix hidden, since it's implied),
-and sends/DMs go out on that channel's index. The `send`/`dm` IPC commands both take an optional
+`<channel>` prefix visible) and sends to channel 0 (Primary). Run with `--channel <name>` (or
+the legacy shorthand `--<name>`, e.g. `mesh_chat.py --ping`), it resolves that name to an index
+via the `channels` IPC command, restricts history/live display to that channel only (prefix
+hidden, since it's implied), and sends/DMs go out on that channel's index. `--history N` sets
+how much history is shown at startup (default 50). The `send`/`dm` IPC commands both take an optional
 `channel` field (channel index, default 0) for this purpose.
 
 ### Node name resolution

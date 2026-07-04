@@ -11,10 +11,13 @@ import asyncio
 import collections
 import contextlib
 import datetime
+import inspect
 import json
+import os
 import socket
 import sys
 import threading
+import time
 from typing import NamedTuple
 
 import meshtastic.tcp_interface
@@ -32,10 +35,14 @@ from mesh_common import (
 )
 
 STORE_SIZE = 300
+# no mesh traffic at all for this long → probe the TCP link with a heartbeat
+# (a silently dead WiFi link doesn't always fire connection.lost)
+SILENCE_TIMEOUT = 600
 
 _interface = None
 _loop: asyncio.AbstractEventLoop | None = None
 _reconnect_event: asyncio.Event | None = None
+_last_rx: float = 0.0  # time.monotonic() of the last packet of any kind
 
 
 class MsgRecord(NamedTuple):
@@ -108,8 +115,10 @@ def _log(*lines: str) -> None:
             f.write(line + "\n")
 
 
-async def _broadcast(lines: list[str]) -> None:
+async def _broadcast(lines: list[str], meta: dict | None = None) -> None:
     event = {"event": "message", "lines": lines}
+    if meta:
+        event.update(meta)
     data = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
     for writer, lock in list(_clients.items()):
         async with lock:
@@ -120,7 +129,7 @@ async def _broadcast(lines: list[str]) -> None:
 
 def _write_message(long_name: str, short_name: str, text: str, hops: int,
                     dm_tag: str = "", reply_to: MsgRecord | None = None,
-                    channel_index: int = 0) -> None:
+                    channel_index: int = 0, meta: dict | None = None) -> None:
     now = datetime.datetime.now().strftime("%H:%M:%S")
     lines = []
     if reply_to:
@@ -130,7 +139,7 @@ def _write_message(long_name: str, short_name: str, text: str, hops: int,
     _log(*lines)
     if _loop:
         # on_receive runs on meshtastic's background thread; schedule safely
-        _loop.call_soon_threadsafe(lambda: _loop.create_task(_broadcast(lines)))
+        _loop.call_soon_threadsafe(lambda: _loop.create_task(_broadcast(lines, meta)))
 
 
 def _packet_id(sent) -> int:
@@ -165,9 +174,12 @@ def on_receive(packet, interface):
         if packet_id:
             _store_msg(packet_id, MsgRecord(long_name, short_name, text))
 
+        # meta lets clients offer "/reply" on this message (packet id → replyId)
         _write_message(long_name, short_name, text, hops,
                        dm_tag=("DM " if is_dm else ""), reply_to=reply_to,
-                       channel_index=channel_index)
+                       channel_index=channel_index,
+                       meta={"packet_id": packet_id, "from_id": from_id,
+                             "is_dm": is_dm, "channel_index": channel_index})
         print(f"[recv] {long_name} ({short_name}): {text}")
     except Exception as e:
         print(f"[error] on_receive: {e}", file=sys.stderr)
@@ -179,23 +191,32 @@ def on_connection_lost(interface):
         _loop.call_soon_threadsafe(_reconnect_event.set)
 
 
+def on_any_packet(packet, interface):
+    # feeds the silence watchdog: nodeinfo/position/telemetry count as proof of life
+    global _last_rx
+    _last_rx = time.monotonic()
+
+
 def _subscribe():
     pub.subscribe(on_receive, "meshtastic.receive.text")
+    pub.subscribe(on_any_packet, "meshtastic.receive")
     pub.subscribe(on_connection_lost, "meshtastic.connection.lost")
 
 
 def _unsubscribe():
     for fn, topic in ((on_receive, "meshtastic.receive.text"),
+                      (on_any_packet, "meshtastic.receive"),
                       (on_connection_lost, "meshtastic.connection.lost")):
         with contextlib.suppress(Exception):
             pub.unsubscribe(fn, topic)
 
 
 def _do_connect() -> bool:
-    global _interface
+    global _interface, _last_rx
     try:
         _interface = meshtastic.tcp_interface.TCPInterface(hostname=HOST)
         _subscribe()
+        _last_rx = time.monotonic()
         my_id = _interface.myInfo.my_node_num
         ln, sn = _node_names(my_id)
         print(f"[info] connected to {HOST} as {ln} ({sn})")
@@ -225,6 +246,27 @@ async def _reconnect_loop() -> None:
             attempt += 1
 
 
+async def _watchdog() -> None:
+    """Probe the device link when the mesh has been silent for too long."""
+    global _last_rx
+    while True:
+        await asyncio.sleep(60)
+        if time.monotonic() - _last_rx < SILENCE_TIMEOUT:
+            continue
+        iface = _interface
+        send_hb = getattr(iface, "sendHeartbeat", None) if iface else None
+        if send_hb is None:
+            continue
+        try:
+            await asyncio.wait_for(asyncio.to_thread(send_hb), timeout=15)
+            _last_rx = time.monotonic()  # TCP link confirmed alive
+        except Exception as e:
+            print(f"[warn] mesh silent and heartbeat failed ({e}), forcing reconnect",
+                  file=sys.stderr)
+            _last_rx = time.monotonic()  # don't re-fire while reconnecting
+            _reconnect_event.set()
+
+
 # ── IPC socket server ──────────────────────────────────────────────────────────
 
 async def _send_json(writer: asyncio.StreamWriter, obj: dict, lock: asyncio.Lock) -> None:
@@ -240,7 +282,8 @@ def _nodes_payload() -> list[dict]:
         return []
     now_ts = datetime.datetime.now().timestamp()
     out = []
-    for nid, node in _interface.nodes.items():
+    # snapshot: the dict is mutated by the meshtastic thread as nodes appear
+    for nid, node in list(_interface.nodes.items()):
         u = node.get("user", {})
         num = nid if isinstance(nid, int) else int(str(nid).lstrip("!"), 16)
         metrics = node.get("deviceMetrics", {})
@@ -296,6 +339,7 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                     else:
                         text = req.get("text", "")
                         channel_index = req.get("channel", 0)
+                        reply_id = req.get("reply_id", 0)
                         pid_holder = {}
                         fired = {"done": False}
 
@@ -328,9 +372,15 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                         kwargs = dict(wantAck=True, channelIndex=channel_index, onResponse=handler)
                         if cmd == "dm":
                             kwargs["destinationId"] = req.get("node_id")
+                        iface = _interface
+                        if reply_id:
+                            if "replyId" not in inspect.signature(iface.sendText).parameters:
+                                raise RuntimeError(
+                                    "библиотека meshtastic не поддерживает replyId — "
+                                    "обновите: pip install -U meshtastic")
+                            kwargs["replyId"] = reply_id
                         # sendText does a synchronous socket write — if the device
                         # link is stalled it would freeze the whole event loop
-                        iface = _interface
                         sent = await asyncio.to_thread(iface.sendText, text, **kwargs)
                         pid = _packet_id(sent)
                         pid_holder["pid"] = pid
@@ -341,12 +391,15 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                         if pid:
                             _store_msg(pid, MsgRecord(ln, sn, text))
 
+                        # our own reply gets the same quote line in the log
+                        reply_rec = _store.get(reply_id) if reply_id else None
                         if cmd == "dm":
                             dest_ln, dest_sn = _node_names(req.get("node_id", 0))
                             _write_message(dest_ln, dest_sn, text, 0, dm_tag="DM → ",
-                                          channel_index=channel_index)
+                                          reply_to=reply_rec, channel_index=channel_index)
                         else:
-                            _write_message(ln, sn, text, 0, channel_index=channel_index)
+                            _write_message(ln, sn, text, 0, reply_to=reply_rec,
+                                          channel_index=channel_index)
 
                         resp = {"req_id": req_id, "ok": True, "packet_id": pid}
                 else:
@@ -392,7 +445,9 @@ async def main() -> None:
         sys.exit(1)
 
     reconnect_task = asyncio.create_task(_reconnect_loop())
+    watchdog_task = asyncio.create_task(_watchdog())
     server = await asyncio.start_unix_server(_handle_client, path=str(SOCKET_PATH))
+    os.chmod(SOCKET_PATH, 0o600)  # only this user may send messages via IPC
     print(f"[info] listening on {SOCKET_PATH}")
 
     try:
@@ -400,6 +455,7 @@ async def main() -> None:
             await server.serve_forever()
     finally:
         reconnect_task.cancel()
+        watchdog_task.cancel()
         _unsubscribe()
         with contextlib.suppress(Exception):
             _interface.close()
