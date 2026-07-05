@@ -280,6 +280,19 @@ the parameter table are in `SETTINGS.md`, but the short version: it excludes `ne
 changing it over this same TCP/WiFi link could sever the connection) and `bluetooth`/`security`
 (keys/PINs, not something to expose over a plaintext local socket).
 
+Every admin message (`writeConfig`, `setOwner`, `reboot`) needs a per-session passkey the
+firmware hands out on request — but the library's own `node.ensureSessionKey()` only *fires*
+that request; the reply lands later, asynchronously, via `_onAdminReceive()` on meshtastic's
+pubsub thread. Sending the admin packet immediately after (as the library itself does inside
+`setOwner()`, and as a first-time `/settings`/`/reboot` naturally would) races that reply: without
+the key, the firmware just drops the packet — no exception, no NAK, nothing to catch. This was
+the actual cause of `/reboot confirm` reporting success while the device never rebooted.
+`_ensure_session_key()` in `mesh_logger.py` closes the race by blocking (via `time.sleep` — it
+always runs inside the same `asyncio.to_thread` call as the admin action it precedes, same as
+`_apply_setting`) until `_has_session_key()` sees the passkey cached or `SESSION_KEY_TIMEOUT`
+elapses; on timeout it proceeds anyway rather than inventing a new error path; some setups may
+not need a passkey at all, in which case this is a no-op wait that costs nothing.
+
 ### Rebooting the node (`/reboot`)
 
 `cmd == "reboot"` calls the meshtastic library's `node.reboot(REBOOT_DELAY_SECS)` (an admin

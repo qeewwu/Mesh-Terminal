@@ -23,6 +23,7 @@ from typing import NamedTuple
 
 import meshtastic.tcp_interface
 from meshtastic.protobuf import config_pb2
+from meshtastic.util import to_node_num
 from pubsub import pub
 
 from mesh_common import (
@@ -48,6 +49,7 @@ CLIENT_SEND_TIMEOUT = 5
 TRACE_TIMEOUT = 40  # a traceroute is a full round trip across the mesh, can be slow
 WATCHDOG_PING_SECONDS = 60  # cadence for the watchdog loop; also used for sd_notify(WATCHDOG=1)
 REBOOT_DELAY_SECS = 5  # gives our own ack response a moment to flush before the device reboots
+SESSION_KEY_TIMEOUT = 5.0  # how long to wait for the admin session passkey handshake
 
 _interface = None
 _loop: asyncio.AbstractEventLoop | None = None
@@ -612,6 +614,38 @@ async def _do_traceroute(dest: int, hop_limit: int, channel_index: int = 0) -> d
     return await asyncio.wait_for(fut, timeout=TRACE_TIMEOUT)
 
 
+# ── admin session key ─────────────────────────────────────────────────────────
+#
+# Admin messages (reboot, writeConfig, setOwner — anything _sendAdmin() sends)
+# need a per-session passkey the firmware only hands out on request. The
+# library's own node.ensureSessionKey() *fires* that request but doesn't wait
+# for the reply — it arrives later, asynchronously, via _onAdminReceive() on
+# meshtastic's pubsub thread. Calling reboot()/writeConfig() right after
+# ensureSessionKey() (as the library itself does, e.g. inside setOwner()) races
+# that reply: send the admin packet before the key lands and the firmware
+# silently drops it — no exception, no NAK, `_send_admin` reports nothing
+# wrong because there's nothing for it to see. This was the actual cause of
+# "/reboot confirm said OK but the device never rebooted".
+
+def _has_session_key(node) -> bool:
+    nodeid = to_node_num(node.nodeNum)
+    return node.iface._getOrCreateByNum(nodeid).get("adminSessionPassKey") is not None
+
+
+def _ensure_session_key(node) -> None:
+    """Blocks (call via asyncio.to_thread, same as the admin call it precedes)
+    until the passkey is cached or SESSION_KEY_TIMEOUT elapses. If it times
+    out we still proceed — some configurations don't require a passkey at all,
+    and it's better to let the real admin call surface whatever's actually
+    wrong than to invent a new error class for a case that may not apply."""
+    if _has_session_key(node):
+        return
+    node.ensureSessionKey()
+    deadline = time.monotonic() + SESSION_KEY_TIMEOUT
+    while time.monotonic() < deadline and not _has_session_key(node):
+        time.sleep(0.1)
+
+
 # ── local node settings ───────────────────────────────────────────────────────
 #
 # Deliberately a small curated whitelist, not a generic protobuf-path get/set:
@@ -707,6 +741,7 @@ def _parse_setting_value(raw: str, kind: str, extra) -> object:
 def _apply_setting(node, key: str, raw_value: str) -> object:
     """Runs in a worker thread — writeConfig() does a synchronous admin-packet
     send. Returns the new value as it will read back via _settings_snapshot()."""
+    _ensure_session_key(node)
     if key == "owner_long":
         node.setOwner(long_name=raw_value)
         return raw_value
@@ -722,6 +757,13 @@ def _apply_setting(node, key: str, raw_value: str) -> object:
     setattr(section, field, value)
     node.writeConfig(config_name)
     return extra.Name(value) if kind == "enum" else value
+
+
+def _reboot_node(node) -> None:
+    """node.reboot() also calls ensureSessionKey() itself, but without waiting
+    — same race as _apply_setting(), so we wait here first for the same reason."""
+    _ensure_session_key(node)
+    node.reboot(REBOOT_DELAY_SECS)
 
 
 async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -826,9 +868,11 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                     else:
                         try:
                             # reboot() does a synchronous admin-packet send (like writeConfig) —
-                            # off the event loop so it can't stall other IPC clients
-                            await asyncio.to_thread(_interface.localNode.reboot,
-                                                    REBOOT_DELAY_SECS)
+                            # off the event loop so it can't stall other IPC clients. Ensuring
+                            # the session key first (and actually waiting for it) in the same
+                            # thread call is what makes this reboot land instead of getting
+                            # silently dropped by the firmware's session-auth check.
+                            await asyncio.to_thread(_reboot_node, _interface.localNode)
                             resp = {"req_id": req_id, "ok": True, "secs": REBOOT_DELAY_SECS}
                         except Exception as e:
                             resp["error"] = f"не удалось перезагрузить: {e}"
