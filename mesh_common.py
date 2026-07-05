@@ -2,6 +2,7 @@
 """Shared constants and log line format used by mesh_logger.py and mesh_chat.py."""
 
 import datetime
+import math
 import re
 from pathlib import Path
 from typing import NamedTuple
@@ -127,3 +128,31 @@ def parse_log_line(line: str):
             text=m.group("text"),
         )
     return None
+
+
+# ── geo helpers (used by mesh_chat.py's /pos) ─────────────────────────────────
+
+_EARTH_RADIUS_KM = 6371.0088
+_COMPASS_POINTS = ["С", "ССВ", "СВ", "ВСВ", "В", "ВЮВ", "ЮВ", "ЮЮВ",
+                   "Ю", "ЮЮЗ", "ЮЗ", "ЗЮЗ", "З", "ЗСЗ", "СЗ", "ССЗ"]
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
+    return 2 * _EARTH_RADIUS_KM * math.asin(math.sqrt(a))
+
+
+def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Initial compass bearing (0-360, 0=North) from point 1 to point 2."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dlambda = math.radians(lon2 - lon1)
+    x = math.sin(dlambda) * math.cos(p2)
+    y = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dlambda)
+    return (math.degrees(math.atan2(x, y)) + 360) % 360
+
+
+def compass_point(deg: float) -> str:
+    return _COMPASS_POINTS[round(deg / 22.5) % 16]

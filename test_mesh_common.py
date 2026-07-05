@@ -10,8 +10,11 @@ import unittest
 
 from mesh_common import (
     QUOTE_MAX,
+    bearing_deg,
+    compass_point,
     format_message_line,
     format_quote_line,
+    haversine_km,
     parse_log_line,
     sanitize_text,
 )
@@ -163,6 +166,39 @@ class TestQuoteRoundTrip(unittest.TestCase):
         self.assertEqual(q.time_str, "")
         self.assertEqual(q.long_name, "Вася")
         self.assertEqual(q.text, "старая цитата без времени")
+
+
+class TestGeoHelpers(unittest.TestCase):
+    # Moscow -> Saint-Petersburg: known real-world distance/bearing, used only
+    # as a sanity check on the formulas (not an exact reference value)
+    MSK = (55.7558, 37.6173)
+    SPB = (59.9343, 30.3351)
+
+    def test_haversine_known_distance(self):
+        km = haversine_km(*self.MSK, *self.SPB)
+        self.assertAlmostEqual(km, 634, delta=5)
+
+    def test_haversine_zero_for_same_point(self):
+        self.assertAlmostEqual(haversine_km(10, 20, 10, 20), 0.0, places=6)
+
+    def test_bearing_known_direction(self):
+        deg = bearing_deg(*self.MSK, *self.SPB)
+        self.assertAlmostEqual(deg, 320, delta=5)  # СПб северо-западнее Москвы
+
+    def test_bearing_north_is_zero(self):
+        self.assertAlmostEqual(bearing_deg(0, 0, 1, 0), 0.0, places=3)
+
+    def test_bearing_east_is_ninety(self):
+        self.assertAlmostEqual(bearing_deg(0, 0, 0, 1), 90.0, places=3)
+
+    def test_compass_point_cardinals(self):
+        self.assertEqual(compass_point(0), "С")
+        self.assertEqual(compass_point(90), "В")
+        self.assertEqual(compass_point(180), "Ю")
+        self.assertEqual(compass_point(270), "З")
+
+    def test_compass_point_wraps_around(self):
+        self.assertEqual(compass_point(359), "С")
 
 
 class TestUnparseable(unittest.TestCase):

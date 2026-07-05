@@ -14,6 +14,7 @@ import datetime
 import inspect
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -21,6 +22,7 @@ import time
 from typing import NamedTuple
 
 import meshtastic.tcp_interface
+from meshtastic.protobuf import config_pb2
 from pubsub import pub
 
 from mesh_common import (
@@ -39,10 +41,12 @@ STORE_SIZE = 300
 # (a silently dead WiFi link doesn't always fire connection.lost)
 SILENCE_TIMEOUT = 600
 OUTBOX_MAX = 50  # queued sends while the device is disconnected
+OUTBOX_RETRIES = 3  # per-message re-queue limit when sendText itself fails
 # a client that stopped reading (suspended terminal) fills its socket buffer;
 # past this timeout it is disconnected so it can't stall pushes to everyone else
 CLIENT_SEND_TIMEOUT = 5
 TRACE_TIMEOUT = 40  # a traceroute is a full round trip across the mesh, can be slow
+WATCHDOG_PING_SECONDS = 60  # cadence for the watchdog loop; also used for sd_notify(WATCHDOG=1)
 
 _interface = None
 _loop: asyncio.AbstractEventLoop | None = None
@@ -55,6 +59,15 @@ class MsgRecord(NamedTuple):
     short_name: str
     text: str
     time_str: str = ""
+
+
+# имена и текст пакетов приходят с чужих узлов — не даём escape-последовательностям
+# попадать в stdout/journald (в лог-файлы пишется как есть, их чистит клиент)
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _console(s: str) -> str:
+    return _CTRL_RE.sub(" ", s)
 
 
 _store: dict[int, MsgRecord] = {}
@@ -211,7 +224,7 @@ def on_receive(packet, interface):
                        meta={"packet_id": packet_id, "from_id": from_id,
                              "is_dm": is_dm, "channel_index": channel_index,
                              "is_emoji": is_emoji})
-        print(f"[recv] {long_name} ({short_name}): {text}")
+        print(_console(f"[recv] {long_name} ({short_name}): {text}"))
     except Exception as e:
         print(f"[error] on_receive: {e}", file=sys.stderr)
 
@@ -276,16 +289,38 @@ async def _reconnect_loop() -> None:
             # TCPInterface() blocks for seconds (DNS + connect + config wait) —
             # in a thread so IPC clients keep getting responses meanwhile
             if await asyncio.to_thread(_do_connect):
+                # событие, взведённое во время попытки (watchdog, поздний
+                # connection.lost старого интерфейса), относится к уже закрытому
+                # соединению — без сброса свежий коннект тут же порвался бы.
+                # Пропущенный реальный обрыв в этом окне подстрахует watchdog.
+                _reconnect_event.clear()
                 attempt = 0
                 break
             attempt += 1
 
 
+def _sd_notify(message: str) -> None:
+    """Tell systemd (Type=notify) this process is ready/alive. A no-op outside
+    systemd — NOTIFY_SOCKET is only set when the unit actually requests it."""
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]  # Linux abstract socket namespace
+    with contextlib.suppress(Exception):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect(addr)
+            s.sendall(message.encode())
+
+
 async def _watchdog() -> None:
-    """Probe the device link when the mesh has been silent for too long."""
+    """Probe the device link when the mesh has been silent for too long, and
+    ping systemd's watchdog every cycle so it can restart us if the event loop
+    itself ever wedges (WatchdogSec in mesh-logger.service)."""
     global _last_rx
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(WATCHDOG_PING_SECONDS)
+        _sd_notify("WATCHDOG=1")
         if time.monotonic() - _last_rx < SILENCE_TIMEOUT:
             continue
         iface = _interface
@@ -323,6 +358,9 @@ def _nodes_payload() -> list[dict]:
         num = nid if isinstance(nid, int) else int(str(nid).lstrip("!"), 16)
         metrics = node.get("deviceMetrics", {})
         last_heard = node.get("lastHeard")
+        # _fixupPosition() (mesh_interface.py) already converts latitudeI/longitudeI
+        # into float-degree latitude/longitude on this dict — no unit conversion here
+        position = node.get("position", {})
         out.append({
             "node_id": num,
             "long_name": u.get("longName"),
@@ -332,28 +370,53 @@ def _nodes_payload() -> list[dict]:
             "snr": node.get("snr"),
             "hops_away": node.get("hopsAway"),
             "seconds_ago": int(now_ts - last_heard) if last_heard else None,
+            "lat": position.get("latitude"),
+            "lon": position.get("longitude"),
+            "alt": position.get("altitude"),
         })
     return out
+
+
+def _send_emoji_packet(iface, text: str, channel_index: int, reply_id: int,
+                        handler, destination_id):
+    """Build and send a tapback-reaction packet by hand: the library's public
+    sendText()/sendData() have no `emoji` kwarg (unlike the `Data` protobuf
+    message, which does), so this mirrors sendData()'s internals with that one
+    field added. Mirrors _do_traceroute()'s precedent for reaching past the
+    public API when it doesn't expose a field we need."""
+    from meshtastic.protobuf import mesh_pb2, portnums_pb2
+
+    packet = mesh_pb2.MeshPacket()
+    packet.channel = channel_index
+    packet.decoded.payload = text.encode("utf-8")
+    packet.decoded.portnum = portnums_pb2.PortNum.TEXT_MESSAGE_APP
+    packet.decoded.emoji = 1
+    if reply_id:
+        packet.decoded.reply_id = reply_id
+    packet.id = iface._generatePacketId()
+    iface._addResponseHandler(packet.id, handler)
+    return iface._sendPacket(packet, destination_id, wantAck=True)
 
 
 async def _send_message(cmd: str, text: str, channel_index: int, reply_id: int = 0,
                          node_id: int | None = None,
                          notify_writer: asyncio.StreamWriter | None = None,
-                         notify_lock: asyncio.Lock | None = None) -> dict:
+                         notify_lock: asyncio.Lock | None = None,
+                         attempts: int = 0, emoji: bool = False) -> dict:
     """Transmit via the device (send or dm) and log the result. Shared by the
     live IPC handler and the outbox flush after a reconnect."""
     if not _interface:
         return {"ok": False, "error": "not connected"}
 
     iface = _interface
-    if reply_id and "replyId" not in inspect.signature(iface.sendText).parameters:
+    if reply_id and not emoji and "replyId" not in inspect.signature(iface.sendText).parameters:
         return {"ok": False, "error": "библиотека meshtastic не поддерживает replyId — "
                                        "обновите: pip install -U meshtastic"}
 
     pid_holder = {}
     fired = {"done": False}
 
-    def emit_delivery(ok, error=None):
+    def emit_delivery(ok, error=None, hops=None):
         if fired["done"]:
             return
         fired["done"] = True
@@ -363,6 +426,8 @@ async def _send_message(cmd: str, text: str, channel_index: int, reply_id: int =
                   "ok": ok, "text": text}
         if error:
             event["error"] = error
+        if hops is not None:
+            event["hops"] = hops
         _loop.create_task(_send_json(notify_writer, event, notify_lock))
 
     def handler(ack_packet):
@@ -370,13 +435,19 @@ async def _send_message(cmd: str, text: str, channel_index: int, reply_id: int =
         routing = decoded.get("routing", {})
         error = routing.get("errorReason", "NONE")
         ok = (error == "NONE")
+        # hops the ACK travelled back over — same hopStart-hopLimit arithmetic
+        # as on_receive(), gives /ping a real "N хопов" figure
+        hop_limit = ack_packet.get("hopLimit") if isinstance(ack_packet, dict) else None
+        hop_start = ack_packet.get("hopStart") if isinstance(ack_packet, dict) else None
+        hops = (hop_start - hop_limit) if hop_limit is not None and hop_start is not None else None
         if _loop:
-            _loop.call_soon_threadsafe(emit_delivery, ok, None if ok else error)
+            _loop.call_soon_threadsafe(emit_delivery, ok, None if ok else error, hops)
 
     async def ack_timeout_watcher():
         await asyncio.sleep(ACK_TIMEOUT_SECONDS)
         emit_delivery(None, "timeout")
 
+    destination_id = node_id if cmd == "dm" else BROADCAST_ADDR
     kwargs = dict(wantAck=True, channelIndex=channel_index, onResponse=handler)
     if cmd == "dm":
         kwargs["destinationId"] = node_id
@@ -385,12 +456,30 @@ async def _send_message(cmd: str, text: str, channel_index: int, reply_id: int =
 
     # sendText does a synchronous socket write — if the device link is
     # stalled it would freeze the whole event loop
-    sent = await asyncio.to_thread(iface.sendText, text, **kwargs)
+    try:
+        if emoji:
+            sent = await asyncio.to_thread(_send_emoji_packet, iface, text, channel_index,
+                                           reply_id, handler, destination_id)
+        else:
+            sent = await asyncio.to_thread(iface.sendText, text, **kwargs)
+    except Exception as e:
+        # линк умер, но connection.lost ещё не прилетел: сообщение — в outbox,
+        # соединение — на переподключение (раньше сообщение просто терялось).
+        # attempts не даёт «ядовитому» сообщению бесконечно ронять flush.
+        _reconnect_event.set()
+        if attempts < OUTBOX_RETRIES and len(_outbox) < OUTBOX_MAX:
+            _outbox.append({"cmd": cmd, "text": text, "channel_index": channel_index,
+                            "reply_id": reply_id, "node_id": node_id,
+                            "writer": notify_writer, "lock": notify_lock,
+                            "attempts": attempts + 1, "emoji": emoji})
+            return {"ok": True, "queued": True}
+        return {"ok": False, "error": f"отправка не удалась: {e}"}
     pid = _packet_id(sent)
     pid_holder["pid"] = pid
     _loop.create_task(ack_timeout_watcher())
 
-    my_id = _interface.myInfo.my_node_num
+    # именно iface, а не _interface: за время await мог случиться реконнект
+    my_id = iface.myInfo.my_node_num
     ln, sn = _node_names(my_id)
     now = datetime.datetime.now().strftime("%H:%M:%S")
     if pid:
@@ -426,10 +515,17 @@ async def _flush_outbox() -> None:
             continue
         result = await _send_message(
             item["cmd"], item["text"], item["channel_index"], item["reply_id"],
-            item["node_id"], notify_writer=item["writer"], notify_lock=item["lock"])
+            item["node_id"], notify_writer=item["writer"], notify_lock=item["lock"],
+            attempts=item.get("attempts", 0), emoji=item.get("emoji", False))
         if not result.get("ok"):
             print(f"[warn] queued message failed to send: {result.get('error')}",
                   file=sys.stderr)
+            # клиенту уже отвечали "queued" — о финальном провале сообщаем
+            # delivery-событием, иначе сообщение пропадёт молча
+            if item.get("writer") is not None:
+                event = {"event": "delivery", "ok": False, "text": item["text"],
+                         "error": result.get("error", "не отправлено")}
+                _loop.create_task(_send_json(item["writer"], event, item["lock"]))
 
 
 UNK_SNR = -128  # meshtastic's sentinel for "SNR unknown" in RouteDiscovery
@@ -501,6 +597,118 @@ async def _do_traceroute(dest: int, hop_limit: int, channel_index: int = 0) -> d
     return await asyncio.wait_for(fut, timeout=TRACE_TIMEOUT)
 
 
+# ── local node settings ───────────────────────────────────────────────────────
+#
+# Deliberately a small curated whitelist, not a generic protobuf-path get/set:
+# - excludes `network` (WiFi credentials) — changing it over this same TCP/WiFi
+#   link could sever our own connection to the device
+# - excludes `bluetooth`/`security` — PINs and keys, not something to expose over
+#   a plaintext local IPC socket
+# - excludes `display`/`power`/`audio`/etc. — no headless-node use case here
+# Every entry is (config_section, is_module_config, field_name, kind, extra).
+# See SETTINGS.md for what each one does and why it's safe to expose.
+_ROLE_ENUM = config_pb2.Config.DeviceConfig.Role
+_GPS_MODE_ENUM = config_pb2.Config.PositionConfig.GpsMode
+
+SETTINGS_REGISTRY: dict[str, tuple] = {
+    "role": ("device", False, "role", "enum", _ROLE_ENUM),
+    "node_info_broadcast_secs": ("device", False, "node_info_broadcast_secs", "int", (60, 86400)),
+    "hop_limit": ("lora", False, "hop_limit", "int", (1, 7)),
+    "tx_power": ("lora", False, "tx_power", "int", (0, 30)),
+    "position_broadcast_secs": ("position", False, "position_broadcast_secs", "int", (30, 86400)),
+    "position_smart_enabled": ("position", False, "position_broadcast_smart_enabled", "bool", None),
+    "gps_mode": ("position", False, "gps_mode", "enum", _GPS_MODE_ENUM),
+    "fixed_position": ("position", False, "fixed_position", "bool", None),
+    "telemetry_device_secs": ("telemetry", True, "device_update_interval", "int", (60, 86400)),
+    "telemetry_env_enabled": ("telemetry", True, "environment_measurement_enabled", "bool", None),
+}
+
+SETTINGS_DESCRIPTIONS = {
+    "owner_long": "Полное имя узла",
+    "owner_short": "Короткое имя узла (обычно до 4 символов)",
+    "role": "Роль узла в сети (CLIENT, ROUTER, REPEATER, ...)",
+    "node_info_broadcast_secs": "Как часто рассылать свой NodeInfo, секунды",
+    "hop_limit": "Максимум хопов для пакетов, отправленных с этого узла",
+    "tx_power": "Мощность передачи, дБм (0 = значение по умолчанию для региона)",
+    "position_broadcast_secs": "Как часто рассылать позицию, секунды",
+    "position_smart_enabled": "Рассылать позицию только при значимом перемещении",
+    "gps_mode": "Режим GPS-приёмника (ENABLED, DISABLED, NOT_PRESENT)",
+    "fixed_position": "Считать текущую позицию фиксированной (узел неподвижен)",
+    "telemetry_device_secs": "Как часто слать телеметрию устройства, секунды",
+    "telemetry_env_enabled": "Слать телеметрию окружающей среды (датчики), если есть",
+}
+
+
+def _get_config_value(node, entry: tuple):
+    config_name, is_module, field, kind, extra = entry
+    root = node.moduleConfig if is_module else node.localConfig
+    section = getattr(root, config_name)
+    value = getattr(section, field)
+    return extra.Name(value) if kind == "enum" else value
+
+
+def _settings_snapshot() -> list[dict]:
+    node = _interface.localNode
+    my_id = _interface.myInfo.my_node_num
+    ln, sn = _node_names(my_id)
+    out = [
+        {"key": "owner_long", "value": ln, "description": SETTINGS_DESCRIPTIONS["owner_long"]},
+        {"key": "owner_short", "value": sn, "description": SETTINGS_DESCRIPTIONS["owner_short"]},
+    ]
+    for key, entry in SETTINGS_REGISTRY.items():
+        try:
+            value = _get_config_value(node, entry)
+        except Exception:
+            value = None
+        out.append({"key": key, "value": value, "description": SETTINGS_DESCRIPTIONS[key]})
+    return out
+
+
+def _parse_setting_value(raw: str, kind: str, extra) -> object:
+    if kind == "bool":
+        low = raw.strip().lower()
+        if low in ("1", "true", "on", "yes", "да", "вкл"):
+            return True
+        if low in ("0", "false", "off", "no", "нет", "выкл"):
+            return False
+        raise ValueError("ожидалось булево значение (on/off, да/нет, 1/0)")
+    if kind == "int":
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError("ожидалось целое число") from None
+        lo, hi = extra
+        if not (lo <= value <= hi):
+            raise ValueError(f"вне диапазона {lo}..{hi}")
+        return value
+    if kind == "enum":
+        name = raw.strip().upper()
+        if name not in extra.keys():
+            raise ValueError(f"допустимые значения: {', '.join(extra.keys())}")
+        return extra.Value(name)
+    raise ValueError(f"неизвестный тип параметра: {kind}")
+
+
+def _apply_setting(node, key: str, raw_value: str) -> object:
+    """Runs in a worker thread — writeConfig() does a synchronous admin-packet
+    send. Returns the new value as it will read back via _settings_snapshot()."""
+    if key == "owner_long":
+        node.setOwner(long_name=raw_value)
+        return raw_value
+    if key == "owner_short":
+        node.setOwner(short_name=raw_value)
+        return raw_value
+    if key not in SETTINGS_REGISTRY:
+        raise KeyError(key)
+    config_name, is_module, field, kind, extra = SETTINGS_REGISTRY[key]
+    value = _parse_setting_value(raw_value, kind, extra)
+    root = node.moduleConfig if is_module else node.localConfig
+    section = getattr(root, config_name)
+    setattr(section, field, value)
+    node.writeConfig(config_name)
+    return extra.Name(value) if kind == "enum" else value
+
+
 async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     write_lock = asyncio.Lock()
     _clients[writer] = write_lock
@@ -539,6 +747,7 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                     channel_index = req.get("channel", 0)
                     reply_id = req.get("reply_id", 0)
                     node_id = req.get("node_id") if cmd == "dm" else None
+                    emoji = bool(req.get("emoji"))
 
                     if not _interface:
                         if len(_outbox) >= OUTBOX_MAX:
@@ -547,12 +756,13 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                             _outbox.append({"cmd": cmd, "text": text,
                                             "channel_index": channel_index,
                                             "reply_id": reply_id, "node_id": node_id,
-                                            "writer": writer, "lock": write_lock})
+                                            "writer": writer, "lock": write_lock,
+                                            "emoji": emoji})
                             resp = {"req_id": req_id, "ok": True, "queued": True}
                     else:
                         result = await _send_message(cmd, text, channel_index, reply_id,
                                                      node_id, notify_writer=writer,
-                                                     notify_lock=write_lock)
+                                                     notify_lock=write_lock, emoji=emoji)
                         resp = {"req_id": req_id, **result}
 
                 elif cmd == "trace":
@@ -569,6 +779,31 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                             resp["error"] = "узел не ответил (timeout)"
                         except Exception as e:
                             resp["error"] = f"traceroute failed: {e}"
+
+                elif cmd == "settings":
+                    if not _interface:
+                        resp["error"] = "not connected"
+                    else:
+                        action = req.get("action", "list")
+                        if action == "list":
+                            resp = {"req_id": req_id, "ok": True,
+                                    "settings": _settings_snapshot()}
+                        elif action == "set":
+                            key = req.get("key", "")
+                            value = req.get("value", "")
+                            try:
+                                new_val = await asyncio.to_thread(
+                                    _apply_setting, _interface.localNode, key, value)
+                                resp = {"req_id": req_id, "ok": True,
+                                        "key": key, "value": new_val}
+                            except KeyError:
+                                resp["error"] = f"неизвестный параметр: {key}"
+                            except ValueError as e:
+                                resp["error"] = str(e)
+                            except Exception as e:
+                                resp["error"] = f"не удалось применить: {e}"
+                        else:
+                            resp["error"] = f"unknown settings action: {action}"
                 else:
                     resp["error"] = f"unknown cmd: {cmd}"
             except Exception as e:
@@ -608,14 +843,23 @@ async def main() -> None:
     _prepare_socket_path()
 
     print(f"[info] connecting to {HOST}...")
-    if not _do_connect():
-        sys.exit(1)
+    if not await asyncio.to_thread(_do_connect):
+        # устройство недоступно — всё равно поднимаем IPC-сокет: клиенты видят
+        # "not connected" и складывают отправки в outbox, а реконнект-цикл
+        # продолжает попытки (раньше процесс тут умирал и до рестарта systemd
+        # сокета не существовало вовсе)
+        print("[warn] device unreachable at startup, serving IPC and retrying",
+              file=sys.stderr)
+        _reconnect_event.set()
 
     reconnect_task = asyncio.create_task(_reconnect_loop())
     watchdog_task = asyncio.create_task(_watchdog())
     server = await asyncio.start_unix_server(_handle_client, path=str(SOCKET_PATH))
     os.chmod(SOCKET_PATH, 0o600)  # only this user may send messages via IPC
     print(f"[info] listening on {SOCKET_PATH}")
+    # ready as far as systemd is concerned even if the device itself isn't
+    # connected yet — the IPC socket (what Type=notify cares about) is up
+    _sd_notify("READY=1")
 
     try:
         async with server:

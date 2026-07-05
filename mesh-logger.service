@@ -4,7 +4,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+WatchdogSec=150
 User=qeewwu
 WorkingDirectory=/home/qeewwu/Mesh
 Environment=PYTHONUNBUFFERED=1

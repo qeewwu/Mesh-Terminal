@@ -44,12 +44,25 @@ connection:
   In the reconnect loop, `_do_connect()`/`close()` run via `asyncio.to_thread` — the
   `TCPInterface` constructor blocks for seconds (DNS + connect + config wait), and running it on
   the event loop would freeze all IPC clients for the duration.
+  `_watchdog()` also pings systemd's own watchdog (`sd_notify("WATCHDOG=1")`, `_sd_notify()`
+  writes directly to the `NOTIFY_SOCKET` unix datagram socket — no extra dependency) every
+  `WATCHDOG_PING_SECONDS`, so a wedged event loop gets restarted by systemd even though the
+  process itself never crashed; `mesh-logger.service` needs `Type=notify` + `WatchdogSec` for
+  this to do anything (a no-op otherwise, since `NOTIFY_SOCKET` is unset outside systemd).
 - **`mesh_chat.py`** — the interactive prompt_toolkit TUI. Never touches the device directly.
   Talks to the logger exclusively over the Unix socket: sending messages, DMs, and node queries
   are all RPC calls (`send`, `dm`, `nodes`, `whoami`) over a newline-delimited JSON protocol.
   Can be started and stopped freely, and multiple instances can connect to the same logger
   simultaneously. If the logger goes away (e.g. `systemctl restart mesh-logger`), the client
   auto-reconnects to the socket and replays messages logged during the gap from `logs/`.
+  Rendering at the history/live seams (startup buffer flush, post-reconnect replay) goes through
+  `_render_if_new`, which skips message lines already in `_recent_lines` — a message logged
+  between a file read and the corresponding live event would otherwise print twice. Plain
+  `_render_unit` stays in use where re-showing is intended (`/ch` recent history, `/search`).
+  `/dm` and `/trace` resolve names via `_pick_node`: exact name/`!hex`-id match beats prefix
+  beats substring, and an ambiguous query lists the candidates instead of picking one silently.
+  So do `/ping` and `/pos`; `/mute` uses the unwrapped `_find_node_in_list` instead (see Muting
+  below — it wants a single exact match or a silent fallback, not an error message).
 - **`mesh_common.py`** — shared source of truth for both processes: the daily log file naming
   scheme (`logs/chat-YYYY-MM-DD.log`, computed from the current date so rotation is automatic —
   no explicit rollover logic needed), and the log line format/parser (`format_message_line`,
@@ -81,7 +94,14 @@ shapes flow back to a client:
   (with its writer/lock so a later delivery event can still reach the same client) to `_outbox`
   (bounded, `OUTBOX_MAX`) and responds `{"ok": true, "queued": true}`. `_flush_outbox()` runs
   automatically from `_do_connect()` on every successful (re)connect, actually transmitting each
-  queued item via the same `_send_message()` helper the live path uses.
+  queued item via the same `_send_message()` helper the live path uses. The same queueing also
+  covers the "link died but `connection.lost` hasn't fired yet" case: if `sendText` itself
+  raises, the message is re-queued (bounded by `OUTBOX_RETRIES` per message, so a poison message
+  can't loop forever) and a reconnect is triggered; a message that exhausts its retries reports
+  failure to its client via a `delivery` event, since the client already got a "queued" response.
+  The logger also starts fine with the device unreachable: `main()` no longer exits on a failed
+  initial connect — it serves the IPC socket immediately (clients see "not connected", sends
+  queue to the outbox) and leaves retrying to the reconnect loop.
 - `cmd == "trace"` runs `_do_traceroute()`, a from-scratch traceroute (not the library's built-in
   `sendTraceRoute`, which blocks and prints straight to stdout instead of returning structured
   data) built on `sendData(portNum=TRACEROUTE_APP)` + a custom `onResponse`. Response packet
@@ -89,6 +109,13 @@ shapes flow back to a client:
   requester) and `p["from"]` is the *traced node* — mirrors meshtastic's own
   `onResponseTraceRoute`. `towards` = [us, ...route hops with SNR, traced node]; `back` = [traced
   node, ...routeBack hops, us] (empty if the far end never sent a return path).
+- `send`/`dm` accept an optional `emoji: bool` field for sending tapback reactions (`/react`;
+  see Reactions below). The `delivery` event also carries an optional `hops` field: `handler()`
+  in `_send_message()` computes it from the ACK packet's `hopStart`/`hopLimit`, the same
+  arithmetic `on_receive()` uses for incoming messages — this is what lets `/ping` report a hop
+  count, and the generic "✓ Доставлено" line show it too.
+- `cmd == "settings"` (`action: "list"|"set"`) reads/writes the local node's own device
+  configuration — see "Local node settings" below.
 
 ### Reply/quote handling
 
@@ -112,6 +139,16 @@ emoji itself, so they get the same quote-line treatment in the log — no format
 looks like nothing but emoji (`_is_reaction_text`, a regex heuristic — the log format has no
 "is this a reaction" bit to read back after a restart, so both live and history rendering use the
 same heuristic for consistency rather than trusting the logger's more precise live `is_emoji` meta).
+
+**Sending** a reaction (`/react #N <emoji>`, sharing `_replyables`/target-parsing with `/reply`
+via `_parse_target_and_text`) needs `decoded.emoji = 1` on the outgoing packet — a field the
+`Data` protobuf message has but that neither `sendText()` nor `sendData()` exposes as a keyword
+argument. `_send_emoji_packet()` in `mesh_logger.py` builds the `MeshPacket` by hand (mirroring
+what `sendData()` does internally) and calls the interface's private `_sendPacket()`/
+`_addResponseHandler()`/`_generatePacketId()` directly — same precedent as `_do_traceroute()`
+reaching past the public API when it doesn't expose a needed field. The reaction is then logged
+through the normal `_write_message()` path with `reply_to` set, so it round-trips through
+`_is_reaction_text()` exactly like a reaction received from someone else.
 
 ### Log line format
 
@@ -172,6 +209,72 @@ mesh) via the public OneMesh API (`https://map.onemesh.ru/api/v1/nodes/{decimal_
 triggered by the `/updatenames` command. Results are cached in `node_names_cache.json` so they
 persist across restarts. This resolution happens only in the display layer — it does not touch
 `logs/`, so historical log lines keep whatever name was known to the device at write time.
+`_periodic_updatenames()` runs this automatically (once at startup, then every
+`UPDATENAMES_INTERVAL` = 30 min) via `_cmd_updatenames(quiet=True)`, which suppresses the
+per-node progress lines and only prints a one-line summary when it actually resolved something
+— the manual `/updatenames` command stays fully verbose.
+
+### `node_names_cache.json` format (names + mutes)
+
+The same file also stores `/mute` state, so its format is a `{"names": {...}, "muted": [...]}`
+wrapper rather than the old flat `{id: {long, short}}` map. `_load_name_cache()` detects the
+format by checking for a `"names"`/`"muted"` key — a cache file written before this change loads
+fine as `names=<the whole file>, muted=[]`, so no migration step is needed.
+
+### Muting (`/mute`, `/unmute`)
+
+Mutes are keyed by **display name**, not node ID, even though `/mute <query>` resolves through
+the live `nodes` list first (via `_find_node_in_list`, to get the canonical `long_name` and avoid
+typos) — because the log format itself only ever stores names, never numeric IDs (see Log line
+format above). A node-ID-keyed mute could not be checked against a plain history line at all.
+`_is_muted()` treats a message as muted if either its `long_name` or `short_name` matches an
+entry, so muting still works from a name typed directly (no live node match needed — e.g. a bot
+that's currently offline). This only filters the passive feed — startup history
+(`_print_initial_history`), live tail (`_handle_event`'s `message` branch), `/ch`'s re-display,
+and reconnect replay (`_replay_missed`) — while `/search`, `/last`, and `/reply` targets stay
+reachable, same reasoning as why `/reply` ignores the channel filter: an explicit query should
+still find what you're looking for.
+
+### Position and distance (`/pos`)
+
+`_nodes_payload()` in `mesh_logger.py` exposes `lat`/`lon`/`alt` from `node["position"]` — already
+converted from the raw `latitudeI`/`longitudeI` integers to float degrees by the meshtastic
+library's own `_fixupPosition()`, so no unit conversion happens on this side. `/pos <node>` reads
+the target's position plus our own (found by matching `whoami_id` in the same `nodes` list) and
+computes distance/bearing with `haversine_km()`/`bearing_deg()` in `mesh_common.py` (kept there,
+not in `mesh_chat.py`, purely so they're plain stdlib math and can be unit-tested without
+prompt_toolkit).
+
+### RTT measurement (`/ping`)
+
+`/ping <node>` sends a DM with `wantAck=True` (via the normal `dm` IPC command) and measures wall
+time until the matching `delivery` event arrives. Since `send`/`dm`'s `packet_id` comes back
+immediately in the request response while delivery is a separate, asynchronously pushed event,
+`_cmd_ping()` registers `_pending_pings[packet_id] = future` and `_handle_event()`'s `delivery`
+branch resolves that future *instead of* printing the generic "✓ Доставлено" line when a match is
+found — `/ping` renders its own line (with the elapsed time and hop count) so the same delivery
+doesn't get reported twice.
+
+### Statistics and per-sender history (`/stats`, `/last`)
+
+Both read only from `logs/` (no device round-trip) and share the walk-newest-first/limit/ordering
+logic in `_scan_units()` — the same helper `/search` uses, parameterized by a match predicate.
+`/last <node>` requires an *exact* (case-insensitive) match on `long_name` or `short_name`,
+unlike `/search`'s substring match — the intent is "this specific sender", not "reminds me of".
+`/stats` computed via `_collect_stats()` runs in `asyncio.to_thread` since walking every log file
+in a long-lived install can take a moment and would otherwise stall the prompt.
+
+### Local node settings (`/settings`)
+
+Reads/writes go through the local node's own `localConfig`/`moduleConfig` (`node.writeConfig()`),
+which is safe to read-modify-write in place because `TCPInterface`'s connection handshake already
+streams the device's *entire* current config into those objects before `_do_connect()` returns —
+setting one field and calling `writeConfig(section)` pushes back the real current values for
+everything else in that section, not blank defaults. `SETTINGS_REGISTRY` in `mesh_logger.py` is a
+deliberately small curated whitelist (not a generic protobuf-path get/set) — full rationale and
+the parameter table are in `SETTINGS.md`, but the short version: it excludes `network` (WiFi;
+changing it over this same TCP/WiFi link could sever the connection) and `bluetooth`/`security`
+(keys/PINs, not something to expose over a plaintext local socket).
 
 ### `/nodes` sorting and online status
 
@@ -199,3 +302,6 @@ runs continuously under systemd, so code changes require an explicit restart:
 git pull
 sudo systemctl restart mesh-logger
 ```
+
+`mesh-logger.service` uses `Type=notify` + `WatchdogSec=150` (see the sd_notify watchdog note
+above) — after editing the unit file, `sudo systemctl daemon-reload` before restarting.

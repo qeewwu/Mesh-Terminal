@@ -17,16 +17,28 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.shortcuts import clear as pt_clear
 
-from mesh_common import BASE_DIR, SOCKET_PATH, list_log_files, parse_log_line
+from mesh_common import (
+    ACK_TIMEOUT_SECONDS,
+    BASE_DIR,
+    SOCKET_PATH,
+    bearing_deg,
+    compass_point,
+    haversine_km,
+    list_log_files,
+    parse_log_line,
+)
 
 NAME_CACHE_FILE = BASE_DIR / "node_names_cache.json"
 HISTORY_SIZE = 100
 CH_SWITCH_HISTORY = 10   # сколько истории показать после /ch
 SEARCH_LIMIT = 20
+LAST_LIMIT = 20
 ONLINE_THRESHOLD_SECONDS = 15 * 60  # узел считается «онлайн», если был на связи недавнее этого
 RECONNECT_DELAY = 3  # seconds between attempts to re-reach the logger socket
 ONEMESH_API = "https://map.onemesh.ru/api/v1/nodes/{}"
 ONEMESH_DELAY = 0.25
+UPDATENAMES_INTERVAL = 30 * 60  # фоновое /updatenames: при запуске и раз в 30 минут
+PING_TIMEOUT = ACK_TIMEOUT_SECONDS + 5.0  # чуть больше, чем логгер сам ждёт ACK
 
 _XML_INVALID = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]")
 _HEX_ID_RE = re.compile(r"^!([0-9a-f]{8})$")
@@ -47,6 +59,10 @@ _client: "IPCClient | None" = None
 
 _name_cache: dict[int, tuple[str, str]] = {}
 _unresolved_ids: set[int] = set()
+# отображаемое имя (long_name), в нижнем регистре — устройство не хранит
+# node_id в текстовом логе, поэтому мьют матчится по имени, а не по id
+# (см. CLAUDE.md); переживает переименование ноды только для новых сообщений
+_muted_names: set[str] = set()
 
 # None => show/send on every channel (send defaults to Primary); otherwise the
 # canonical channel name (and matching index) this session is restricted to.
@@ -62,6 +78,7 @@ _replyables: collections.deque[dict] = collections.deque(maxlen=REPLYABLE_SIZE)
 # Кандидаты для tab-автодополнения (обновляются из ответов логгера)
 _completion_nodes: list[str] = []
 _completion_channels: list[str] = []
+_completion_settings: list[str] = []
 
 
 def _parse_args() -> tuple[str | None, int]:
@@ -92,6 +109,19 @@ def _channel_matches(msg_line: str) -> bool:
         return False
     return parsed.channel.lower() == _channel_filter.lower()
 
+
+def _is_muted(msg_line: str) -> bool:
+    """Only gates the live/history feed (startup, live tail, /ch, reconnect
+    replay) — /search and /last still surface muted senders on an explicit
+    query, same as /reply staying reachable for them."""
+    if not _muted_names:
+        return False
+    parsed = parse_log_line(msg_line)
+    if not parsed or parsed.kind != "message":
+        return False
+    return (parsed.long_name.strip().lower() in _muted_names
+            or parsed.short_name.strip().lower() in _muted_names)
+
 # Live "message" events pushed by the logger before history has finished
 # printing are buffered here, then flushed in order once history is done.
 _history_ready = False
@@ -105,19 +135,29 @@ def _safe(text: str) -> str:
 
 
 def _load_name_cache() -> None:
-    global _name_cache
+    """The cache file predates /mute: an old file is a flat {id: {long,short}}
+    map, so a "names"/"muted" wrapper key is what marks the new format —
+    old files load fine with an empty mute list."""
+    global _name_cache, _muted_names
     if not NAME_CACHE_FILE.exists():
         return
     try:
         raw = json.loads(NAME_CACHE_FILE.read_text(encoding="utf-8"))
-        _name_cache = {int(k): (v["long"], v["short"]) for k, v in raw.items()}
+        if "names" in raw or "muted" in raw:
+            names, muted = raw.get("names", {}), raw.get("muted", [])
+        else:
+            names, muted = raw, []
+        _name_cache = {int(k): (v["long"], v["short"]) for k, v in names.items()}
+        _muted_names = set(muted)
     except Exception:
         _name_cache = {}
+        _muted_names = set()
 
 
 def _save_name_cache() -> None:
     try:
-        raw = {str(k): {"long": v[0], "short": v[1]} for k, v in _name_cache.items()}
+        names = {str(k): {"long": v[0], "short": v[1]} for k, v in _name_cache.items()}
+        raw = {"names": names, "muted": sorted(_muted_names)}
         NAME_CACHE_FILE.write_text(
             json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -146,14 +186,42 @@ def _fetch_onemesh_name(node_id: int) -> tuple[str, str] | None:
     return long_name, short_name
 
 
-def _find_node_in_list(nodes: list[dict], query: str) -> dict | None:
+def _find_node_in_list(nodes: list[dict], query: str) -> list[dict]:
+    """Кандидаты по убыванию точности: точное имя/hex-id → префикс → подстрока.
+    Раньше возвращалось первое подстрочное совпадение, и `/dm Alex` мог уйти
+    узлу «Alexander», хотя в сети есть точный «Alex»."""
     q = query.lower()
+    exact, prefix, substr = [], [], []
     for n in nodes:
         ln = (n.get("long_name") or "").lower()
         sn = (n.get("short_name") or "").lower()
-        if q in ln or q in sn:
-            return n
-    return None
+        if q in (ln, sn, f"!{n['node_id']:08x}"):
+            exact.append(n)
+        elif ln.startswith(q) or sn.startswith(q):
+            prefix.append(n)
+        elif q in ln or q in sn:
+            substr.append(n)
+    return exact or prefix or substr
+
+
+def _pick_node(nodes: list[dict], query: str) -> dict | None:
+    """Единственный подходящий узел, иначе None с объяснением пользователю."""
+    matches = _find_node_in_list(nodes, query)
+    if not matches:
+        print_formatted_text(HTML(
+            f"<ansired>Узел '{_safe(query)}' не найден. Проверьте /nodes</ansired>"
+        ))
+        return None
+    if len(matches) > 1:
+        names = ", ".join(f"{n.get('long_name') or '?'} ({n.get('short_name') or '?'})"
+                          for n in matches[:5])
+        more = " …" if len(matches) > 5 else ""
+        print_formatted_text(HTML(
+            f"<ansiyellow>Имя '{_safe(query)}' неоднозначно, совпадают: "
+            f"{_safe(names)}{more} — уточните запрос</ansiyellow>"
+        ))
+        return None
+    return matches[0]
 
 
 def _resolve_display_name(long_name: str, short_name: str) -> tuple[str, str]:
@@ -171,8 +239,9 @@ def _resolve_display_name(long_name: str, short_name: str) -> tuple[str, str]:
 
 # ── tab completion ────────────────────────────────────────────────────────────
 
-COMMANDS = ["/nodes", "/who", "/dm", "/reply", "/ch", "/send", "/search", "/trace",
-            "/updatenames", "/clear", "/help"]
+COMMANDS = ["/nodes", "/who", "/dm", "/reply", "/react", "/ch", "/send", "/search",
+            "/last", "/trace", "/ping", "/pos", "/stats", "/mute", "/unmute",
+            "/updatenames", "/settings", "/clear", "/help"]
 
 
 class MeshCompleter(Completer):
@@ -189,7 +258,7 @@ class MeshCompleter(Completer):
             return
         cmd, _, arg = text.partition(" ")
         cmd = cmd.lower()
-        if cmd in ("/dm", "/trace"):
+        if cmd in ("/dm", "/trace", "/ping", "/pos", "/mute", "/unmute", "/last"):
             probe = arg.lstrip('"').lower()
             for cand in _completion_nodes:
                 if cand.strip('"').lower().startswith(probe):
@@ -208,6 +277,15 @@ class MeshCompleter(Completer):
                 for cand in _completion_channels:
                     if cand.lower().startswith(arg.lower()):
                         yield Completion(cand, start_position=-len(arg))
+        elif cmd == "/stats":
+            for cand in ("день", "узел"):
+                if cand.startswith(arg.lower()):
+                    yield Completion(cand, start_position=-len(arg))
+        elif cmd == "/settings":
+            if " " not in arg:
+                for cand in _completion_settings:
+                    if cand.lower().startswith(arg.lower()):
+                        yield Completion(cand, start_position=-len(arg))
 
 
 def _update_node_completions(nodes: list[dict]) -> None:
@@ -224,13 +302,16 @@ def _update_node_completions(nodes: list[dict]) -> None:
 
 
 async def _refresh_completions() -> None:
-    global _completion_channels
+    global _completion_channels, _completion_settings
     resp = await _client.request("nodes")
     if resp.get("ok"):
         _update_node_completions(resp.get("nodes", []))
     resp = await _client.request("channels")
     if resp.get("ok"):
         _completion_channels = [c["name"] for c in resp.get("channels", [])]
+    resp = await _client.request("settings", action="list")
+    if resp.get("ok"):
+        _completion_settings = [s["key"] for s in resp.get("settings", [])]
 
 
 # ── IPC client ───────────────────────────────────────────────────────────────
@@ -276,6 +357,11 @@ class IPCClient:
             pass
         finally:
             self.connected = False
+            # не заставляем запросы в полёте ждать свои 10-секундные таймауты
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.set_result({"ok": False, "error": "нет соединения с логгером"})
+            self._pending.clear()
             if not self._closing and self.on_disconnect:
                 self.on_disconnect()
 
@@ -313,13 +399,28 @@ def _snippet(text: str, limit: int = 30) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
+# /ping ждёт delivery-событие своего собственного packet_id напрямую (см. _cmd_ping);
+# когда оно найдено здесь, обычная печать "✓ Доставлено" подавляется — команда
+# сама покажет результат вместе с измеренным временем.
+_pending_pings: dict[int, asyncio.Future] = {}
+
+
 def _handle_event(obj: dict) -> None:
     kind = obj.get("event")
     if kind == "delivery":
+        pid = obj.get("packet_id")
+        fut = _pending_pings.pop(pid, None) if pid else None
+        if fut is not None:
+            if not fut.done():
+                fut.set_result(obj)
+            return
         ref = f' "{_safe(_snippet(obj.get("text", "")))}"'
         ok = obj.get("ok")
         if ok is True:
-            print_formatted_text(HTML(f"<ansigreen>  ✓ Доставлено{ref}</ansigreen>"))
+            hops = obj.get("hops")
+            hop_str = f" ({hops} хоп{'' if hops == 1 else 'а' if 2 <= hops <= 4 else 'ов'})" \
+                if hops is not None else ""
+            print_formatted_text(HTML(f"<ansigreen>  ✓ Доставлено{hop_str}{ref}</ansigreen>"))
         elif ok is False:
             print_formatted_text(HTML(
                 f"<ansired>  ✗ Не доставлено ({_safe(str(obj.get('error', '')))}){ref}</ansired>"
@@ -333,6 +434,8 @@ def _handle_event(obj: dict) -> None:
         lines = obj.get("lines", [])
         if not lines or not _channel_matches(lines[-1]):
             return
+        if _is_muted(lines[-1]):
+            return
         if obj.get("packet_id"):
             _replyables.append({
                 "packet_id": obj["packet_id"],
@@ -344,7 +447,7 @@ def _handle_event(obj: dict) -> None:
             })
         if _history_ready:
             quote = lines[0] if len(lines) == 2 else None
-            _render_unit(quote, lines[-1])
+            _render_if_new(quote, lines[-1])
         else:
             _pending_live.append(lines)
 
@@ -427,6 +530,20 @@ def _render_unit(quote: str | None, msg: str) -> None:
     _render_line(msg)
 
 
+# Последние отрисованные строки сообщений. Закрывает гонки двойного показа:
+# сообщение, записанное в лог между чтением истории и обработкой live-событий
+# (при старте), и между live-событиями нового сокета и перечитыванием лога
+# (_replay_missed при реконнекте к логгеру), пришло бы на экран дважды.
+_recent_lines: collections.deque[str] = collections.deque(maxlen=200)
+
+
+def _render_if_new(quote: str | None, msg: str) -> None:
+    if msg in _recent_lines:
+        return
+    _recent_lines.append(msg)
+    _render_unit(quote, msg)
+
+
 # ── history + live tail ────────────────────────────────────────────────────────
 
 def _split_into_units(lines: list[str]) -> list[tuple[str | None, str]]:
@@ -453,11 +570,15 @@ def _print_initial_history(n: int = HISTORY_SIZE) -> None:
         file_units = _split_into_units(lines)
         if _channel_filter is not None:
             file_units = [u for u in file_units if _channel_matches(u[1])]
+        if _muted_names:
+            file_units = [u for u in file_units if not _is_muted(u[1])]
         units = file_units + units
         if len(units) >= n:
             break
 
     for quote, msg in units[-n:]:
+        # note but don't skip: /ch re-shows recent lines on purpose
+        _recent_lines.append(msg)
         _render_unit(quote, msg)
 
 
@@ -499,7 +620,9 @@ def _replay_missed(lost_at: datetime.datetime) -> None:
                 continue
             if not _channel_matches(msg):
                 continue
-            _render_unit(quote, msg)
+            if _is_muted(msg):
+                continue
+            _render_if_new(quote, msg)
 
 
 async def _reconnect_logger(lost_at: datetime.datetime) -> None:
@@ -665,11 +788,8 @@ async def _cmd_dm(args: str) -> None:
         ))
         return
 
-    node = _find_node_in_list(resp["nodes"], target_name)
+    node = _pick_node(resp["nodes"], target_name)
     if not node:
-        print_formatted_text(HTML(
-            f"<ansired>Узел '{_safe(target_name)}' не найден. Проверьте /nodes</ansired>"
-        ))
         return
 
     send_resp = await _client.request("dm", node_id=node["node_id"], text=text,
@@ -701,11 +821,8 @@ async def _cmd_trace(args: str) -> None:
             f"<ansired>Не удалось получить список узлов: {_safe(resp.get('error', ''))}</ansired>"
         ))
         return
-    node = _find_node_in_list(resp["nodes"], target_name)
+    node = _pick_node(resp["nodes"], target_name)
     if not node:
-        print_formatted_text(HTML(
-            f"<ansired>Узел '{_safe(target_name)}' не найден. Проверьте /nodes</ansired>"
-        ))
         return
 
     print_formatted_text(HTML(
@@ -738,6 +855,125 @@ async def _cmd_trace(args: str) -> None:
         ))
 
 
+async def _cmd_ping(args: str) -> None:
+    """Меряет RTT до узла: DM с wantAck, дожидаемся своего delivery-события
+    по packet_id (см. _pending_pings в _handle_event) и печатаем время + число
+    хопов, которое ACK принёс с собой (см. handler() в mesh_logger.py)."""
+    target_name = args.strip()
+    if not target_name:
+        print_formatted_text(HTML("<ansiyellow>Использование: /ping &lt;имя узла&gt;</ansiyellow>"))
+        return
+
+    resp = await _client.request("nodes")
+    if not resp.get("ok"):
+        print_formatted_text(HTML(
+            f"<ansired>Не удалось получить список узлов: {_safe(resp.get('error', ''))}</ansired>"
+        ))
+        return
+    node = _pick_node(resp["nodes"], target_name)
+    if not node:
+        return
+
+    ln, sn = node.get("long_name") or "?", node.get("short_name") or "?"
+    print_formatted_text(HTML(f"<ansiwhite>🏓 Пингую {_safe(ln)} ({_safe(sn)})...</ansiwhite>"))
+
+    start = _loop.time()
+    send_resp = await _client.request("dm", node_id=node["node_id"], text="🏓 ping",
+                                       channel=_channel_index)
+    if not send_resp.get("ok"):
+        print_formatted_text(HTML(
+            f"<ansired>Ошибка отправки: {_safe(send_resp.get('error', ''))}</ansired>"
+        ))
+        return
+    if send_resp.get("queued"):
+        print_formatted_text(HTML(
+            "<ansiyellow>⏳ Устройство офлайн — пинг встал в очередь, RTT не измерить</ansiyellow>"
+        ))
+        return
+    pid = send_resp.get("packet_id")
+    if not pid:
+        print_formatted_text(HTML("<ansired>Не удалось получить packet_id для пинга</ansired>"))
+        return
+
+    fut = _loop.create_future()
+    _pending_pings[pid] = fut
+    try:
+        delivery = await asyncio.wait_for(fut, timeout=PING_TIMEOUT)
+    except asyncio.TimeoutError:
+        _pending_pings.pop(pid, None)
+        print_formatted_text(HTML(
+            f"<ansired>🏓 {_safe(ln)}: нет ответа за {int(PING_TIMEOUT)}с</ansired>"
+        ))
+        return
+
+    elapsed = _loop.time() - start
+    ok = delivery.get("ok")
+    if ok is True:
+        hops = delivery.get("hops")
+        hop_str = f", {hops} хоп{'' if hops == 1 else 'а' if 2 <= hops <= 4 else 'ов'}" \
+            if hops is not None else ""
+        print_formatted_text(HTML(
+            f"<ansigreen>🏓 {_safe(ln)}: доставлено за {elapsed:.1f}с{hop_str}</ansigreen>"
+        ))
+    elif ok is False:
+        print_formatted_text(HTML(
+            f"<ansired>🏓 {_safe(ln)}: не доставлено "
+            f"({_safe(str(delivery.get('error', '')))})</ansired>"
+        ))
+    else:
+        print_formatted_text(HTML(
+            f"<ansiyellow>🏓 {_safe(ln)}: нет подтверждения доставки за {elapsed:.1f}с "
+            "(мог дойти, но ACK не получен)</ansiyellow>"
+        ))
+
+
+async def _cmd_pos(args: str) -> None:
+    target_name = args.strip()
+    if not target_name:
+        print_formatted_text(HTML("<ansiyellow>Использование: /pos &lt;имя узла&gt;</ansiyellow>"))
+        return
+
+    resp = await _client.request("nodes")
+    if not resp.get("ok"):
+        print_formatted_text(HTML(
+            f"<ansired>Не удалось получить список узлов: {_safe(resp.get('error', ''))}</ansired>"
+        ))
+        return
+    nodes = resp["nodes"]
+    node = _pick_node(nodes, target_name)
+    if not node:
+        return
+    if node.get("lat") is None or node.get("lon") is None:
+        print_formatted_text(HTML(
+            f"<ansiyellow>У узла {_safe(node.get('long_name') or '?')} нет данных о позиции "
+            "(не шлёт GPS-координаты)</ansiyellow>"
+        ))
+        return
+
+    ln, sn = node.get("long_name") or "?", node.get("short_name") or "?"
+    alt = node.get("alt")
+    alt_str = f", {alt} м" if alt is not None else ""
+    print_formatted_text(HTML(
+        f"<ansiwhite>📍 {_safe(ln)} ({_safe(sn)}): "
+        f"{node['lat']:.5f}, {node['lon']:.5f}{alt_str}</ansiwhite>"
+    ))
+
+    me = next((n for n in nodes if n["node_id"] == _client.whoami_id), None) \
+        if _client.whoami_id is not None else None
+    if me and me.get("lat") is not None and me.get("lon") is not None:
+        dist = haversine_km(me["lat"], me["lon"], node["lat"], node["lon"])
+        brng = bearing_deg(me["lat"], me["lon"], node["lat"], node["lon"])
+        dist_str = f"{dist:.1f} км" if dist >= 1 else f"{dist * 1000:.0f} м"
+        print_formatted_text(HTML(
+            f"<ansiwhite>   от меня: {dist_str}, азимут {brng:.0f}° "
+            f"({compass_point(brng)})</ansiwhite>"
+        ))
+    else:
+        print_formatted_text(HTML(
+            "<ansigray>   (у моего узла нет своей позиции — расстояние не посчитать)</ansigray>"
+        ))
+
+
 def _reply_label(r: dict, num: int) -> str:
     parsed = parse_log_line(r["line"])
     if not parsed:
@@ -760,6 +996,35 @@ def _list_replyables() -> None:
     ))
 
 
+def _parse_target_and_text(args: str, usage_html: str) -> tuple[dict, str] | None:
+    """Общий разбор `#N <текст>` / `<текст>` (на #1), используется /reply и /react."""
+    if args.startswith("#"):
+        num_str, _, text = args[1:].partition(" ")
+        text = text.strip()
+        if not num_str.isdigit() or not text:
+            print_formatted_text(HTML(usage_html))
+            return None
+        num = int(num_str)
+        if not 1 <= num <= len(_replyables):
+            print_formatted_text(HTML(
+                f"<ansired>Нет сообщения #{num} — доступны #1…#{len(_replyables)}</ansired>"
+            ))
+            return None
+        return _replyables[-num], text
+    return _replyables[-1], args
+
+
+async def _send_to_reply_target(r: dict, text: str, emoji: bool = False) -> dict:
+    fields = dict(text=text, reply_id=r["packet_id"], channel=r["channel_index"], emoji=emoji)
+    if r["is_dm"]:
+        # For both incoming and outgoing DM: use to_id if it exists (outgoing),
+        # otherwise from_id (incoming)
+        target = r.get("to_id") or r.get("from_id")
+        if target:
+            return await _client.request("dm", node_id=target, **fields)
+    return await _client.request("send", **fields)
+
+
 async def _cmd_reply(args: str) -> None:
     args = args.strip()
     if not _replyables:
@@ -773,25 +1038,13 @@ async def _cmd_reply(args: str) -> None:
         _list_replyables()
         return
 
-    if args.startswith("#"):
-        num_str, _, text = args[1:].partition(" ")
-        text = text.strip()
-        if not num_str.isdigit() or not text:
-            print_formatted_text(HTML(
-                "<ansiyellow>Использование: /reply #&lt;номер&gt; &lt;текст&gt; "
-                "(номера — в /reply без аргументов)</ansiyellow>"
-            ))
-            return
-        num = int(num_str)
-        if not 1 <= num <= len(_replyables):
-            print_formatted_text(HTML(
-                f"<ansired>Нет сообщения #{num} — доступны #1…#{len(_replyables)}</ansired>"
-            ))
-            return
-        r = _replyables[-num]
-    else:
-        r = _replyables[-1]
-        text = args
+    target = _parse_target_and_text(args, (
+        "<ansiyellow>Использование: /reply #&lt;номер&gt; &lt;текст&gt; "
+        "(номера — в /reply без аргументов)</ansiyellow>"
+    ))
+    if target is None:
+        return
+    r, text = target
 
     parsed = parse_log_line(r["line"])
     if parsed:
@@ -799,18 +1052,43 @@ async def _cmd_reply(args: str) -> None:
             f"<ansigray>Отвечаю на: [{_safe(parsed.time_str)}] {_safe(parsed.long_name)} — "
             f"{_safe(_snippet(parsed.text))}</ansigray>"
         ))
-    fields = dict(text=text, reply_id=r["packet_id"], channel=r["channel_index"])
-    if r["is_dm"]:
-        # For both incoming and outgoing DM: use to_id if it exists (outgoing),
-        # otherwise from_id (incoming)
-        target = r.get("to_id") or r.get("from_id")
-        if target:
-            resp = await _client.request("dm", node_id=target, **fields)
-        else:
-            resp = await _client.request("send", **fields)
-    else:
-        resp = await _client.request("send", **fields)
+    resp = await _send_to_reply_target(r, text)
     _handle_send_response(resp, text)
+
+
+async def _cmd_react(args: str) -> None:
+    args = args.strip()
+    if not _replyables:
+        print_formatted_text(HTML(
+            "<ansiyellow>Пока нечего реактить: /react работает для сообщений, "
+            "полученных после запуска клиента</ansiyellow>"
+        ))
+        return
+
+    if not args:
+        _list_replyables()
+        print_formatted_text(HTML(
+            "<ansigray>Реакция: /react #&lt;номер&gt; &lt;эмодзи&gt; — "
+            "или /react &lt;эмодзи&gt; на #1</ansigray>"
+        ))
+        return
+
+    target = _parse_target_and_text(args, (
+        "<ansiyellow>Использование: /react #&lt;номер&gt; &lt;эмодзи&gt; "
+        "(номера — в /react без аргументов)</ansiyellow>"
+    ))
+    if target is None:
+        return
+    r, emoji_text = target
+
+    parsed = parse_log_line(r["line"])
+    if parsed:
+        print_formatted_text(HTML(
+            f"<ansigray>Реагирую на: [{_safe(parsed.time_str)}] {_safe(parsed.long_name)} — "
+            f"{_safe(_snippet(parsed.text))}</ansigray>"
+        ))
+    resp = await _send_to_reply_target(r, emoji_text, emoji=True)
+    _handle_send_response(resp, emoji_text)
 
 
 async def _cmd_ch(args: str) -> None:
@@ -885,15 +1163,13 @@ async def _cmd_send(args: str) -> None:
     _handle_send_response(send_resp, text)
 
 
-def _cmd_search(args: str) -> None:
-    query = args.strip().lower()
-    if not query:
-        print_formatted_text(HTML(
-            "<ansiyellow>Использование: /search &lt;текст&gt;</ansiyellow>"
-        ))
-        return
-
-    matches: list[tuple[str, str | None, str]] = []  # (date, quote, msg)
+def _scan_units(predicate, limit: int) -> list[tuple[str, str | None, str]]:
+    """Walk logs/ newest-file-first, keep (date, quote, msg) units whose
+    message line matches `predicate(parsed)`, stop once `limit` collected.
+    Shared by /search and /last — same file-walk/limit/ordering logic, just a
+    different match rule; per-file order stays oldest-to-newest, and prepending
+    each (older) file's matches keeps the overall list chronological."""
+    matches: list[tuple[str, str | None, str]] = []
     for path in list_log_files():  # newest date first
         date_str = path.stem.removeprefix("chat-")
         try:
@@ -903,26 +1179,24 @@ def _cmd_search(args: str) -> None:
         found = []
         for quote, msg in _split_into_units(lines):
             parsed = parse_log_line(msg)
-            if not parsed or not _channel_matches(msg):
+            if not parsed or parsed.kind != "message" or not _channel_matches(msg):
                 continue
-            if (query in parsed.text.lower() or query in parsed.long_name.lower()
-                    or query in parsed.short_name.lower()):
+            if predicate(parsed):
                 found.append((date_str, quote, msg))
         matches = found + matches
-        if len(matches) >= SEARCH_LIMIT:
+        if len(matches) >= limit:
             break
+    return matches
 
+
+def _print_unit_matches(header: str, matches: list[tuple[str, str | None, str]],
+                         limit: int, empty_message: str) -> None:
     if not matches:
-        print_formatted_text(HTML(
-            f"<ansiyellow>По запросу «{_safe(query)}» ничего не найдено</ansiyellow>"
-        ))
+        print_formatted_text(HTML(f"<ansiyellow>{empty_message}</ansiyellow>"))
         return
-
-    shown = matches[-SEARCH_LIMIT:]
-    suffix = f" (показаны последние {SEARCH_LIMIT})" if len(matches) > SEARCH_LIMIT else ""
-    print_formatted_text(HTML(
-        f"<ansiwhite>─── Поиск: «{_safe(query)}»{_safe(suffix)} ───</ansiwhite>"
-    ))
+    shown = matches[-limit:]
+    suffix = f" (показаны последние {limit})" if len(matches) > limit else ""
+    print_formatted_text(HTML(f"<ansiwhite>{header}{_safe(suffix)} ───</ansiwhite>"))
     last_date = None
     for date_str, quote, msg in shown:
         if date_str != last_date:
@@ -931,11 +1205,129 @@ def _cmd_search(args: str) -> None:
         _render_unit(quote, msg)
 
 
+def _cmd_search(args: str) -> None:
+    query = args.strip().lower()
+    if not query:
+        print_formatted_text(HTML(
+            "<ansiyellow>Использование: /search &lt;текст&gt;</ansiyellow>"
+        ))
+        return
+
+    matches = _scan_units(
+        lambda p: (query in p.text.lower() or query in p.long_name.lower()
+                   or query in p.short_name.lower()),
+        SEARCH_LIMIT,
+    )
+    _print_unit_matches(f"─── Поиск: «{_safe(query)}»", matches, SEARCH_LIMIT,
+                        f"По запросу «{_safe(query)}» ничего не найдено")
+
+
+def _cmd_last(args: str) -> None:
+    query = args.strip()
+    if not query:
+        print_formatted_text(HTML(
+            "<ansiyellow>Использование: /last &lt;имя узла&gt; (короткое или полное, "
+            "точное совпадение)</ansiyellow>"
+        ))
+        return
+
+    q = query.lower()
+    matches = _scan_units(
+        lambda p: p.long_name.lower() == q or p.short_name.lower() == q,
+        LAST_LIMIT,
+    )
+    _print_unit_matches(f"─── Последние сообщения от «{_safe(query)}»", matches, LAST_LIMIT,
+                        f"Сообщений от «{_safe(query)}» не найдено")
+
+
+def _collect_stats() -> dict:
+    """Synchronous — called via asyncio.to_thread so a large logs/ directory
+    doesn't stall the prompt. Device connection not needed: everything comes
+    from logs/, same as /search."""
+    per_day: collections.Counter = collections.Counter()
+    per_node: collections.Counter = collections.Counter()
+    per_hour: collections.Counter = collections.Counter()
+    total = 0
+    for path in list_log_files():
+        date_str = path.stem.removeprefix("chat-")
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            continue
+        for line in lines:
+            parsed = parse_log_line(line)
+            if not parsed or parsed.kind != "message":
+                continue
+            if _channel_filter is not None and parsed.channel.lower() != _channel_filter.lower():
+                continue
+            total += 1
+            per_day[date_str] += 1
+            per_node[(parsed.long_name, parsed.short_name)] += 1
+            if parsed.time_str[:2].isdigit():
+                per_hour[int(parsed.time_str[:2])] += 1
+    return {"total": total, "per_day": per_day, "per_node": per_node, "per_hour": per_hour}
+
+
+def _bar(count: int, max_count: int, width: int = 20) -> str:
+    if max_count <= 0 or count <= 0:
+        return ""
+    return "█" * max(1, round(count / max_count * width))
+
+
+async def _cmd_stats(args: str = "") -> None:
+    mode = args.strip().lower()
+    stats = await asyncio.to_thread(_collect_stats)
+    if stats["total"] == 0:
+        print_formatted_text(HTML("<ansiyellow>Нет данных для статистики</ansiyellow>"))
+        return
+
+    if mode in ("день", "дни", "day", "days"):
+        print_formatted_text(HTML("<ansiwhite>─── Сообщений по дням ───</ansiwhite>"))
+        days = sorted(stats["per_day"].items())
+        max_count = max(c for _, c in days)
+        for date_str, count in days:
+            print_formatted_text(HTML(
+                f"  {date_str}  <ansigreen>{_bar(count, max_count)}</ansigreen> {count}"
+            ))
+        return
+
+    if mode in ("узел", "узлы", "node", "nodes"):
+        print_formatted_text(HTML("<ansiwhite>─── Топ активных узлов ───</ansiwhite>"))
+        top = stats["per_node"].most_common(15)
+        max_count = top[0][1] if top else 0
+        for (ln, sn), count in top:
+            dln, dsn = _resolve_display_name(ln, sn)
+            print_formatted_text(HTML(
+                f"  <b>{_safe(dln)}</b> ({_safe(dsn)})  "
+                f"<ansigreen>{_bar(count, max_count)}</ansigreen> {count}"
+            ))
+        return
+
+    days_count = len(stats["per_day"])
+    top_nodes = stats["per_node"].most_common(5)
+    busiest_hour = stats["per_hour"].most_common(1)
+    print_formatted_text(HTML("<ansiwhite>─── Статистика ───</ansiwhite>"))
+    print_formatted_text(HTML(f"  Всего сообщений: <b>{stats['total']}</b> за {days_count} дн."))
+    if busiest_hour:
+        hour, cnt = busiest_hour[0]
+        print_formatted_text(HTML(f"  Самый активный час: {hour:02d}:00 ({cnt} сообщений)"))
+    if top_nodes:
+        print_formatted_text(HTML("  Топ узлов:"))
+        for (ln, sn), count in top_nodes:
+            dln, dsn = _resolve_display_name(ln, sn)
+            print_formatted_text(HTML(f"    <b>{_safe(dln)}</b> ({_safe(dsn)}) — {count}"))
+    print_formatted_text(HTML("<ansigray>Подробнее: /stats день · /stats узел</ansigray>"))
+
+
 def _cmd_clear() -> None:
     pt_clear()
 
 
-async def _cmd_updatenames() -> None:
+async def _cmd_updatenames(quiet: bool = False) -> None:
+    """quiet=True — фоновый вызов (при старте и раз в UPDATENAMES_INTERVAL):
+    без промежуточных строк, только короткая сводка если что-то нашлось, и
+    полная тишина, если обновлять нечего — команда не должна отвлекать
+    от набора текста в разговоре."""
     targets = set(_unresolved_ids)
     resp = await _client.request("nodes")
     if resp.get("ok"):
@@ -944,15 +1336,17 @@ async def _cmd_updatenames() -> None:
                 targets.add(n["node_id"])
 
     if not targets:
-        print_formatted_text(HTML(
-            "<ansiyellow>Нечего обновлять — все видимые узлы уже с именами</ansiyellow>"
-        ))
+        if not quiet:
+            print_formatted_text(HTML(
+                "<ansiyellow>Нечего обновлять — все видимые узлы уже с именами</ansiyellow>"
+            ))
         return
 
     targets = sorted(targets)
-    print_formatted_text(HTML(
-        f"<ansiwhite>Запрашиваю имена {len(targets)} узлов через OneMesh...</ansiwhite>"
-    ))
+    if not quiet:
+        print_formatted_text(HTML(
+            f"<ansiwhite>Запрашиваю имена {len(targets)} узлов через OneMesh...</ansiwhite>"
+        ))
 
     resolved = 0
     for nid in targets:
@@ -961,15 +1355,129 @@ async def _cmd_updatenames() -> None:
             _name_cache[nid] = result
             _unresolved_ids.discard(nid)
             resolved += 1
-            print_formatted_text(HTML(
-                f"  <ansigreen>✓</ansigreen> !{nid:08x} → "
-                f"<b>{_safe(result[0])}</b> ({_safe(result[1])})"
-            ))
+            if not quiet:
+                print_formatted_text(HTML(
+                    f"  <ansigreen>✓</ansigreen> !{nid:08x} → "
+                    f"<b>{_safe(result[0])}</b> ({_safe(result[1])})"
+                ))
         await asyncio.sleep(ONEMESH_DELAY)
 
+    if resolved:
+        _save_name_cache()
+    if quiet:
+        if resolved:
+            print_formatted_text(HTML(
+                f"<ansigray>🔎 Автообновление имён: +{resolved} новых</ansigray>"
+            ))
+    else:
+        print_formatted_text(HTML(
+            f"<ansigreen>Готово: обновлено {resolved} из {len(targets)} имён</ansigreen>"
+        ))
+
+
+async def _periodic_updatenames() -> None:
+    while True:
+        with contextlib.suppress(Exception):
+            await _cmd_updatenames(quiet=True)
+        await asyncio.sleep(UPDATENAMES_INTERVAL)
+
+
+def _list_muted() -> None:
+    if not _muted_names:
+        print_formatted_text(HTML("<ansiyellow>Список замьюченных пуст</ansiyellow>"))
+        return
+    print_formatted_text(HTML("<ansiwhite>─── Замьюченные ───</ansiwhite>"))
+    for name in sorted(_muted_names):
+        print_formatted_text(HTML(f"  {_safe(name)}"))
+    print_formatted_text(HTML("<ansigray>Снять: /unmute &lt;имя&gt;</ansigray>"))
+
+
+async def _cmd_mute(args: str) -> None:
+    """Мьютит по имени, а не по node_id: лог хранит только текстовые имена
+    (см. CLAUDE.md), поэтому это единственный ключ, который работает и для
+    живых, и для исторических сообщений. Живой список узлов используется
+    только чтобы взять каноническое long_name при точном совпадении; если
+    узел сейчас не виден (офлайн/неизвестен), мьютим по введённому тексту
+    напрямую — тоже сработает, раз /is_muted проверяет и short_name."""
+    query = args.strip()
+    if not query:
+        _list_muted()
+        return
+
+    resp = await _client.request("nodes")
+    nodes = resp.get("nodes", []) if resp.get("ok") else []
+    matches = _find_node_in_list(nodes, query)
+    target = matches[0].get("long_name") if len(matches) == 1 and matches[0].get("long_name") else query
+
+    key = target.strip().lower()
+    if key in _muted_names:
+        print_formatted_text(HTML(f"<ansiyellow>«{_safe(target)}» уже замьючен</ansiyellow>"))
+        return
+    _muted_names.add(key)
     _save_name_cache()
     print_formatted_text(HTML(
-        f"<ansigreen>Готово: обновлено {resolved} из {len(targets)} имён</ansigreen>"
+        f"<ansigray>🔇 «{_safe(target)}» замьючен — больше не появится в чате "
+        "(/search и /last по-прежнему находят)</ansigray>"
+    ))
+
+
+async def _cmd_unmute(args: str) -> None:
+    query = args.strip()
+    if not query:
+        _list_muted()
+        return
+    key = query.lower()
+    if key not in _muted_names:
+        print_formatted_text(HTML(
+            f"<ansiyellow>«{_safe(query)}» не в списке замьюченных — /unmute без аргументов "
+            "покажет список</ansiyellow>"
+        ))
+        return
+    _muted_names.discard(key)
+    _save_name_cache()
+    print_formatted_text(HTML(f"<ansigreen>🔊 «{_safe(query)}» размьючен</ansigreen>"))
+
+
+async def _cmd_settings(args: str) -> None:
+    """Список/изменение параметров ЛОКАЛЬНОГО узла (см. SETTINGS.md для полного
+    описания каждого параметра и почему часть конфига устройства сюда
+    сознательно не вынесена — network/bluetooth/security)."""
+    parts = args.strip().split(None, 1)
+    if not parts:
+        resp = await _client.request("settings", action="list")
+        if not resp.get("ok"):
+            print_formatted_text(HTML(
+                f"<ansired>Не удалось получить настройки: {_safe(resp.get('error', ''))}</ansired>"
+            ))
+            return
+        print_formatted_text(HTML("<ansiwhite>─── Настройки узла ───</ansiwhite>"))
+        for item in resp.get("settings", []):
+            print_formatted_text(HTML(
+                f"  <b>{_safe(item['key'])}</b> = {_safe(str(item['value']))}  "
+                f"<ansigray>{_safe(item['description'])}</ansigray>"
+            ))
+        print_formatted_text(HTML(
+            "<ansigray>Изменить: /settings &lt;параметр&gt; &lt;значение&gt;. "
+            "Подробности — SETTINGS.md</ansigray>"
+        ))
+        return
+
+    if len(parts) < 2:
+        print_formatted_text(HTML(
+            "<ansiyellow>Использование: /settings &lt;параметр&gt; &lt;значение&gt; "
+            "(список параметров — /settings без аргументов)</ansiyellow>"
+        ))
+        return
+    key, value = parts
+    resp = await _client.request("settings", action="set", key=key, value=value)
+    if not resp.get("ok"):
+        print_formatted_text(HTML(
+            f"<ansired>Не удалось применить: {_safe(resp.get('error', ''))}</ansired>"
+        ))
+        return
+    print_formatted_text(HTML(
+        f"<ansigreen>✓ {_safe(key)} = {_safe(str(resp['value']))}</ansigreen> "
+        "<ansigray>(некоторые параметры применяются только после перезагрузки устройства)</ansigray>"
     ))
 
 
@@ -982,11 +1490,20 @@ def _cmd_help() -> None:
         "  /reply               список недавних сообщений, на которые можно ответить",
         "  /reply &lt;текст&gt;       ответ (с цитатой) на последнее полученное сообщение",
         "  /reply #N &lt;текст&gt;    ответ на сообщение №N из списка /reply",
+        "  /react &lt;эмодзи&gt;      реакция (tapback) на последнее сообщение",
+        "  /react #N &lt;эмодзи&gt;   реакция на сообщение №N из списка /reply",
         "  /ch [имя|all]        показать/сменить канал",
         "  /send &lt;канал&gt; &lt;текст&gt; разовая отправка в канал без переключения сессии",
         "  /search &lt;текст&gt;     поиск по истории (учитывает текущий канал)",
+        "  /last &lt;имя&gt;         последние сообщения узла (точное имя, короткое или полное)",
+        "  /stats [день|узел]   статистика по истории переписки",
         "  /trace &lt;имя&gt;        маршрут пакетов до узла (traceroute)",
-        "  /updatenames         подтянуть имена узлов с OneMesh",
+        "  /ping &lt;имя&gt;         время доставки (RTT) и число хопов до узла",
+        "  /pos &lt;имя&gt;          позиция узла, расстояние и азимут от меня",
+        "  /mute &lt;имя&gt;         скрыть сообщения узла из чата (история — всё ещё в /search)",
+        "  /unmute [имя]        снять мьют (без аргумента — список замьюченных)",
+        "  /updatenames         подтянуть имена узлов с OneMesh (и так — раз в 30 мин фоном)",
+        "  /settings [параметр значение]  настройки локального узла (см. SETTINGS.md)",
         "  /clear               очистить экран",
         "  /help                эта справка",
         "  Tab                  автодополнение команд, имён узлов и каналов",
@@ -1005,11 +1522,19 @@ async def _handle_command(text: str) -> None:
     elif cmd == "who":         _cmd_who()
     elif cmd == "dm":          await _cmd_dm(args)
     elif cmd == "reply":       await _cmd_reply(args)
+    elif cmd == "react":       await _cmd_react(args)
     elif cmd == "ch":          await _cmd_ch(args)
     elif cmd == "send":        await _cmd_send(args)
     elif cmd == "search":      _cmd_search(args)
+    elif cmd == "last":        _cmd_last(args)
+    elif cmd == "stats":       await _cmd_stats(args)
     elif cmd == "trace":       await _cmd_trace(args)
+    elif cmd == "ping":        await _cmd_ping(args)
+    elif cmd == "pos":         await _cmd_pos(args)
+    elif cmd == "mute":        await _cmd_mute(args)
+    elif cmd == "unmute":      await _cmd_unmute(args)
     elif cmd == "updatenames": await _cmd_updatenames()
+    elif cmd == "settings":    await _cmd_settings(args)
     elif cmd == "clear":       _cmd_clear()
     elif cmd == "help":        _cmd_help()
     else:
@@ -1081,10 +1606,11 @@ async def main() -> None:
     _history_ready = True
     for lines in _pending_live:
         quote = lines[0] if len(lines) == 2 else None
-        _render_unit(quote, lines[-1])
+        _render_if_new(quote, lines[-1])
     _pending_live.clear()
 
     await _refresh_completions()
+    asyncio.create_task(_periodic_updatenames())
     session = PromptSession(completer=MeshCompleter(), complete_while_typing=False)
     print_formatted_text(HTML(
         "\n<ansiwhite>Сообщение или /help. Ctrl+C / Ctrl+D — выход.</ansiwhite>\n"
