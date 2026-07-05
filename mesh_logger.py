@@ -47,6 +47,7 @@ OUTBOX_RETRIES = 3  # per-message re-queue limit when sendText itself fails
 CLIENT_SEND_TIMEOUT = 5
 TRACE_TIMEOUT = 40  # a traceroute is a full round trip across the mesh, can be slow
 WATCHDOG_PING_SECONDS = 60  # cadence for the watchdog loop; also used for sd_notify(WATCHDOG=1)
+REBOOT_DELAY_SECS = 5  # gives our own ack response a moment to flush before the device reboots
 
 _interface = None
 _loop: asyncio.AbstractEventLoop | None = None
@@ -804,6 +805,19 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                                 resp["error"] = f"не удалось применить: {e}"
                         else:
                             resp["error"] = f"unknown settings action: {action}"
+
+                elif cmd == "reboot":
+                    if not _interface:
+                        resp["error"] = "not connected"
+                    else:
+                        try:
+                            # reboot() does a synchronous admin-packet send (like writeConfig) —
+                            # off the event loop so it can't stall other IPC clients
+                            await asyncio.to_thread(_interface.localNode.reboot,
+                                                    REBOOT_DELAY_SECS)
+                            resp = {"req_id": req_id, "ok": True, "secs": REBOOT_DELAY_SECS}
+                        except Exception as e:
+                            resp["error"] = f"не удалось перезагрузить: {e}"
                 else:
                     resp["error"] = f"unknown cmd: {cmd}"
             except Exception as e:

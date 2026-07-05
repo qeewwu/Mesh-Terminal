@@ -276,6 +276,20 @@ the parameter table are in `SETTINGS.md`, but the short version: it excludes `ne
 changing it over this same TCP/WiFi link could sever the connection) and `bluetooth`/`security`
 (keys/PINs, not something to expose over a plaintext local socket).
 
+### Rebooting the node (`/reboot`)
+
+`cmd == "reboot"` calls the meshtastic library's `node.reboot(REBOOT_DELAY_SECS)` (an admin
+message, same family as `writeConfig`) via `asyncio.to_thread` for the same blocking-socket-write
+reason as everything else that talks to the device. This is the deliberately disruptive sibling
+of `/settings` — some config sections (mainly `lora`) only take effect after a reboot, so
+`/reboot` is also how a user applies those. `mesh_chat.py` gates it behind a two-step confirm
+(`_cmd_reboot`): a bare `/reboot` only arms a `REBOOT_CONFIRM_WINDOW`-second window (module
+global `_reboot_confirm_deadline`, checked against `_loop.time()`) and prints a warning; only
+`/reboot confirm` inside that window actually sends the IPC request. Two separate commands
+rather than a y/n prompt so the handler doesn't need access to the `PromptSession` object created
+in `main()`. The reboot drops the TCP connection like any other disconnect — the logger's normal
+reconnect loop (`on_connection_lost` → `_reconnect_loop`) picks it back up with no special-casing.
+
 ### `/nodes` sorting and online status
 
 `mesh_logger.py`'s `_nodes_payload()` includes `hops_away` (from the protobuf `NodeInfo.hops_away`,

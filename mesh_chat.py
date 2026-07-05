@@ -39,6 +39,7 @@ ONEMESH_API = "https://map.onemesh.ru/api/v1/nodes/{}"
 ONEMESH_DELAY = 0.25
 UPDATENAMES_INTERVAL = 30 * 60  # фоновое /updatenames: при запуске и раз в 30 минут
 PING_TIMEOUT = ACK_TIMEOUT_SECONDS + 5.0  # чуть больше, чем логгер сам ждёт ACK
+REBOOT_CONFIRM_WINDOW = 30.0  # секунд на /reboot confirm после /reboot
 
 _XML_INVALID = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]")
 _HEX_ID_RE = re.compile(r"^!([0-9a-f]{8})$")
@@ -56,6 +57,9 @@ def _is_reaction_text(text: str) -> bool:
 
 _loop: asyncio.AbstractEventLoop | None = None
 _client: "IPCClient | None" = None
+# monotonic deadline (_loop.time()) for /reboot confirm; None когда нет
+# ожидающего подтверждения — см. _cmd_reboot
+_reboot_confirm_deadline: float | None = None
 
 _name_cache: dict[int, tuple[str, str]] = {}
 _unresolved_ids: set[int] = set()
@@ -241,7 +245,7 @@ def _resolve_display_name(long_name: str, short_name: str) -> tuple[str, str]:
 
 COMMANDS = ["/nodes", "/who", "/dm", "/reply", "/react", "/ch", "/send", "/search",
             "/last", "/trace", "/ping", "/pos", "/stats", "/mute", "/unmute",
-            "/updatenames", "/settings", "/clear", "/help"]
+            "/updatenames", "/settings", "/reboot", "/clear", "/help"]
 
 
 class MeshCompleter(Completer):
@@ -286,6 +290,9 @@ class MeshCompleter(Completer):
                 for cand in _completion_settings:
                     if cand.lower().startswith(arg.lower()):
                         yield Completion(cand, start_position=-len(arg))
+        elif cmd == "/reboot":
+            if "confirm".startswith(arg.lower()):
+                yield Completion("confirm", start_position=-len(arg))
 
 
 def _update_node_completions(nodes: list[dict]) -> None:
@@ -1477,7 +1484,50 @@ async def _cmd_settings(args: str) -> None:
         return
     print_formatted_text(HTML(
         f"<ansigreen>✓ {_safe(key)} = {_safe(str(resp['value']))}</ansigreen> "
-        "<ansigray>(некоторые параметры применяются только после перезагрузки устройства)</ansigray>"
+        "<ansigray>(некоторые параметры требуют /reboot, чтобы вступить в силу)</ansigray>"
+    ))
+
+
+async def _cmd_reboot(args: str) -> None:
+    """Двухшаговое подтверждение вместо одного деструктивного действия: /reboot
+    показывает предупреждение и открывает окно REBOOT_CONFIRM_WINDOW секунд, в
+    течение которого только /reboot confirm реально шлёт reboot(). Отдельная
+    команда — а не да/нет-промпт поверх PromptSession — чтобы не тащить сессию
+    prompt_toolkit в обработчик команд."""
+    global _reboot_confirm_deadline
+    arg = args.strip().lower()
+    if arg not in ("", "confirm"):
+        print_formatted_text(HTML(
+            "<ansiyellow>Использование: /reboot — предупреждение, "
+            "/reboot confirm — подтвердить перезагрузку</ansiyellow>"
+        ))
+        return
+
+    now = _loop.time()
+    if arg == "confirm":
+        if _reboot_confirm_deadline is None or now > _reboot_confirm_deadline:
+            print_formatted_text(HTML(
+                "<ansiyellow>Нет ожидающего подтверждения — сначала наберите /reboot</ansiyellow>"
+            ))
+            return
+        _reboot_confirm_deadline = None
+        resp = await _client.request("reboot")
+        if not resp.get("ok"):
+            print_formatted_text(HTML(
+                f"<ansired>Не удалось перезагрузить: {_safe(resp.get('error', ''))}</ansired>"
+            ))
+            return
+        print_formatted_text(HTML(
+            "<ansigreen>🔄 Узел перезагружается — соединение на секунду оборвётся, "
+            "логгер переподключится сам</ansigreen>"
+        ))
+        return
+
+    _reboot_confirm_deadline = now + REBOOT_CONFIRM_WINDOW
+    print_formatted_text(HTML(
+        f"<ansiyellow>⚠ Это перезагрузит устройство (пригодится и после /settings — "
+        f"часть параметров вступает в силу только после перезапуска). Подтвердите: "
+        f"<b>/reboot confirm</b> — окно {int(REBOOT_CONFIRM_WINDOW)}с</ansiyellow>"
     ))
 
 
@@ -1504,6 +1554,7 @@ def _cmd_help() -> None:
         "  /unmute [имя]        снять мьют (без аргумента — список замьюченных)",
         "  /updatenames         подтянуть имена узлов с OneMesh (и так — раз в 30 мин фоном)",
         "  /settings [параметр значение]  настройки локального узла (см. SETTINGS.md)",
+        "  /reboot             перезагрузить узел (требует /reboot confirm)",
         "  /clear               очистить экран",
         "  /help                эта справка",
         "  Tab                  автодополнение команд, имён узлов и каналов",
@@ -1535,6 +1586,7 @@ async def _handle_command(text: str) -> None:
     elif cmd == "unmute":      await _cmd_unmute(args)
     elif cmd == "updatenames": await _cmd_updatenames()
     elif cmd == "settings":    await _cmd_settings(args)
+    elif cmd == "reboot":     await _cmd_reboot(args)
     elif cmd == "clear":       _cmd_clear()
     elif cmd == "help":        _cmd_help()
     else:
