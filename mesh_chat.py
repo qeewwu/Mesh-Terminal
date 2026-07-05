@@ -457,6 +457,23 @@ def _handle_event(obj: dict) -> None:
             _render_if_new(quote, lines[-1])
         else:
             _pending_live.append(lines)
+    elif kind == "device":
+        # статус связи логгера с самим устройством (не с сокетом логгера —
+        # тот отслеживается отдельно, через IPCClient.on_disconnect). Без
+        # этого события /reboot confirm вешает пользователя в неведении:
+        # команда "принята" мгновенно, а реальная перезагрузка и
+        # переподключение происходят только между логгером и устройством.
+        status = obj.get("status")
+        if status == "disconnected":
+            print_formatted_text(HTML(
+                "<ansired>⚠ Устройство отключилось — жду переподключения логгера</ansired>"
+            ))
+        elif status == "connected":
+            ln = _safe(obj.get("long_name") or "?")
+            sn = _safe(obj.get("short_name") or "?")
+            print_formatted_text(HTML(
+                f"<ansigreen>✓ Устройство снова на связи: {ln} ({sn})</ansigreen>"
+            ))
 
 
 # ── display ───────────────────────────────────────────────────────────────────

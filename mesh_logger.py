@@ -140,10 +140,7 @@ def _log(*lines: str) -> None:
             f.write(line + "\n")
 
 
-async def _broadcast(lines: list[str], meta: dict | None = None) -> None:
-    event = {"event": "message", "lines": lines}
-    if meta:
-        event.update(meta)
+async def _broadcast_event(event: dict) -> None:
     data = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
     for writer, lock in list(_clients.items()):
 
@@ -160,6 +157,18 @@ async def _broadcast(lines: list[str], meta: dict | None = None) -> None:
             _clients.pop(writer, None)
             with contextlib.suppress(Exception):
                 writer.close()
+
+
+def _broadcast_device_status(status: str, **fields) -> None:
+    """Tells connected clients when the device link itself drops/comes back —
+    e.g. after /reboot, or an ordinary connection.lost. Called from
+    on_connection_lost (meshtastic's callback thread) and _do_connect() (runs
+    via asyncio.to_thread), so always hops back onto the loop like _write_message
+    does; a no-op if the loop isn't running yet (startup, before main() sets it)."""
+    if not _loop:
+        return
+    event = {"event": "device", "status": status, **fields}
+    _loop.call_soon_threadsafe(lambda: _loop.create_task(_broadcast_event(event)))
 
 
 def _write_message(long_name: str, short_name: str, text: str, hops: int,
@@ -179,7 +188,10 @@ def _write_message(long_name: str, short_name: str, text: str, hops: int,
     _log(*lines)
     if _loop:
         # on_receive runs on meshtastic's background thread; schedule safely
-        _loop.call_soon_threadsafe(lambda: _loop.create_task(_broadcast(lines, meta)))
+        event = {"event": "message", "lines": lines}
+        if meta:
+            event.update(meta)
+        _loop.call_soon_threadsafe(lambda: _loop.create_task(_broadcast_event(event)))
 
 
 def _packet_id(sent) -> int:
@@ -232,6 +244,7 @@ def on_receive(packet, interface):
 
 def on_connection_lost(interface):
     print("[warn] connection lost, will reconnect", file=sys.stderr)
+    _broadcast_device_status("disconnected")
     if _loop and _reconnect_event:
         _loop.call_soon_threadsafe(_reconnect_event.set)
 
@@ -265,6 +278,7 @@ def _do_connect() -> bool:
         my_id = _interface.myInfo.my_node_num
         ln, sn = _node_names(my_id)
         print(f"[info] connected to {HOST} as {ln} ({sn})")
+        _broadcast_device_status("connected", long_name=ln, short_name=sn)
         if _loop and _outbox:
             _loop.call_soon_threadsafe(lambda: _loop.create_task(_flush_outbox()))
         return True

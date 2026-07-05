@@ -76,15 +76,19 @@ shapes flow back to a client:
 - **Responses**: `{"req_id": N, "ok": bool, ...}` — always keyed by `req_id`, matched against a
   pending `asyncio.Future` in the client's `IPCClient._pending` dict.
 - **Events** (unsolicited, pushed by the logger): `{"event": "delivery", ...}` for ACK/NAK after
-  a send, and `{"event": "message", "lines": [...]}` broadcast to every connected client the
-  instant a new message is logged. Every per-client write (broadcast and response alike) is
-  bounded by `CLIENT_SEND_TIMEOUT`: a client that stopped reading (e.g. a suspended terminal)
-  fills its socket buffer and would otherwise hold its write lock in `drain()` forever, stalling
-  broadcasts to everyone else — instead it gets disconnected. For received messages the event also carries `packet_id`,
-  `from_id`, `is_dm`, `channel_index` — the client tracks the latest one as the `/reply` target.
-  There is no polling — the logger pushes live updates directly, so `mesh_chat.py` only reads
-  history once at startup (last 50 messages, walking `logs/` files newest-first via
-  `list_log_files()`) and then relies entirely on pushed events.
+  a send, `{"event": "message", "lines": [...]}` broadcast to every connected client the instant
+  a new message is logged, and `{"event": "device", "status": "connected"|"disconnected", ...}`
+  for the *device* link's own state (see "Device connection status" below — distinct from a
+  client's own socket to the logger, which `IPCClient.on_disconnect` tracks separately). All
+  three go through the same `_broadcast_event()` in `mesh_logger.py`; every per-client write
+  (broadcast and response alike) is bounded by `CLIENT_SEND_TIMEOUT`: a client that stopped
+  reading (e.g. a suspended terminal) fills its socket buffer and would otherwise hold its write
+  lock in `drain()` forever, stalling broadcasts to everyone else — instead it gets disconnected.
+  For received messages the event also carries `packet_id`, `from_id`, `is_dm`, `channel_index`
+  — the client tracks the latest one as the `/reply` target. There is no polling — the logger
+  pushes live updates directly, so `mesh_chat.py` only reads history once at startup (last 50
+  messages, walking `logs/` files newest-first via `list_log_files()`) and then relies entirely
+  on pushed events.
 - The `send`/`dm` commands accept an optional `reply_id` (a packet id) which is passed to
   `sendText(replyId=...)` — requires a meshtastic lib version whose `sendText` has that
   parameter; the logger checks via `inspect.signature` and returns a clear error otherwise.
@@ -289,6 +293,20 @@ global `_reboot_confirm_deadline`, checked against `_loop.time()`) and prints a 
 rather than a y/n prompt so the handler doesn't need access to the `PromptSession` object created
 in `main()`. The reboot drops the TCP connection like any other disconnect — the logger's normal
 reconnect loop (`on_connection_lost` → `_reconnect_loop`) picks it back up with no special-casing.
+
+### Device connection status (`"device"` event)
+
+Without this, `/reboot confirm` was a UX dead end: the IPC response only confirms the admin
+packet was *sent*, not that the device actually rebooted and came back — that whole cycle
+happens entirely between `mesh_logger.py` and the device, invisible to any client, since a
+client's Unix socket to the logger doesn't drop when the *device* link does. `on_connection_lost`
+broadcasts `{"event": "device", "status": "disconnected"}`; `_do_connect()` broadcasts
+`{"status": "connected", "long_name": ..., "short_name": ...}` on every successful (re)connect,
+not just after a reboot — so it also covers a plain WiFi drop or a manual `systemctl restart
+mesh-logger` mid-connection. `mesh_chat.py` prints both unconditionally (no channel/mute
+filtering — this is link status, not a chat message). Absent a live client, `/who` or `/nodes`
+still work as a manual check: they round-trip through the logger and report "not connected" until
+the device is actually back.
 
 ### `/nodes` sorting and online status
 
