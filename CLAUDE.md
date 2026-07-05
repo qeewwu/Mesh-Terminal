@@ -12,6 +12,7 @@ A terminal chat client for Meshtastic over WiFi (TCP API to a `meshtastic.local`
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env   # optional — sensible defaults apply if you skip this
 ```
 
 Two separate processes, always run in this order:
@@ -68,6 +69,21 @@ connection:
   no explicit rollover logic needed), and the log line format/parser (`format_message_line`,
   `format_quote_line`, `parse_log_line`). Because both processes read/write the exact same text
   format, keeping this module as the single formatter+parser prevents drift.
+
+### `.env` (personal/environment config)
+
+`parse_env_file()`/`update_env_file()` in `mesh_common.py` are a deliberately minimal stdlib
+`KEY=VALUE` reader/writer (no `python-dotenv` — the project has no other third-party deps to
+justify one). `_ENV` is parsed once at import time; `HOST` (device hostname, `MESH_HOST`) and
+`PING_CHANNEL_NAME` (`PING_CHANNEL`) fall back to their old hardcoded defaults if `.env` is
+missing or a key isn't set, so a fresh checkout with no `.env` at all still runs. `.env.example`
+in the repo documents every key with a placeholder/default; `.env` itself is gitignored.
+`update_env_file()` rewrites only the keys it's given, preserving every other line (comments,
+unrelated vars) — `mesh_chat.py`'s `/who` calls it with the freshly-learned `NODE_LONG_NAME`/
+`NODE_SHORT_NAME`/`NODE_ID` every time it runs, so `.env` self-updates with the current node
+identity instead of needing manual upkeep. `PING_CHANNEL_NAME` exists for the ping-channel bot
+and auto-ping features (see below) to agree on which channel is "the" ping channel without
+hardcoding its name.
 
 ### IPC protocol (mesh_logger.py ⇄ mesh_chat.py)
 
@@ -208,22 +224,33 @@ logger) to watch DMs; nothing is lost — DMs are always in `logs/` regardless o
 
 ### Node name resolution
 
-`mesh_chat.py` additionally resolves `!hex (???)` fallback names (nodes not yet known to the
-mesh) via the public OneMesh API (`https://map.onemesh.ru/api/v1/nodes/{decimal_node_id}`),
-triggered by the `/updatenames` command. Results are cached in `node_names_cache.json` so they
-persist across restarts. This resolution happens only in the display layer — it does not touch
-`logs/`, so historical log lines keep whatever name was known to the device at write time.
-`_periodic_updatenames()` runs this automatically (once at startup, then every
-`UPDATENAMES_INTERVAL` = 30 min) via `_cmd_updatenames(quiet=True)`, which suppresses the
-per-node progress lines and only prints a one-line summary when it actually resolved something
-— the manual `/updatenames` command stays fully verbose.
+`!hex (???)` fallback names (nodes the mesh itself hasn't given us a NodeInfo for) get resolved
+via the public OneMesh API (`https://map.onemesh.ru/api/v1/nodes/{decimal_node_id}`) — but the
+resolution and caching live in **`mesh_logger.py`**, not the client. This used to be purely a
+`mesh_chat.py` display-layer feature (cache never touched `logs/`, so historical lines kept
+whatever name was known at write time) — moved because that meant resolution only ever ran while
+some chat client happened to be connected. `mesh_logger.py` runs `_run_onemesh_update()`
+continuously (`_periodic_onemesh_update()`: once at startup, then every `ONEMESH_UPDATE_INTERVAL`
+= 30 min, scanning `_interface.nodes` for entries with no `user` data at all and not already
+cached) and — this is the actual point of the move — feeds the result straight into
+`_node_names()`, so **freshly-written log lines** get the resolved name instead of `!hex (???)`,
+not just how a client happens to render them. Results persist in `onemesh_cache.json`
+(`ONEMESH_CACHE_FILE` in `mesh_common.py`), a flat `{node_id: {long, short}}` map — logger-owned,
+logger-written. `mesh_chat.py`'s `/updatenames` is now a thin `updatenames` IPC call that just
+triggers an extra sweep on demand and reloads the shared cache to show the result immediately;
+`_periodic_cache_reload()` re-reads that same file every `CACHE_RELOAD_INTERVAL` (5 min) so a
+long-running client picks up names the logger resolved in the background, without needing a
+restart — no network calls happen client-side.
 
-### `node_names_cache.json` format (names + mutes)
+### `node_names_cache.json` (mute state only)
 
-The same file also stores `/mute` state, so its format is a `{"names": {...}, "muted": [...]}`
-wrapper rather than the old flat `{id: {long, short}}` map. `_load_name_cache()` detects the
-format by checking for a `"names"`/`"muted"` key — a cache file written before this change loads
-fine as `names=<the whole file>, muted=[]`, so no migration step is needed.
+This file predates the OneMesh-resolution move and used to also cache resolved names
+(`{"names": {...}, "muted": [...]}`); now it stores only `{"muted": [...]}` — names live in
+`onemesh_cache.json` instead. `_load_name_cache()` still reads an old file's `"names"` section
+once, as a seed, so upgrading doesn't lose already-resolved names before the logger gets around
+to re-resolving them; `_reload_onemesh_cache()` immediately overlays the shared cache on top
+(newer entries win on conflict), and `_save_name_cache()` only ever writes the `"muted"` key back
+— nothing in `mesh_chat.py` writes to `"names"` anymore.
 
 ### Muting (`/mute`, `/unmute`)
 
@@ -280,6 +307,19 @@ the parameter table are in `SETTINGS.md`, but the short version: it excludes `ne
 changing it over this same TCP/WiFi link could sever the connection) and `bluetooth`/`security`
 (keys/PINs, not something to expose over a plaintext local socket).
 
+MQTT (`mqtt_*` keys — bridges LoRa traffic to services like OneMesh over the internet) mostly
+fits the same registry mechanism (`moduleConfig.mqtt`, `is_module=True`), plus a `"str"` kind in
+`_parse_setting_value()`/`SETTINGS_REGISTRY` for free-text fields (address/username/password/root)
+alongside the existing bool/int/enum. `mqtt_password` is the one field that's write-only in
+effect: `_apply_setting()` and `_settings_snapshot()` both substitute `MQTT_PASSWORD_MASK` for the
+real value on the way out, so a plaintext password set once is never echoed back over the IPC
+socket or shown in `/settings`. `mqtt_uplink`/`mqtt_downlink` don't fit the registry's
+(config-section, field) shape at all — `uplink_enabled`/`downlink_enabled` live on
+`ChannelSettings` (per-channel, via `node.writeChannel()`), not `moduleConfig` — so they're
+special-cased in `_apply_setting()` (alongside `owner_long`/`owner_short`) with a
+`<channel_name>:on|off` value format, and `_settings_snapshot()` shows a summary across every
+non-disabled channel (`_channel_links_summary()`) instead of a single scalar.
+
 Every admin message (`writeConfig`, `setOwner`, `reboot`) needs a per-session passkey the
 firmware hands out on request — but the library's own `node.ensureSessionKey()` only *fires*
 that request; the reply lands later, asynchronously, via `_onAdminReceive()` on meshtastic's
@@ -292,6 +332,42 @@ always runs inside the same `asyncio.to_thread` call as the admin action it prec
 `_apply_setting`) until `_has_session_key()` sees the passkey cached or `SESSION_KEY_TIMEOUT`
 elapses; on timeout it proceeds anyway rather than inventing a new error path; some setups may
 not need a passkey at all, in which case this is a no-op wait that costs nothing.
+
+### Ping-channel bot (`/botping`)
+
+Auto-replies with a hop count on the channel named `PING_CHANNEL_NAME` (`.env`'s
+`PING_CHANNEL`, default "Ping") — lives entirely in `mesh_logger.py` so it keeps answering
+whether or not any `mesh_chat.py` client is open, unlike a feature built into the TUI would.
+`on_receive()` calls `_maybe_botping_reply()` after logging every message; it schedules
+`_send_botping_reply()` onto the event loop (same `call_soon_threadsafe` pattern as
+`_write_message`'s broadcast, since `on_receive` runs on meshtastic's callback thread) only
+when: the bot is enabled, the channel matches, it's not a DM, and it's not already a reply —
+that last check plus a text-prefix check (`BOTPING_MARKER = "🤖"`) matters because **two nodes
+both running botping would otherwise reply to each other's replies forever**; a message that's
+already a reply or already starts with the marker is assumed to be a bot reply (ours or someone
+else's) and is never replied to. The reply itself is sent with `reply_id` set to the triggering
+message's own packet id — a real reply with a quote line, not a bare broadcast, per the request
+("функция реплай"). `_ping_channel_index()` resolves `PING_CHANNEL_NAME` to a channel index by
+name each time (channel lists are tiny, not worth caching) — if the device has no channel with
+that name, it returns `None`, which can never equal a real `channel_index`, so the bot silently
+never fires rather than erroring. Toggled via `/botping 0|1` in `mesh_chat.py` → the `"botping"`
+IPC command → `_set_botping()`, which flips `_botping_enabled` and persists to `.env`
+(`BOTPING_ENABLED`) so the setting survives a `mesh_logger.py` restart; loaded once at import via
+the same `parse_env_file(ENV_FILE)` call used for `HOST`/`PING_CHANNEL_NAME`.
+
+### Auto-ping health check
+
+`_periodic_autoping()` broadcasts "🏓 автопинг: проверка связи" into `PING_CHANNEL_NAME` every
+`AUTOPING_INTERVAL` (2h), unconditionally — independent of `/botping`'s toggle. It's a liveness
+canary (is the mesh link actually carrying traffic), not the reply-bot, so it isn't gated by
+`_botping_enabled`. Sleeps first (doesn't fire immediately on a logger restart, so a crash-loop
+during a bad deploy doesn't spam the channel), and silently no-ops if the device isn't connected
+or has no channel matching `PING_CHANNEL_NAME` — same reasoning as `_ping_channel_index()`
+returning `None` for the bot. Deliberately minimal for now: collecting/parsing responses into a
+daily stats file (how many nodes answered, their hop counts) was scoped out as needing real
+per-bot response-format parsing (community ping bots reply in inconsistent formats) — this only
+sends the canary; `/stats`-style aggregation of who responds can be layered on later by reading
+`logs/` for replies to the autoping's own packet id, without changing this function.
 
 ### Rebooting the node (`/reboot`)
 

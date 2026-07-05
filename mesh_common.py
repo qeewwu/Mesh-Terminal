@@ -7,13 +7,72 @@ import re
 from pathlib import Path
 from typing import NamedTuple
 
-HOST = "meshtastic.local"
 BASE_DIR = Path(__file__).resolve().parent
+ENV_FILE = BASE_DIR / ".env"
+
+
+def parse_env_file(path: Path) -> dict[str, str]:
+    """Minimal stdlib .env reader — KEY=VALUE per line, '#' comments, blank
+    lines ignored, values may be wrapped in matching quotes. Not a full .env
+    spec (no multiline values, no escape sequences) — deliberately simple
+    since this project has no other dependencies to justify pulling in
+    python-dotenv for."""
+    env: dict[str, str] = {}
+    if not path.exists():
+        return env
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        env[key] = value
+    return env
+
+
+def _format_env_value(value: str) -> str:
+    if not value or any(c in value for c in " \t#\"'"):
+        return '"' + value.replace('"', '\\"') + '"'
+    return value
+
+
+def update_env_file(path: Path, updates: dict[str, str]) -> None:
+    """Rewrite `path`, updating/appending `updates` in place and leaving every
+    other line (including comments and unrelated keys) untouched. Used by
+    mesh_chat.py's /who to keep NODE_LONG_NAME/NODE_SHORT_NAME/NODE_ID current
+    without clobbering the rest of a hand-edited .env."""
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    seen = set()
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        key = stripped.split("=", 1)[0].strip() if "=" in stripped and not stripped.startswith("#") else None
+        if key in updates:
+            out.append(f"{key}={_format_env_value(updates[key])}")
+            seen.add(key)
+        else:
+            out.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            out.append(f"{key}={_format_env_value(value)}")
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+_ENV = parse_env_file(ENV_FILE)
+
+HOST = _ENV.get("MESH_HOST", "meshtastic.local")
+PING_CHANNEL_NAME = _ENV.get("PING_CHANNEL", "Ping")
 LOG_DIR = BASE_DIR / "logs"
 SOCKET_PATH = Path("/tmp/mesh_chat.sock")
 BROADCAST_ADDR = 0xFFFFFFFF
 QUOTE_MAX = 60
 ACK_TIMEOUT_SECONDS = 60  # how long to wait for a mesh ACK/NAK before reporting "unknown"
+# OneMesh-resolved !hex -> (long_name, short_name) cache. Owned and written by
+# mesh_logger.py (it feeds real log lines, not just client display) — see
+# "Node name resolution" in CLAUDE.md. mesh_chat.py only reads it.
+ONEMESH_CACHE_FILE = BASE_DIR / "onemesh_cache.json"
 
 
 def log_file_for(date: datetime.date) -> Path:

@@ -20,12 +20,15 @@ from prompt_toolkit.shortcuts import clear as pt_clear
 from mesh_common import (
     ACK_TIMEOUT_SECONDS,
     BASE_DIR,
+    ENV_FILE,
+    ONEMESH_CACHE_FILE,
     SOCKET_PATH,
     bearing_deg,
     compass_point,
     haversine_km,
     list_log_files,
     parse_log_line,
+    update_env_file,
 )
 
 NAME_CACHE_FILE = BASE_DIR / "node_names_cache.json"
@@ -35,9 +38,7 @@ SEARCH_LIMIT = 20
 LAST_LIMIT = 20
 ONLINE_THRESHOLD_SECONDS = 15 * 60  # узел считается «онлайн», если был на связи недавнее этого
 RECONNECT_DELAY = 3  # seconds between attempts to re-reach the logger socket
-ONEMESH_API = "https://map.onemesh.ru/api/v1/nodes/{}"
-ONEMESH_DELAY = 0.25
-UPDATENAMES_INTERVAL = 30 * 60  # фоновое /updatenames: при запуске и раз в 30 минут
+CACHE_RELOAD_INTERVAL = 5 * 60  # как часто перечитывать onemesh_cache.json с диска
 PING_TIMEOUT = ACK_TIMEOUT_SECONDS + 5.0  # чуть больше, чем логгер сам ждёт ACK
 REBOOT_CONFIRM_WINDOW = 30.0  # секунд на /reboot confirm после /reboot
 
@@ -61,8 +62,9 @@ _client: "IPCClient | None" = None
 # ожидающего подтверждения — см. _cmd_reboot
 _reboot_confirm_deadline: float | None = None
 
+# прочитано из onemesh_cache.json (пишет и резолвит только mesh_logger.py —
+# см. "Node name resolution" в CLAUDE.md); клиент только перечитывает файл
 _name_cache: dict[int, tuple[str, str]] = {}
-_unresolved_ids: set[int] = set()
 # отображаемое имя (long_name), в нижнем регистре — устройство не хранит
 # node_id в текстовом логе, поэтому мьют матчится по имени, а не по id
 # (см. CLAUDE.md); переживает переименование ноды только для новых сообщений
@@ -139,55 +141,59 @@ def _safe(text: str) -> str:
 
 
 def _load_name_cache() -> None:
-    """The cache file predates /mute: an old file is a flat {id: {long,short}}
-    map, so a "names"/"muted" wrapper key is what marks the new format —
-    old files load fine with an empty mute list."""
+    """node_names_cache.json now only stores /mute state — name resolution
+    moved to mesh_logger.py (onemesh_cache.json), so it can run continuously
+    instead of only while a chat client happens to be connected. An old file
+    from before that move may still have a "names" section; kept here once as
+    a seed so existing users don't lose already-resolved names on upgrade —
+    _reload_onemesh_cache() below overlays the shared (fresher, logger-owned)
+    cache on top, and only that file grows from here on."""
     global _name_cache, _muted_names
-    if not NAME_CACHE_FILE.exists():
-        return
-    try:
-        raw = json.loads(NAME_CACHE_FILE.read_text(encoding="utf-8"))
-        if "names" in raw or "muted" in raw:
-            names, muted = raw.get("names", {}), raw.get("muted", [])
-        else:
-            names, muted = raw, []
-        _name_cache = {int(k): (v["long"], v["short"]) for k, v in names.items()}
-        _muted_names = set(muted)
-    except Exception:
-        _name_cache = {}
-        _muted_names = set()
+    _name_cache = {}
+    _muted_names = set()
+    if NAME_CACHE_FILE.exists():
+        try:
+            raw = json.loads(NAME_CACHE_FILE.read_text(encoding="utf-8"))
+            if "names" in raw or "muted" in raw:
+                legacy_names, muted = raw.get("names", {}), raw.get("muted", [])
+            else:
+                legacy_names, muted = raw, []
+            _name_cache = {int(k): (v["long"], v["short"]) for k, v in legacy_names.items()}
+            _muted_names = set(muted)
+        except Exception:
+            pass
+    _reload_onemesh_cache()
 
 
 def _save_name_cache() -> None:
     try:
-        names = {str(k): {"long": v[0], "short": v[1]} for k, v in _name_cache.items()}
-        raw = {"names": names, "muted": sorted(_muted_names)}
         NAME_CACHE_FILE.write_text(
-            json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps({"muted": sorted(_muted_names)}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
     except Exception:
         pass
 
 
-def _fetch_onemesh_name(node_id: int) -> tuple[str, str] | None:
-    import urllib.request
-
-    req = urllib.request.Request(
-        ONEMESH_API.format(node_id),
-        headers={"User-Agent": "mesh-chat/1.0"},
-    )
+def _reload_onemesh_cache() -> None:
+    """onemesh_cache.json is written by mesh_logger.py, possibly while this
+    client is already running (its own background sweep, or another client's
+    /updatenames) — reloading periodically (_periodic_cache_reload) picks up
+    newly-resolved names without needing a restart."""
+    if not ONEMESH_CACHE_FILE.exists():
+        return
     try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        raw = json.loads(ONEMESH_CACHE_FILE.read_text(encoding="utf-8"))
+        _name_cache.update({int(k): (v["long"], v["short"]) for k, v in raw.items()})
     except Exception:
-        return None
+        pass
 
-    node = data.get("node")
-    if not node:
-        return None
-    long_name = node.get("long_name") or f"!{node_id:08x}"
-    short_name = node.get("short_name") or "???"
-    return long_name, short_name
+
+async def _periodic_cache_reload() -> None:
+    while True:
+        await asyncio.sleep(CACHE_RELOAD_INTERVAL)
+        with contextlib.suppress(Exception):
+            _reload_onemesh_cache()
 
 
 def _find_node_in_list(nodes: list[dict], query: str) -> list[dict]:
@@ -229,23 +235,20 @@ def _pick_node(nodes: list[dict], query: str) -> dict | None:
 
 
 def _resolve_display_name(long_name: str, short_name: str) -> tuple[str, str]:
-    """If a name looks like our own hex fallback, try the OneMesh cache and
-    track it as unresolved otherwise."""
+    """If a name looks like our own hex fallback, try the OneMesh cache
+    (mesh_logger.py resolves and persists it; we just read it here)."""
     m = _HEX_ID_RE.match(long_name)
     if not m or short_name != "???":
         return long_name, short_name
     node_id = int(m.group(1), 16)
-    if node_id in _name_cache:
-        return _name_cache[node_id]
-    _unresolved_ids.add(node_id)
-    return long_name, short_name
+    return _name_cache.get(node_id, (long_name, short_name))
 
 
 # ── tab completion ────────────────────────────────────────────────────────────
 
 COMMANDS = ["/nodes", "/who", "/dm", "/reply", "/react", "/ch", "/send", "/search",
             "/last", "/trace", "/ping", "/pos", "/stats", "/mute", "/unmute",
-            "/updatenames", "/settings", "/reboot", "/clear", "/help"]
+            "/updatenames", "/settings", "/botping", "/reboot", "/clear", "/help"]
 
 
 class MeshCompleter(Completer):
@@ -284,6 +287,10 @@ class MeshCompleter(Completer):
         elif cmd == "/stats":
             for cand in ("день", "узел"):
                 if cand.startswith(arg.lower()):
+                    yield Completion(cand, start_position=-len(arg))
+        elif cmd == "/botping":
+            for cand in ("0", "1"):
+                if cand.startswith(arg):
                     yield Completion(cand, start_position=-len(arg))
         elif cmd == "/settings":
             if " " not in arg:
@@ -716,12 +723,7 @@ async def _cmd_nodes(args: str = "") -> None:
         if n["has_user"]:
             ln, sn = n["long_name"], n["short_name"]
         else:
-            cached = _name_cache.get(n["node_id"])
-            if cached:
-                ln, sn = cached
-            else:
-                ln, sn = f"!{n['node_id']:08x}", "???"
-                _unresolved_ids.add(n["node_id"])
+            ln, sn = _name_cache.get(n["node_id"], (f"!{n['node_id']:08x}", "???"))
         enriched.append({**n, "display_long": ln, "display_short": sn})
 
     enriched.sort(key=lambda n: _node_sort_key(n, mode))
@@ -761,13 +763,19 @@ def _cmd_who() -> None:
         print_formatted_text(HTML("<ansiyellow>Информация о себе недоступна</ansiyellow>"))
         return
     ln, sn = _client.whoami
-    id_str = f" !{_client.whoami_id:08x}" if _client.whoami_id is not None else ""
+    id_str = f"!{_client.whoami_id:08x}" if _client.whoami_id is not None else ""
     print_formatted_text(HTML(
         f"<ansiwhite>Я: </ansiwhite>"
         f"<b><ansicyan>{_safe(ln)}</ansicyan></b> "
         f"<ansicyan>({_safe(sn)})</ansicyan>"
-        f"<ansiwhite>{id_str}</ansiwhite>"
+        f"<ansiwhite>{f' {_safe(id_str)}' if id_str else ''}</ansiwhite>"
     ))
+    # держим .env в актуальном состоянии для собственной ноды без ручного
+    # редактирования — молча, ошибка записи не должна ломать саму команду
+    with contextlib.suppress(Exception):
+        update_env_file(ENV_FILE, {
+            "NODE_LONG_NAME": ln, "NODE_SHORT_NAME": sn, "NODE_ID": id_str,
+        })
 
 
 def _handle_send_response(resp: dict, text: str) -> None:
@@ -1347,63 +1355,27 @@ def _cmd_clear() -> None:
     pt_clear()
 
 
-async def _cmd_updatenames(quiet: bool = False) -> None:
-    """quiet=True — фоновый вызов (при старте и раз в UPDATENAMES_INTERVAL):
-    без промежуточных строк, только короткая сводка если что-то нашлось, и
-    полная тишина, если обновлять нечего — команда не должна отвлекать
-    от набора текста в разговоре."""
-    targets = set(_unresolved_ids)
-    resp = await _client.request("nodes")
-    if resp.get("ok"):
-        for n in resp["nodes"]:
-            if not n["has_user"] and n["node_id"] not in _name_cache:
-                targets.add(n["node_id"])
-
-    if not targets:
-        if not quiet:
-            print_formatted_text(HTML(
-                "<ansiyellow>Нечего обновлять — все видимые узлы уже с именами</ansiyellow>"
-            ))
-        return
-
-    targets = sorted(targets)
-    if not quiet:
+async def _cmd_updatenames() -> None:
+    """Resolution itself runs in mesh_logger.py now (continuously, at startup
+    and every 30 min — see CLAUDE.md), so this just triggers an extra sweep on
+    demand and reloads the shared cache to show the result immediately instead
+    of waiting for the next _periodic_cache_reload tick."""
+    resp = await _client.request("updatenames")
+    if not resp.get("ok"):
         print_formatted_text(HTML(
-            f"<ansiwhite>Запрашиваю имена {len(targets)} узлов через OneMesh...</ansiwhite>"
+            f"<ansired>Не удалось обновить имена: {_safe(resp.get('error', ''))}</ansired>"
         ))
-
-    resolved = 0
-    for nid in targets:
-        result = await asyncio.to_thread(_fetch_onemesh_name, nid)
-        if result:
-            _name_cache[nid] = result
-            _unresolved_ids.discard(nid)
-            resolved += 1
-            if not quiet:
-                print_formatted_text(HTML(
-                    f"  <ansigreen>✓</ansigreen> !{nid:08x} → "
-                    f"<b>{_safe(result[0])}</b> ({_safe(result[1])})"
-                ))
-        await asyncio.sleep(ONEMESH_DELAY)
-
-    if resolved:
-        _save_name_cache()
-    if quiet:
-        if resolved:
-            print_formatted_text(HTML(
-                f"<ansigray>🔎 Автообновление имён: +{resolved} новых</ansigray>"
-            ))
+        return
+    _reload_onemesh_cache()
+    resolved, targets = resp.get("resolved", 0), resp.get("targets", 0)
+    if targets == 0:
+        print_formatted_text(HTML(
+            "<ansiyellow>Нечего обновлять — все видимые узлы уже с именами</ansiyellow>"
+        ))
     else:
         print_formatted_text(HTML(
-            f"<ansigreen>Готово: обновлено {resolved} из {len(targets)} имён</ansigreen>"
+            f"<ansigreen>Готово: обновлено {resolved} из {targets} имён</ansigreen>"
         ))
-
-
-async def _periodic_updatenames() -> None:
-    while True:
-        with contextlib.suppress(Exception):
-            await _cmd_updatenames(quiet=True)
-        await asyncio.sleep(UPDATENAMES_INTERVAL)
 
 
 def _list_muted() -> None:
@@ -1460,6 +1432,33 @@ async def _cmd_unmute(args: str) -> None:
     _muted_names.discard(key)
     _save_name_cache()
     print_formatted_text(HTML(f"<ansigreen>🔊 «{_safe(query)}» размьючен</ansigreen>"))
+
+
+async def _cmd_botping(args: str) -> None:
+    """Включает/выключает бота (живёт в mesh_logger.py, работает независимо
+    от того, открыт ли какой-то клиент): он отвечает в канале PING_CHANNEL
+    на любое сообщение количеством хопов от отправителя, настоящим reply
+    (с цитатой). Состояние (BOTPING_ENABLED) переживает рестарт логгера —
+    хранится в .env."""
+    value = args.strip()
+    if value not in ("0", "1"):
+        print_formatted_text(HTML(
+            "<ansiyellow>Использование: /botping 0|1 (0 — выключить, 1 — включить)</ansiyellow>"
+        ))
+        return
+    resp = await _client.request("botping", value=value)
+    if not resp.get("ok"):
+        print_formatted_text(HTML(
+            f"<ansired>Не удалось изменить: {_safe(resp.get('error', ''))}</ansired>"
+        ))
+        return
+    state = "включён" if resp.get("enabled") else "выключен"
+    print_formatted_text(HTML(f"<ansigreen>🤖 botping {state}</ansigreen>"))
+    if resp.get("enabled") and not resp.get("channel_found", True):
+        print_formatted_text(HTML(
+            "<ansiyellow>На устройстве нет канала «Ping» (PING_CHANNEL в .env) — "
+            "бот включён, но реагировать пока не на что</ansiyellow>"
+        ))
 
 
 async def _cmd_settings(args: str) -> None:
@@ -1571,6 +1570,7 @@ def _cmd_help() -> None:
         "  /unmute [имя]        снять мьют (без аргумента — список замьюченных)",
         "  /updatenames         подтянуть имена узлов с OneMesh (и так — раз в 30 мин фоном)",
         "  /settings [параметр значение]  настройки локального узла (см. SETTINGS.md)",
+        "  /botping 0|1         бот в канале Ping: отвечает хопами до отправителя",
         "  /reboot             перезагрузить узел (требует /reboot confirm)",
         "  /clear               очистить экран",
         "  /help                эта справка",
@@ -1603,6 +1603,7 @@ async def _handle_command(text: str) -> None:
     elif cmd == "unmute":      await _cmd_unmute(args)
     elif cmd == "updatenames": await _cmd_updatenames()
     elif cmd == "settings":    await _cmd_settings(args)
+    elif cmd == "botping":     await _cmd_botping(args)
     elif cmd == "reboot":     await _cmd_reboot(args)
     elif cmd == "clear":       _cmd_clear()
     elif cmd == "help":        _cmd_help()
@@ -1679,7 +1680,7 @@ async def main() -> None:
     _pending_live.clear()
 
     await _refresh_completions()
-    asyncio.create_task(_periodic_updatenames())
+    asyncio.create_task(_periodic_cache_reload())
     session = PromptSession(completer=MeshCompleter(), complete_while_typing=False)
     print_formatted_text(HTML(
         "\n<ansiwhite>Сообщение или /help. Ctrl+C / Ctrl+D — выход.</ansiwhite>\n"

@@ -19,6 +19,7 @@ import socket
 import sys
 import threading
 import time
+import urllib.request
 from typing import NamedTuple
 
 import meshtastic.tcp_interface
@@ -29,12 +30,17 @@ from pubsub import pub
 from mesh_common import (
     ACK_TIMEOUT_SECONDS,
     BROADCAST_ADDR,
+    ENV_FILE,
     HOST,
     LOG_DIR,
+    ONEMESH_CACHE_FILE,
+    PING_CHANNEL_NAME,
     SOCKET_PATH,
     current_log_file,
     format_message_line,
     format_quote_line,
+    parse_env_file,
+    update_env_file,
 )
 
 STORE_SIZE = 300
@@ -50,11 +56,20 @@ TRACE_TIMEOUT = 40  # a traceroute is a full round trip across the mesh, can be 
 WATCHDOG_PING_SECONDS = 60  # cadence for the watchdog loop; also used for sd_notify(WATCHDOG=1)
 REBOOT_DELAY_SECS = 5  # gives our own ack response a moment to flush before the device reboots
 SESSION_KEY_TIMEOUT = 5.0  # how long to wait for the admin session passkey handshake
+ONEMESH_API = "https://map.onemesh.ru/api/v1/nodes/{}"
+ONEMESH_DELAY = 0.25  # between OneMesh lookups, so a full sweep doesn't hammer the API
+ONEMESH_UPDATE_INTERVAL = 30 * 60  # background resolution sweep: at startup, then every 30 min
+AUTOPING_INTERVAL = 2 * 60 * 60  # health-check broadcast into the Ping channel
 
 _interface = None
 _loop: asyncio.AbstractEventLoop | None = None
 _reconnect_event: asyncio.Event | None = None
 _last_rx: float = 0.0  # time.monotonic() of the last packet of any kind
+# /botping toggle (mesh_chat.py "botping" IPC cmd) — persisted to .env
+# (BOTPING_ENABLED) so it survives a logger restart; loaded once at import,
+# same as HOST/PING_CHANNEL_NAME.
+_botping_enabled: bool = parse_env_file(ENV_FILE).get("BOTPING_ENABLED", "0") == "1"
+BOTPING_MARKER = "🤖"  # prefix on our own bot replies — see _maybe_botping_reply
 
 
 class MsgRecord(NamedTuple):
@@ -82,6 +97,87 @@ _clients: dict[asyncio.StreamWriter, asyncio.Lock] = {}
 # Sends attempted while the device was disconnected; flushed once it reconnects
 _outbox: collections.deque[dict] = collections.deque()
 
+# node_id -> (long_name, short_name) resolved via OneMesh for nodes the mesh
+# itself hasn't given us a NodeInfo for yet. Persisted to ONEMESH_CACHE_FILE.
+# Feeding this into _node_names() (not just a display-layer lookup, unlike the
+# old mesh_chat.py version of this) is the whole point of living here: it's
+# what actually lands in freshly-written log lines instead of `!hex (???)`.
+_onemesh_names: dict[int, tuple[str, str]] = {}
+
+
+def _load_onemesh_cache() -> None:
+    global _onemesh_names
+    if not ONEMESH_CACHE_FILE.exists():
+        return
+    try:
+        raw = json.loads(ONEMESH_CACHE_FILE.read_text(encoding="utf-8"))
+        _onemesh_names = {int(k): (v["long"], v["short"]) for k, v in raw.items()}
+    except Exception:
+        _onemesh_names = {}
+
+
+def _save_onemesh_cache() -> None:
+    try:
+        raw = {str(k): {"long": v[0], "short": v[1]} for k, v in _onemesh_names.items()}
+        ONEMESH_CACHE_FILE.write_text(json.dumps(raw, ensure_ascii=False, indent=2),
+                                       encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _fetch_onemesh_name(node_id: int) -> tuple[str, str] | None:
+    req = urllib.request.Request(
+        ONEMESH_API.format(node_id),
+        headers={"User-Agent": "mesh-logger/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+    node = data.get("node")
+    if not node:
+        return None
+    long_name = node.get("long_name") or f"!{node_id:08x}"
+    short_name = node.get("short_name") or "???"
+    return long_name, short_name
+
+
+def _run_onemesh_update() -> dict:
+    """Synchronous — scans the live NodeInfo table for nodes the mesh hasn't
+    told us a name for, and asks OneMesh for each not already cached. Call via
+    asyncio.to_thread (blocking network I/O). Runs at startup and every
+    ONEMESH_UPDATE_INTERVAL automatically (_periodic_onemesh_update), and once
+    on demand via the "updatenames" IPC command (mesh_chat.py's /updatenames)."""
+    if not _interface or not _interface.nodes:
+        return {"resolved": 0, "targets": 0}
+    targets = []
+    for nid, node in list(_interface.nodes.items()):
+        num = nid if isinstance(nid, int) else int(str(nid).lstrip("!"), 16)
+        if not node.get("user") and num not in _onemesh_names:
+            targets.append(num)
+
+    resolved = 0
+    for nid in targets:
+        result = _fetch_onemesh_name(nid)
+        if result:
+            _onemesh_names[nid] = result
+            resolved += 1
+        time.sleep(ONEMESH_DELAY)
+
+    if resolved:
+        _save_onemesh_cache()
+    return {"resolved": resolved, "targets": len(targets)}
+
+
+async def _periodic_onemesh_update() -> None:
+    while True:
+        result = await asyncio.to_thread(_run_onemesh_update)
+        if result["resolved"]:
+            print(f"[info] onemesh: resolved {result['resolved']}/{result['targets']} name(s)")
+        await asyncio.sleep(ONEMESH_UPDATE_INTERVAL)
+
 
 def _store_msg(packet_id: int, record: MsgRecord) -> None:
     if len(_store_order) == STORE_SIZE and _store_order[0] in _store:
@@ -91,15 +187,21 @@ def _store_msg(packet_id: int, record: MsgRecord) -> None:
 
 
 def _node_names(node_id: int) -> tuple[str, str]:
+    hex_id = f"!{node_id:08x}"
     if _interface and _interface.nodes:
-        hex_id = f"!{node_id:08x}"
         node = _interface.nodes.get(node_id) or _interface.nodes.get(hex_id)
         if node and "user" in node:
             u = node["user"]
-            # `or`, not a dict default: firmware can report the key with an
-            # empty string, and an empty name makes the log line unparseable
-            return u.get("longName") or hex_id, u.get("shortName") or "???"
-    return f"!{node_id:08x}", "???"
+            # both fields present is the common case for a node the mesh
+            # already knows about — prefer it over a (possibly stale) OneMesh
+            # cache entry; an incomplete pair falls through to OneMesh instead
+            ln, sn = u.get("longName"), u.get("shortName")
+            if ln and sn:
+                return ln, sn
+    cached = _onemesh_names.get(node_id)
+    if cached:
+        return cached
+    return hex_id, "???"
 
 
 def _channel_name(index: int) -> str:
@@ -128,6 +230,69 @@ def _channels_payload() -> list[dict]:
     if not out:
         out.append({"index": 0, "name": "Primary"})
     return out
+
+
+def _ping_channel_index() -> int | None:
+    """None if the device has no channel named PING_CHANNEL_NAME (bot simply
+    never fires — channel_index never equals None) or channels aren't known yet."""
+    try:
+        channels = _interface.localNode.channels or []
+    except Exception:
+        return None
+    for ch in channels:
+        if ch.role != 0 and ch.settings.name.lower() == PING_CHANNEL_NAME.lower():
+            return ch.index
+    return None
+
+
+def _set_botping(enabled: bool) -> None:
+    global _botping_enabled
+    _botping_enabled = enabled
+    with contextlib.suppress(Exception):
+        update_env_file(ENV_FILE, {"BOTPING_ENABLED": "1" if enabled else "0"})
+
+
+async def _send_botping_reply(reply_id: int, channel_index: int, hops: int) -> None:
+    word = "хоп" if hops == 1 else "хопа" if 2 <= hops <= 4 else "хопов"
+    text = f"{BOTPING_MARKER} {hops} {word} от вас"
+    await _send_message("send", text, channel_index, reply_id=reply_id)
+
+
+def _maybe_botping_reply(from_id: int, packet_id: int, channel_index: int,
+                          is_dm: bool, is_reply: bool, text: str, hops: int) -> None:
+    """Called from on_receive() (meshtastic's callback thread) — only ever
+    schedules work onto the event loop, never sends directly from here."""
+    if not _botping_enabled or is_dm or not packet_id:
+        return
+    if channel_index != _ping_channel_index():
+        return
+    if _interface and from_id == _interface.myInfo.my_node_num:
+        return  # никогда не должно сработать (свои пакеты не приходят через on_receive), но дёшево перестраховаться
+    # без этой проверки два узла с включённым botping отвечали бы друг другу
+    # бесконечно: сообщение с маркером — это уже чей-то ответ бота, не исходное
+    if is_reply or text.strip().startswith(BOTPING_MARKER):
+        return
+    if _loop:
+        _loop.call_soon_threadsafe(
+            lambda: _loop.create_task(_send_botping_reply(packet_id, channel_index, hops)))
+
+
+async def _periodic_autoping() -> None:
+    """Health-check heartbeat into the Ping channel: unrelated to /botping (runs
+    regardless of whether the reply-bot is toggled on) — the point is a visible
+    "the mesh link is alive" canary, for us and for anyone/anything listening on
+    that channel. Sleeps first so a logger restart doesn't immediately re-ping."""
+    while True:
+        await asyncio.sleep(AUTOPING_INTERVAL)
+        if not _interface:
+            continue
+        idx = _ping_channel_index()
+        if idx is None:
+            continue
+        try:
+            await _send_message("send", "🏓 автопинг: проверка связи", idx)
+        except Exception as e:
+            print(f"[warn] autoping failed: {e}", file=sys.stderr)
 
 
 # _write_message runs both on the meshtastic callback thread (on_receive) and
@@ -240,6 +405,8 @@ def on_receive(packet, interface):
                              "is_dm": is_dm, "channel_index": channel_index,
                              "is_emoji": is_emoji})
         print(_console(f"[recv] {long_name} ({short_name}): {text}"))
+        _maybe_botping_reply(from_id, packet_id, channel_index, is_dm,
+                              bool(reply_id), text, hops)
     except Exception as e:
         print(f"[error] on_receive: {e}", file=sys.stderr)
 
@@ -670,6 +837,19 @@ SETTINGS_REGISTRY: dict[str, tuple] = {
     "fixed_position": ("position", False, "fixed_position", "bool", None),
     "telemetry_device_secs": ("telemetry", True, "device_update_interval", "int", (60, 86400)),
     "telemetry_env_enabled": ("telemetry", True, "environment_measurement_enabled", "bool", None),
+    # MQTT: bridges LoRa traffic to services like OneMesh over the internet,
+    # not just the mesh itself. uplink_enabled/downlink_enabled are per-CHANNEL
+    # flags (ChannelSettings, not moduleConfig) — see mqtt_uplink/mqtt_downlink
+    # special-cased in _apply_setting()/_settings_snapshot() below, they don't
+    # fit this table's (config_section, field) shape.
+    "mqtt_enabled": ("mqtt", True, "enabled", "bool", None),
+    "mqtt_address": ("mqtt", True, "address", "str", None),
+    "mqtt_username": ("mqtt", True, "username", "str", None),
+    "mqtt_password": ("mqtt", True, "password", "str", None),  # masked on read, see _settings_snapshot
+    "mqtt_encryption_enabled": ("mqtt", True, "encryption_enabled", "bool", None),
+    "mqtt_json_enabled": ("mqtt", True, "json_enabled", "bool", None),
+    "mqtt_tls_enabled": ("mqtt", True, "tls_enabled", "bool", None),
+    "mqtt_root": ("mqtt", True, "root", "str", None),
 }
 
 SETTINGS_DESCRIPTIONS = {
@@ -685,7 +865,19 @@ SETTINGS_DESCRIPTIONS = {
     "fixed_position": "Считать текущую позицию фиксированной (узел неподвижен)",
     "telemetry_device_secs": "Как часто слать телеметрию устройства, секунды",
     "telemetry_env_enabled": "Слать телеметрию окружающей среды (датчики), если есть",
+    "mqtt_enabled": "Включить отправку сообщений в MQTT (в дополнение к LoRa)",
+    "mqtt_address": "Адрес MQTT-брокера, host[:port] (например map.onemesh.ru)",
+    "mqtt_username": "Логин для подключения к MQTT-брокеру",
+    "mqtt_password": "Пароль для подключения к MQTT-брокеру (в списке — маской)",
+    "mqtt_encryption_enabled": "Шифровать пакеты в MQTT тем же PSK, что и в канале",
+    "mqtt_json_enabled": "Дополнительно публиковать сообщения в виде JSON",
+    "mqtt_tls_enabled": "TLS-соединение с брокером",
+    "mqtt_root": "Корневой топик MQTT (например msh/RU)",
+    "mqtt_uplink": "Ретрансляция канала из LoRa в MQTT: <канал>:on|off, например Primary:on",
+    "mqtt_downlink": "Ретрансляция канала из MQTT в LoRa: <канал>:on|off",
 }
+
+MQTT_PASSWORD_MASK = "••••••••"
 
 
 def _get_config_value(node, entry: tuple):
@@ -694,6 +886,19 @@ def _get_config_value(node, entry: tuple):
     section = getattr(root, config_name)
     value = getattr(section, field)
     return extra.Name(value) if kind == "enum" else value
+
+
+def _channel_links_summary(node, field: str) -> str:
+    """Reads uplink_enabled/downlink_enabled across every non-disabled channel
+    — these are per-channel, so there's no single scalar to show like the rest
+    of SETTINGS_REGISTRY."""
+    try:
+        channels = node.channels or []
+    except Exception:
+        channels = []
+    parts = [f"{_channel_name(c.index)}:{'on' if getattr(c.settings, field) else 'off'}"
+             for c in channels if c.role != 0]
+    return ", ".join(parts) if parts else "—"
 
 
 def _settings_snapshot() -> list[dict]:
@@ -709,11 +914,19 @@ def _settings_snapshot() -> list[dict]:
             value = _get_config_value(node, entry)
         except Exception:
             value = None
+        if key == "mqtt_password" and value:
+            value = MQTT_PASSWORD_MASK
         out.append({"key": key, "value": value, "description": SETTINGS_DESCRIPTIONS[key]})
+    out.append({"key": "mqtt_uplink", "value": _channel_links_summary(node, "uplink_enabled"),
+                "description": SETTINGS_DESCRIPTIONS["mqtt_uplink"]})
+    out.append({"key": "mqtt_downlink", "value": _channel_links_summary(node, "downlink_enabled"),
+                "description": SETTINGS_DESCRIPTIONS["mqtt_downlink"]})
     return out
 
 
 def _parse_setting_value(raw: str, kind: str, extra) -> object:
+    if kind == "str":
+        return raw
     if kind == "bool":
         low = raw.strip().lower()
         if low in ("1", "true", "on", "yes", "да", "вкл"):
@@ -738,6 +951,28 @@ def _parse_setting_value(raw: str, kind: str, extra) -> object:
     raise ValueError(f"неизвестный тип параметра: {kind}")
 
 
+def _apply_channel_link(node, raw_value: str, field: str) -> str:
+    """mqtt_uplink/mqtt_downlink: value is "<канал>:on|off" — writes a
+    ChannelSettings flag via writeChannel(), not writeConfig(), since uplink/
+    downlink live on the channel, not in moduleConfig.mqtt."""
+    if ":" not in raw_value:
+        raise ValueError("формат: <канал>:on|off, например Primary:on")
+    channel_name, _, flag_str = raw_value.partition(":")
+    channel_name = channel_name.strip()
+    flag = _parse_setting_value(flag_str, "bool", None)
+    try:
+        channels = node.channels or []
+    except Exception:
+        channels = []
+    match = next((c for c in channels if _channel_name(c.index).lower() == channel_name.lower()),
+                 None)
+    if match is None:
+        raise ValueError(f"канал '{channel_name}' не найден")
+    setattr(match.settings, field, flag)
+    node.writeChannel(match.index)
+    return f"{channel_name}:{'on' if flag else 'off'}"
+
+
 def _apply_setting(node, key: str, raw_value: str) -> object:
     """Runs in a worker thread — writeConfig() does a synchronous admin-packet
     send. Returns the new value as it will read back via _settings_snapshot()."""
@@ -748,6 +983,10 @@ def _apply_setting(node, key: str, raw_value: str) -> object:
     if key == "owner_short":
         node.setOwner(short_name=raw_value)
         return raw_value
+    if key == "mqtt_uplink":
+        return _apply_channel_link(node, raw_value, "uplink_enabled")
+    if key == "mqtt_downlink":
+        return _apply_channel_link(node, raw_value, "downlink_enabled")
     if key not in SETTINGS_REGISTRY:
         raise KeyError(key)
     config_name, is_module, field, kind, extra = SETTINGS_REGISTRY[key]
@@ -756,7 +995,8 @@ def _apply_setting(node, key: str, raw_value: str) -> object:
     section = getattr(root, config_name)
     setattr(section, field, value)
     node.writeConfig(config_name)
-    return extra.Name(value) if kind == "enum" else value
+    result = extra.Name(value) if kind == "enum" else value
+    return MQTT_PASSWORD_MASK if key == "mqtt_password" else result
 
 
 def _reboot_node(node) -> None:
@@ -876,6 +1116,22 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                             resp = {"req_id": req_id, "ok": True, "secs": REBOOT_DELAY_SECS}
                         except Exception as e:
                             resp["error"] = f"не удалось перезагрузить: {e}"
+
+                elif cmd == "updatenames":
+                    if not _interface:
+                        resp["error"] = "not connected"
+                    else:
+                        result = await asyncio.to_thread(_run_onemesh_update)
+                        resp = {"req_id": req_id, "ok": True, **result}
+
+                elif cmd == "botping":
+                    value = req.get("value")
+                    if value not in ("0", "1"):
+                        resp["error"] = "ожидается value: '0' или '1'"
+                    else:
+                        _set_botping(value == "1")
+                        resp = {"req_id": req_id, "ok": True, "enabled": _botping_enabled,
+                                "channel_found": _ping_channel_index() is not None}
                 else:
                     resp["error"] = f"unknown cmd: {cmd}"
             except Exception as e:
@@ -912,6 +1168,7 @@ async def main() -> None:
     _reconnect_event = asyncio.Event()
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _load_onemesh_cache()
     _prepare_socket_path()
 
     print(f"[info] connecting to {HOST}...")
@@ -926,6 +1183,8 @@ async def main() -> None:
 
     reconnect_task = asyncio.create_task(_reconnect_loop())
     watchdog_task = asyncio.create_task(_watchdog())
+    onemesh_task = asyncio.create_task(_periodic_onemesh_update())
+    autoping_task = asyncio.create_task(_periodic_autoping())
     server = await asyncio.start_unix_server(_handle_client, path=str(SOCKET_PATH))
     os.chmod(SOCKET_PATH, 0o600)  # only this user may send messages via IPC
     print(f"[info] listening on {SOCKET_PATH}")
@@ -939,6 +1198,8 @@ async def main() -> None:
     finally:
         reconnect_task.cancel()
         watchdog_task.cancel()
+        onemesh_task.cancel()
+        autoping_task.cancel()
         _unsubscribe()
         with contextlib.suppress(Exception):
             _interface.close()
