@@ -4,7 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A terminal chat client for Meshtastic over WiFi (TCP API to a `meshtastic.local` device).
+A terminal chat client for Meshtastic. Connects over WiFi (TCP API, default), USB serial, or
+Bluetooth LE — see `MESH_CONN_TYPE` in `.env`.
 
 ## Setup / running
 
@@ -32,19 +33,34 @@ Run them after any change to the log line format or parser in `mesh_common.py`.
 
 ## Architecture
 
-The Meshtastic device only accepts **one TCP connection at a time**. This single constraint
+The Meshtastic device only accepts **one connection at a time**, regardless of transport (WiFi
+TCP, USB serial, or BLE all share this limit at the firmware level). This single constraint
 shapes the entire codebase, which is split into two processes that never both hold the device
 connection:
 
-- **`mesh_logger.py`** — the only process that opens `meshtastic.tcp_interface.TCPInterface` to
-  the device. Runs continuously (deployed via `mesh-logger.service`, a systemd unit). Owns
+- **`mesh_logger.py`** — the only process that opens a connection to the device, via
+  `meshtastic.tcp_interface.TCPInterface`, `meshtastic.serial_interface.SerialInterface`, or
+  `meshtastic.ble_interface.BLEInterface` depending on `CONN_TYPE` (`mesh_common.py`, from
+  `MESH_CONN_TYPE` in `.env`: `wifi` (default) | `usb` | `ble`). `_open_interface()` is the single
+  place that branches on `CONN_TYPE` and constructs the right interface; everything else in the
+  file (reconnect loop, watchdog, `close()`) treats `_interface` uniformly since all three
+  interface classes share the same base API. `HOST`/`MESH_HOST` (wifi), `USB_PORT`/`MESH_USB_PORT`
+  (usb), and `BLE_ADDRESS`/`MESH_BLE_ADDRESS` (ble) are all optional except `HOST` (which has a
+  hardcoded fallback of `meshtastic.local`) — leaving `USB_PORT`/`BLE_ADDRESS` unset lets the
+  meshtastic lib auto-detect the sole attached serial device / do a BLE scan and connect if
+  exactly one Meshtastic device is found, so `usb`/`ble` work with zero extra `.env` config on a
+  machine with only one device attached. `CONN_TARGET` is a display-only string (which of
+  `HOST`/`USB_PORT`/`BLE_ADDRESS` is relevant for the configured `CONN_TYPE`, or a fallback label
+  when unset) used only in log messages — it doesn't affect how `_open_interface()` connects.
+  Runs continuously (deployed via `mesh-logger.service`, a systemd unit). Owns
   reconnect logic (both on `connection.lost` and via a silence watchdog: no packets of any kind
   for `SILENCE_TIMEOUT` → heartbeat probe → forced reconnect on failure), appends every text
   message to a daily log file under `logs/`, and exposes a Unix socket (`SOCKET_PATH` in
   `mesh_common.py`, default `/tmp/mesh_chat.sock`, chmod 0600) as an IPC broker.
   In the reconnect loop, `_do_connect()`/`close()` run via `asyncio.to_thread` — the
-  `TCPInterface` constructor blocks for seconds (DNS + connect + config wait), and running it on
-  the event loop would freeze all IPC clients for the duration.
+  interface constructor blocks for seconds (DNS + connect + config wait for TCP; port open +
+  handshake for USB/BLE), and running it on the event loop would freeze all IPC clients for the
+  duration.
   `_watchdog()` also pings systemd's own watchdog (`sd_notify("WATCHDOG=1")`, `_sd_notify()`
   writes directly to the `NOTIFY_SOCKET` unix datagram socket — no extra dependency) every
   `WATCHDOG_PING_SECONDS`, so a wedged event loop gets restarted by systemd even though the
@@ -74,9 +90,12 @@ connection:
 
 `parse_env_file()`/`update_env_file()` in `mesh_common.py` are a deliberately minimal stdlib
 `KEY=VALUE` reader/writer (no `python-dotenv` — the project has no other third-party deps to
-justify one). `_ENV` is parsed once at import time; `HOST` (device hostname, `MESH_HOST`) and
-`PING_CHANNEL_NAME` (`PING_CHANNEL`) fall back to their old hardcoded defaults if `.env` is
-missing or a key isn't set, so a fresh checkout with no `.env` at all still runs. `.env.example`
+justify one). `_ENV` is parsed once at import time; `HOST` (device hostname, `MESH_HOST`),
+`CONN_TYPE` (`MESH_CONN_TYPE`), and `PING_CHANNEL_NAME` (`PING_CHANNEL`) fall back to their old
+hardcoded defaults if `.env` is missing or a key isn't set, so a fresh checkout with no `.env` at
+all still runs (and connects over wifi, same as before this setting existed). `USB_PORT`
+(`MESH_USB_PORT`) and `BLE_ADDRESS` (`MESH_BLE_ADDRESS`) fall back to `None` instead, which is a
+meaningful value to the meshtastic lib (auto-detect), not just an unset placeholder. `.env.example`
 in the repo documents every key with a placeholder/default; `.env` itself is gitignored.
 `update_env_file()` rewrites only the keys it's given, preserving every other line (comments,
 unrelated vars) — `mesh_chat.py`'s `/who` calls it with the freshly-learned `NODE_LONG_NAME`/
@@ -298,14 +317,16 @@ in a long-lived install can take a moment and would otherwise stall the prompt.
 ### Local node settings (`/settings`)
 
 Reads/writes go through the local node's own `localConfig`/`moduleConfig` (`node.writeConfig()`),
-which is safe to read-modify-write in place because `TCPInterface`'s connection handshake already
+which is safe to read-modify-write in place because the interface's connection handshake already
 streams the device's *entire* current config into those objects before `_do_connect()` returns —
 setting one field and calling `writeConfig(section)` pushes back the real current values for
 everything else in that section, not blank defaults. `SETTINGS_REGISTRY` in `mesh_logger.py` is a
 deliberately small curated whitelist (not a generic protobuf-path get/set) — full rationale and
-the parameter table are in `SETTINGS.md`, but the short version: it excludes `network` (WiFi;
-changing it over this same TCP/WiFi link could sever the connection) and `bluetooth`/`security`
-(keys/PINs, not something to expose over a plaintext local socket).
+the parameter table are in `SETTINGS.md`, but the short version: it excludes `network` (WiFi
+credentials; changing it while connected over that same wifi link could sever the connection —
+still excluded even for a usb/ble session, to keep the registry's behavior independent of
+`CONN_TYPE`) and `bluetooth`/`security` (keys/PINs, not something to expose over a plaintext local
+socket).
 
 MQTT (`mqtt_*` keys — bridges LoRa traffic to services like OneMesh over the internet) mostly
 fits the same registry mechanism (`moduleConfig.mqtt`, `is_module=True`), plus a `"str"` kind in

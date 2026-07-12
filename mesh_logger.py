@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Lightweight always-on Meshtastic logger and IPC broker.
 
-Holds the single TCP connection to the Meshtastic device, appends every
-text message to a daily log file under logs/, and exposes a Unix socket so other processes
-(e.g. mesh_chat.py) can send messages and query node info without needing
-their own connection to the device.
+Holds the single connection to the Meshtastic device (WiFi/TCP, USB serial, or
+BLE — see MESH_CONN_TYPE in .env), appends every text message to a daily log
+file under logs/, and exposes a Unix socket so other processes (e.g.
+mesh_chat.py) can send messages and query node info without needing their own
+connection to the device.
 """
 
 import asyncio
@@ -22,6 +23,8 @@ import time
 import urllib.request
 from typing import NamedTuple
 
+import meshtastic.ble_interface
+import meshtastic.serial_interface
 import meshtastic.tcp_interface
 from meshtastic.protobuf import config_pb2
 from meshtastic.util import to_node_num
@@ -29,13 +32,16 @@ from pubsub import pub
 
 from mesh_common import (
     ACK_TIMEOUT_SECONDS,
+    BLE_ADDRESS,
     BROADCAST_ADDR,
+    CONN_TYPE,
     ENV_FILE,
     HOST,
     LOG_DIR,
     ONEMESH_CACHE_FILE,
     PING_CHANNEL_NAME,
     SOCKET_PATH,
+    USB_PORT,
     current_log_file,
     format_message_line,
     format_quote_line,
@@ -44,8 +50,8 @@ from mesh_common import (
 )
 
 STORE_SIZE = 300
-# no mesh traffic at all for this long → probe the TCP link with a heartbeat
-# (a silently dead WiFi link doesn't always fire connection.lost)
+# no mesh traffic at all for this long → probe the link with a heartbeat
+# (a silently dead WiFi/USB/BLE link doesn't always fire connection.lost)
 SILENCE_TIMEOUT = 600
 OUTBOX_MAX = 50  # queued sends while the device is disconnected
 OUTBOX_RETRIES = 3  # per-message re-queue limit when sendText itself fails
@@ -438,15 +444,36 @@ def _unsubscribe():
             pub.unsubscribe(fn, topic)
 
 
+# human-readable description of the configured target, for log messages —
+# doesn't affect how _open_interface() actually connects
+CONN_TARGET = {
+    "wifi": HOST,
+    "usb": USB_PORT or "auto-detected USB port",
+    "ble": BLE_ADDRESS or "auto-detected BLE device",
+}.get(CONN_TYPE, HOST)
+
+
+def _open_interface():
+    """Construct the interface for the configured MESH_CONN_TYPE. USB/BLE
+    targets are optional (None) — the meshtastic lib then auto-detects the
+    sole attached serial device / does a BLE scan and connects if exactly one
+    Meshtastic device is found."""
+    if CONN_TYPE == "usb":
+        return meshtastic.serial_interface.SerialInterface(devPath=USB_PORT)
+    if CONN_TYPE == "ble":
+        return meshtastic.ble_interface.BLEInterface(address=BLE_ADDRESS)
+    return meshtastic.tcp_interface.TCPInterface(hostname=HOST)
+
+
 def _do_connect() -> bool:
     global _interface, _last_rx
     try:
-        _interface = meshtastic.tcp_interface.TCPInterface(hostname=HOST)
+        _interface = _open_interface()
         _subscribe()
         _last_rx = time.monotonic()
         my_id = _interface.myInfo.my_node_num
         ln, sn = _node_names(my_id)
-        print(f"[info] connected to {HOST} as {ln} ({sn})")
+        print(f"[info] connected via {CONN_TYPE} to {CONN_TARGET} as {ln} ({sn})")
         _broadcast_device_status("connected", long_name=ln, short_name=sn)
         if _loop and _outbox:
             _loop.call_soon_threadsafe(lambda: _loop.create_task(_flush_outbox()))
@@ -470,8 +497,9 @@ async def _reconnect_loop() -> None:
             with contextlib.suppress(Exception):
                 if _interface:
                     await asyncio.to_thread(_interface.close)
-            # TCPInterface() blocks for seconds (DNS + connect + config wait) —
-            # in a thread so IPC clients keep getting responses meanwhile
+            # the interface constructor blocks for seconds (DNS+connect+config
+            # wait for TCP, port open + handshake for USB/BLE) — in a thread
+            # so IPC clients keep getting responses meanwhile
             if await asyncio.to_thread(_do_connect):
                 # событие, взведённое во время попытки (watchdog, поздний
                 # connection.lost старого интерфейса), относится к уже закрытому
@@ -513,7 +541,7 @@ async def _watchdog() -> None:
             continue
         try:
             await asyncio.wait_for(asyncio.to_thread(send_hb), timeout=15)
-            _last_rx = time.monotonic()  # TCP link confirmed alive
+            _last_rx = time.monotonic()  # link confirmed alive
         except Exception as e:
             print(f"[warn] mesh silent and heartbeat failed ({e}), forcing reconnect",
                   file=sys.stderr)
@@ -1171,7 +1199,7 @@ async def main() -> None:
     _load_onemesh_cache()
     _prepare_socket_path()
 
-    print(f"[info] connecting to {HOST}...")
+    print(f"[info] connecting via {CONN_TYPE} to {CONN_TARGET}...")
     if not await asyncio.to_thread(_do_connect):
         # устройство недоступно — всё равно поднимаем IPC-сокет: клиенты видят
         # "not connected" и складывают отправки в outbox, а реконнект-цикл

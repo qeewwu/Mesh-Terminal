@@ -63,6 +63,13 @@ def update_env_file(path: Path, updates: dict[str, str]) -> None:
 _ENV = parse_env_file(ENV_FILE)
 
 HOST = _ENV.get("MESH_HOST", "meshtastic.local")
+# how mesh_logger.py talks to the device: "wifi" (TCP), "usb" (serial), or "ble"
+# (Bluetooth Low Energy). USB_PORT/BLE_ADDRESS are optional — left empty (None),
+# the meshtastic lib auto-detects the sole attached USB device / does a BLE scan
+# and connects if exactly one Meshtastic device is found.
+CONN_TYPE = _ENV.get("MESH_CONN_TYPE", "wifi").strip().lower()
+USB_PORT = _ENV.get("MESH_USB_PORT", "").strip() or None
+BLE_ADDRESS = _ENV.get("MESH_BLE_ADDRESS", "").strip() or None
 PING_CHANNEL_NAME = _ENV.get("PING_CHANNEL", "Ping")
 LOG_DIR = BASE_DIR / "logs"
 SOCKET_PATH = Path("/tmp/mesh_chat.sock")
