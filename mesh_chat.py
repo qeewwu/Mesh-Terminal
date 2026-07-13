@@ -41,6 +41,11 @@ RECONNECT_DELAY = 3  # seconds between attempts to re-reach the logger socket
 CACHE_RELOAD_INTERVAL = 5 * 60  # как часто перечитывать onemesh_cache.json с диска
 PING_TIMEOUT = ACK_TIMEOUT_SECONDS + 5.0  # чуть больше, чем логгер сам ждёт ACK
 REBOOT_CONFIRM_WINDOW = 30.0  # секунд на /reboot confirm после /reboot
+# /settings <key> <value> ждёт сессионный ключ (до 5с в mesh_logger.py) + сам
+# синхронный writeConfig() — дефолтные 10с IPCClient.request впритык на
+# медленном линке; список настроек (action="list") не трогает устройство и
+# укладывается в дефолт
+SETTINGS_SET_TIMEOUT = 20.0
 
 _XML_INVALID = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]")
 _HEX_ID_RE = re.compile(r"^!([0-9a-f]{8})$")
@@ -74,6 +79,12 @@ _muted_names: set[str] = set()
 # canonical channel name (and matching index) this session is restricted to.
 _channel_filter: str | None = None
 _channel_index: int = 0
+# False while a --channel name is given but the device wasn't connected yet
+# to confirm it exists (the "channels" IPC call degrades to a fake single
+# "Primary" entry when _interface is None — see _channels_payload() in
+# mesh_logger.py) — resolved for real once a "device: connected" event
+# arrives, see _try_resolve_pending_channel()
+_channel_resolved: bool = True
 
 # Последние полученные live-сообщения с packet_id — цели для /reply
 # (новые в конце). История из файлов id не содержит, поэтому реплай доступен
@@ -196,15 +207,38 @@ async def _periodic_cache_reload() -> None:
             _reload_onemesh_cache()
 
 
+def _enrich_nodes(nodes: list[dict]) -> list[dict]:
+    """Adds display_long/display_short to each node dict. The raw long_name/
+    short_name from the "nodes" IPC response (mesh_logger.py's
+    _nodes_payload()) are only ever what the mesh's own NodeInfo carries —
+    None for a node we only know as `!hex (???)` with a since-resolved
+    OneMesh cache entry. /nodes already computed this inline; factored out
+    so /dm, /trace, /ping, /pos, /mute and tab-completion can match and
+    display against the same name the user actually sees in /nodes, instead
+    of only ever matching by raw name or !hex id for such a node."""
+    out = []
+    for n in nodes:
+        if n["has_user"]:
+            ln, sn = n["long_name"], n["short_name"]
+        else:
+            ln, sn = _name_cache.get(n["node_id"], (f"!{n['node_id']:08x}", "???"))
+        out.append({**n, "display_long": ln, "display_short": sn})
+    return out
+
+
 def _find_node_in_list(nodes: list[dict], query: str) -> list[dict]:
     """Кандидаты по убыванию точности: точное имя/hex-id → префикс → подстрока.
     Раньше возвращалось первое подстрочное совпадение, и `/dm Alex` мог уйти
-    узлу «Alexander», хотя в сети есть точный «Alex»."""
+    узлу «Alexander», хотя в сети есть точный «Alex». Matches against the
+    *display* name (falls back to the raw long/short_name if `nodes` wasn't
+    run through _enrich_nodes) — a node visible only via `!hex (???)` on the
+    wire but resolved via OneMesh (as /nodes shows it) would otherwise never
+    match by the name the user actually typed."""
     q = query.lower()
     exact, prefix, substr = [], [], []
     for n in nodes:
-        ln = (n.get("long_name") or "").lower()
-        sn = (n.get("short_name") or "").lower()
+        ln = (n.get("display_long") or n.get("long_name") or "").lower()
+        sn = (n.get("display_short") or n.get("short_name") or "").lower()
         if q in (ln, sn, f"!{n['node_id']:08x}"):
             exact.append(n)
         elif ln.startswith(q) or sn.startswith(q):
@@ -223,8 +257,10 @@ def _pick_node(nodes: list[dict], query: str) -> dict | None:
         ))
         return None
     if len(matches) > 1:
-        names = ", ".join(f"{n.get('long_name') or '?'} ({n.get('short_name') or '?'})"
-                          for n in matches[:5])
+        names = ", ".join(
+            f"{n.get('display_long') or n.get('long_name') or '?'} "
+            f"({n.get('display_short') or n.get('short_name') or '?'})"
+            for n in matches[:5])
         more = " …" if len(matches) > 5 else ""
         print_formatted_text(HTML(
             f"<ansiyellow>Имя '{_safe(query)}' неоднозначно, совпадают: "
@@ -303,10 +339,13 @@ class MeshCompleter(Completer):
 
 
 def _update_node_completions(nodes: list[dict]) -> None:
+    """Expects nodes already run through _enrich_nodes — falls back to the
+    raw long/short_name otherwise, same as _find_node_in_list."""
     global _completion_nodes
     out = set()
     for n in nodes:
-        sn, ln = n.get("short_name"), n.get("long_name")
+        sn = n.get("display_short") or n.get("short_name")
+        ln = n.get("display_long") or n.get("long_name")
         if sn and sn != "???":
             out.add(sn)
         if ln:
@@ -319,7 +358,7 @@ async def _refresh_completions() -> None:
     global _completion_channels, _completion_settings
     resp = await _client.request("nodes")
     if resp.get("ok"):
-        _update_node_completions(resp.get("nodes", []))
+        _update_node_completions(_enrich_nodes(resp.get("nodes", [])))
     resp = await _client.request("channels")
     if resp.get("ok"):
         _completion_channels = [c["name"] for c in resp.get("channels", [])]
@@ -448,8 +487,11 @@ def _handle_event(obj: dict) -> None:
         lines = obj.get("lines", [])
         if not lines or not _channel_matches(lines[-1]):
             return
-        if _is_muted(lines[-1]):
-            return
+        # mute only hides from the screen — /reply targets stay reachable even
+        # for a muted sender, same as /search and /last (see Muting in
+        # CLAUDE.md); the channel filter above is different: a filtered
+        # session is meant to be a clean view of just that channel, so it's
+        # allowed to also gate what becomes a /reply target
         if obj.get("packet_id"):
             _replyables.append({
                 "packet_id": obj["packet_id"],
@@ -459,6 +501,8 @@ def _handle_event(obj: dict) -> None:
                 "channel_index": obj.get("channel_index", 0),
                 "line": lines[-1],
             })
+        if _is_muted(lines[-1]):
+            return
         if _history_ready:
             quote = lines[0] if len(lines) == 2 else None
             _render_if_new(quote, lines[-1])
@@ -481,6 +525,8 @@ def _handle_event(obj: dict) -> None:
             print_formatted_text(HTML(
                 f"<ansigreen>✓ Устройство снова на связи: {ln} ({sn})</ansigreen>"
             ))
+            if not _channel_resolved:
+                _loop.create_task(_try_resolve_pending_channel())
 
 
 # ── display ───────────────────────────────────────────────────────────────────
@@ -664,14 +710,21 @@ async def _reconnect_logger(lost_at: datetime.datetime) -> None:
         if not SOCKET_PATH.exists():
             continue
         client = IPCClient(_loop)
+        # set *before* connect(), not after: on_disconnect was previously
+        # wired up only once connect() had already returned, so a drop in
+        # that split second (read_loop's finally block runs with
+        # on_disconnect still None) went completely unnoticed — the client
+        # would silently sit disconnected forever, since _reconnecting was
+        # never reset to trigger another attempt
+        client.on_disconnect = _on_logger_lost
         try:
             await client.connect()
-            break
         except Exception:
             continue
+        if client.connected:
+            break
     with contextlib.suppress(Exception):
         await old.close()
-    client.on_disconnect = _on_logger_lost
     client.whoami, client.whoami_id = old.whoami, old.whoami_id
     who = await client.request("whoami")
     if who.get("ok"):
@@ -679,6 +732,13 @@ async def _reconnect_logger(lost_at: datetime.datetime) -> None:
         client.whoami_id = who["node_id"]
     _client = client
     _reconnecting = False
+    if not client.connected:
+        # dropped again during the whoami round-trip above; on_disconnect
+        # was a no-op while _reconnecting was still True (guards against a
+        # duplicate reconnect task), so nothing else will retry this —
+        # kick it off ourselves now that the guard is clear
+        _on_logger_lost()
+        return
     print_formatted_text(HTML(
         "<ansigreen>✓ Соединение с логгером восстановлено</ansigreen>"
     ))
@@ -716,15 +776,8 @@ async def _cmd_nodes(args: str = "") -> None:
         print_formatted_text(HTML("<ansiyellow>Нет данных об узлах</ansiyellow>"))
         return
 
-    _update_node_completions(resp["nodes"])
-
-    enriched = []
-    for n in resp["nodes"]:
-        if n["has_user"]:
-            ln, sn = n["long_name"], n["short_name"]
-        else:
-            ln, sn = _name_cache.get(n["node_id"], (f"!{n['node_id']:08x}", "???"))
-        enriched.append({**n, "display_long": ln, "display_short": sn})
+    enriched = _enrich_nodes(resp["nodes"])
+    _update_node_completions(enriched)
 
     enriched.sort(key=lambda n: _node_sort_key(n, mode))
 
@@ -820,7 +873,7 @@ async def _cmd_dm(args: str) -> None:
         ))
         return
 
-    node = _pick_node(resp["nodes"], target_name)
+    node = _pick_node(_enrich_nodes(resp["nodes"]), target_name)
     if not node:
         return
 
@@ -853,16 +906,17 @@ async def _cmd_trace(args: str) -> None:
             f"<ansired>Не удалось получить список узлов: {_safe(resp.get('error', ''))}</ansired>"
         ))
         return
-    node = _pick_node(resp["nodes"], target_name)
+    node = _pick_node(_enrich_nodes(resp["nodes"]), target_name)
     if not node:
         return
 
     print_formatted_text(HTML(
-        f"<ansiwhite>Трассирую до {_safe(node.get('long_name') or '?')} — "
+        f"<ansiwhite>Трассирую до "
+        f"{_safe(node.get('display_long') or node.get('long_name') or '?')} — "
         f"может занять до {int(TRACE_TIMEOUT)}с...</ansiwhite>"
     ))
     trace_resp = await _client.request("trace", node_id=node["node_id"],
-                                        timeout=TRACE_TIMEOUT)
+                                        channel=_channel_index, timeout=TRACE_TIMEOUT)
     if not trace_resp.get("ok"):
         print_formatted_text(HTML(
             f"<ansired>Traceroute не удался: {_safe(trace_resp.get('error', ''))}</ansired>"
@@ -902,11 +956,12 @@ async def _cmd_ping(args: str) -> None:
             f"<ansired>Не удалось получить список узлов: {_safe(resp.get('error', ''))}</ansired>"
         ))
         return
-    node = _pick_node(resp["nodes"], target_name)
+    node = _pick_node(_enrich_nodes(resp["nodes"]), target_name)
     if not node:
         return
 
-    ln, sn = node.get("long_name") or "?", node.get("short_name") or "?"
+    ln = node.get("display_long") or node.get("long_name") or "?"
+    sn = node.get("display_short") or node.get("short_name") or "?"
     print_formatted_text(HTML(f"<ansiwhite>🏓 Пингую {_safe(ln)} ({_safe(sn)})...</ansiwhite>"))
 
     start = _loop.time()
@@ -971,18 +1026,20 @@ async def _cmd_pos(args: str) -> None:
             f"<ansired>Не удалось получить список узлов: {_safe(resp.get('error', ''))}</ansired>"
         ))
         return
-    nodes = resp["nodes"]
+    nodes = _enrich_nodes(resp["nodes"])
     node = _pick_node(nodes, target_name)
     if not node:
         return
     if node.get("lat") is None or node.get("lon") is None:
         print_formatted_text(HTML(
-            f"<ansiyellow>У узла {_safe(node.get('long_name') or '?')} нет данных о позиции "
-            "(не шлёт GPS-координаты)</ansiyellow>"
+            f"<ansiyellow>У узла "
+            f"{_safe(node.get('display_long') or node.get('long_name') or '?')} "
+            "нет данных о позиции (не шлёт GPS-координаты)</ansiyellow>"
         ))
         return
 
-    ln, sn = node.get("long_name") or "?", node.get("short_name") or "?"
+    ln = node.get("display_long") or node.get("long_name") or "?"
+    sn = node.get("display_short") or node.get("short_name") or "?"
     alt = node.get("alt")
     alt_str = f", {alt} м" if alt is not None else ""
     print_formatted_text(HTML(
@@ -1123,8 +1180,40 @@ async def _cmd_react(args: str) -> None:
     _handle_send_response(resp, emoji_text)
 
 
+async def _try_resolve_pending_channel() -> None:
+    """Retries resolving a --channel name given at startup while the device
+    wasn't connected yet (see the _channel_resolved comment near its
+    declaration) — called once the "device: connected" event actually
+    confirms channels are known. If the name still doesn't match a real
+    channel now that the device answered for real, it's a genuine typo:
+    fall back to showing all channels instead of leaving the session stuck
+    filtered to channel 0 with nothing displayed."""
+    global _channel_filter, _channel_index, _channel_resolved
+    if _channel_resolved or _channel_filter is None:
+        return
+    resp = await _client.request("channels")
+    channels = resp.get("channels", []) if resp.get("ok") else []
+    match = next((c for c in channels if c["name"].lower() == _channel_filter.lower()), None)
+    if match:
+        _channel_index = match["index"]
+        _channel_filter = match["name"]
+        _channel_resolved = True
+        print_formatted_text(HTML(
+            f"<b><ansicyan>Канал подтверждён: {_safe(_channel_filter)}</ansicyan></b>"
+        ))
+    else:
+        available = ", ".join(c["name"] for c in channels) or "нет данных"
+        print_formatted_text(HTML(
+            f"<ansired>Канал '{_safe(_channel_filter)}' не найден на устройстве. "
+            f"Доступные: {_safe(available)} — показываю все каналы</ansired>"
+        ))
+        _channel_filter = None
+        _channel_index = 0
+        _channel_resolved = True
+
+
 async def _cmd_ch(args: str) -> None:
-    global _channel_filter, _channel_index, _completion_channels
+    global _channel_filter, _channel_index, _completion_channels, _channel_resolved
     name = args.strip()
     resp = await _client.request("channels")
     channels = resp.get("channels", []) if resp.get("ok") else []
@@ -1143,6 +1232,7 @@ async def _cmd_ch(args: str) -> None:
     if name.lower() in ("all", "*", "все"):
         _channel_filter = None
         _channel_index = 0
+        _channel_resolved = True
         print_formatted_text(HTML(
             "<b><ansicyan>Все каналы (отправка — в Primary)</ansicyan></b>"
         ))
@@ -1159,6 +1249,7 @@ async def _cmd_ch(args: str) -> None:
 
     _channel_filter = match["name"]
     _channel_index = match["index"]
+    _channel_resolved = True
     # цели /reply из других каналов после переключения удивили бы
     kept = [r for r in _replyables if r["channel_index"] == match["index"]]
     _replyables.clear()
@@ -1401,9 +1492,16 @@ async def _cmd_mute(args: str) -> None:
         return
 
     resp = await _client.request("nodes")
-    nodes = resp.get("nodes", []) if resp.get("ok") else []
+    nodes = _enrich_nodes(resp.get("nodes", [])) if resp.get("ok") else []
     matches = _find_node_in_list(nodes, query)
-    target = matches[0].get("long_name") if len(matches) == 1 and matches[0].get("long_name") else query
+    # display_long over long_name: mesh_logger.py's own OneMesh resolution
+    # feeds the same name into _node_names(), so it's what actually ends up
+    # written in the log lines /is_muted matches against — muting by the raw
+    # (possibly None, for a !hex-only node) long_name would silently fail to
+    # match anything once the logger resolves the name
+    canonical = matches[0].get("display_long") or matches[0].get("long_name") \
+        if len(matches) == 1 else None
+    target = canonical or query
 
     key = target.strip().lower()
     if key in _muted_names:
@@ -1492,7 +1590,8 @@ async def _cmd_settings(args: str) -> None:
         ))
         return
     key, value = parts
-    resp = await _client.request("settings", action="set", key=key, value=value)
+    resp = await _client.request("settings", action="set", key=key, value=value,
+                                  timeout=SETTINGS_SET_TIMEOUT)
     if not resp.get("ok"):
         print_formatted_text(HTML(
             f"<ansired>Не удалось применить: {_safe(resp.get('error', ''))}</ansired>"
@@ -1616,7 +1715,7 @@ async def _handle_command(text: str) -> None:
 # ── main ──────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    global _loop, _client, _history_ready, _channel_filter, _channel_index
+    global _loop, _client, _history_ready, _channel_filter, _channel_index, _channel_resolved
     _loop = asyncio.get_running_loop()
     _load_name_cache()
     _channel_filter, history_size = _parse_args()
@@ -1639,7 +1738,8 @@ async def main() -> None:
         sys.exit(1)
 
     who = await _client.request("whoami")
-    if who.get("ok"):
+    device_connected = who.get("ok", False)
+    if device_connected:
         _client.whoami = (who["long_name"], who["short_name"])
         _client.whoami_id = who["node_id"]
         print_formatted_text(HTML(
@@ -1655,18 +1755,32 @@ async def main() -> None:
         chresp = await _client.request("channels")
         channels = chresp.get("channels", []) if chresp.get("ok") else []
         match = next((c for c in channels if c["name"].lower() == _channel_filter.lower()), None)
-        if not match:
+        if not match and not device_connected:
+            # can't tell a real typo from "the device just hasn't answered
+            # yet" — the "channels" IPC call degrades to a single fake
+            # "Primary" entry while _interface is None (mesh_logger.py's
+            # _channels_payload()). Don't exit: keep the given name, send on
+            # Primary until _try_resolve_pending_channel confirms it for
+            # real off the "device: connected" event.
+            _channel_resolved = False
+            print_formatted_text(HTML(
+                f"<ansiyellow>Канал '{_safe(_channel_filter)}' пока не проверить — устройство "
+                "не подключено. Приму как есть и уточню, когда оно выйдет на связь "
+                "(отправка пока — в Primary)</ansiyellow>"
+            ))
+        elif not match:
             available = ", ".join(c["name"] for c in channels) or "нет данных"
             print_formatted_text(HTML(
                 f"<ansired>Канал '{_safe(_channel_filter)}' не найден. "
                 f"Доступные каналы: {_safe(available)}</ansired>"
             ))
             sys.exit(1)
-        _channel_index = match["index"]
-        _channel_filter = match["name"]
-        print_formatted_text(HTML(
-            f"<b><ansicyan>Канал: {_safe(_channel_filter)}</ansicyan></b>"
-        ))
+        else:
+            _channel_index = match["index"]
+            _channel_filter = match["name"]
+            print_formatted_text(HTML(
+                f"<b><ansicyan>Канал: {_safe(_channel_filter)}</ansicyan></b>"
+            ))
     else:
         print_formatted_text(HTML(
             "<ansiwhite>Показываю сообщения со всех каналов (отправка — в Primary)</ansiwhite>"

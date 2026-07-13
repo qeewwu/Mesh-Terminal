@@ -123,9 +123,27 @@ def sanitize_text(text: str) -> str:
     return _NEWLINES.sub(" ⏎ ", text)
 
 
+def _sanitize_name(name: str) -> str:
+    """long_name/short_name come from another node's NodeInfo — just as
+    untrusted as message text (sanitize_text above), and just as capable of
+    forging extra log lines via an embedded newline if left alone."""
+    return _NEWLINES.sub(" ⏎ ", name)
+
+
+def _sanitize_short_name(short_name: str) -> str:
+    """short_name is wrapped bare as `(<short_name>)` with no delimiter of its
+    own, and the parser's short-name group is `[^)]*` (stops at the first
+    ')') — an untrusted short_name containing ')' would misalign the
+    name/short split or break parsing outright, unlike long_name's ')'
+    (which the parser's non-greedy name match already tolerates)."""
+    return _sanitize_name(short_name).replace(")", "⟩")
+
+
 def format_quote_line(long_name: str, short_name: str, text: str,
                        time_str: str = "") -> str:
     time_prefix = f"[{time_str}] " if time_str else ""
+    long_name = _sanitize_name(long_name)
+    short_name = _sanitize_short_name(short_name)
     return (f"  ┆ {time_prefix}{long_name or '?'} ({short_name}): "
             f"{truncate(sanitize_text(text))}")
 
@@ -147,6 +165,8 @@ def format_message_line(time_str: str, long_name: str, short_name: str,
                          channel_name: str = "Primary",
                          snr: float | None = None) -> str:
     snr_suffix = f" SNR:{snr:.2f}" if snr is not None else ""
+    long_name = _sanitize_name(long_name)
+    short_name = _sanitize_short_name(short_name)
     return (f"{channel_name} [{time_str}] {dm_tag}{_escape_name(long_name, dm_tag)} "
             f"({short_name}): {sanitize_text(text)} | {hops}{snr_suffix}")
 

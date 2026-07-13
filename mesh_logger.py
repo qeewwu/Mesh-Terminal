@@ -26,7 +26,8 @@ from typing import NamedTuple
 import meshtastic.ble_interface
 import meshtastic.serial_interface
 import meshtastic.tcp_interface
-from meshtastic.protobuf import config_pb2
+from meshtastic.mesh_interface import MeshInterface
+from meshtastic.protobuf import config_pb2, mesh_pb2
 from meshtastic.util import to_node_num
 from pubsub import pub
 
@@ -55,6 +56,10 @@ STORE_SIZE = 300
 SILENCE_TIMEOUT = 600
 OUTBOX_MAX = 50  # queued sends while the device is disconnected
 OUTBOX_RETRIES = 3  # per-message re-queue limit when sendText itself fails
+# sendData() raises MeshInterfaceError synchronously above this — a payload-size
+# validation error, not a link failure, so it must be rejected outright instead
+# of tripping the outbox/reconnect path in _send_message
+MAX_PAYLOAD_BYTES = mesh_pb2.Constants.DATA_PAYLOAD_LEN
 # a client that stopped reading (suspended terminal) fills its socket buffer;
 # past this timeout it is disconnected so it can't stall pushes to everyone else
 CLIENT_SEND_TIMEOUT = 5
@@ -186,8 +191,18 @@ async def _periodic_onemesh_update() -> None:
 
 
 def _store_msg(packet_id: int, record: MsgRecord) -> None:
-    if len(_store_order) == STORE_SIZE and _store_order[0] in _store:
-        del _store[_store_order[0]]
+    if packet_id in _store:
+        # already tracked — a duplicate delivery (mesh flood-routing re-delivery,
+        # or an id collision) or our own retry. Refresh the record in place but
+        # don't re-append: appending again would leave two copies of packet_id
+        # in _store_order, and when the *older* copy reaches the front and gets
+        # evicted, it would delete this entry out from under the newer copy —
+        # a live record could then vanish well before STORE_SIZE messages had
+        # actually passed
+        _store[packet_id] = record
+        return
+    if len(_store_order) == STORE_SIZE:
+        _store.pop(_store_order[0], None)  # about to be evicted by the append below
     _store[packet_id] = record
     _store_order.append(packet_id)
 
@@ -314,9 +329,11 @@ def _log(*lines: str) -> None:
 
 
 async def _broadcast_event(event: dict) -> None:
+    if not _clients:
+        return
     data = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
-    for writer, lock in list(_clients.items()):
 
+    async def _push_one(writer: asyncio.StreamWriter, lock: asyncio.Lock) -> None:
         async def _push():
             async with lock:
                 writer.write(data)
@@ -330,6 +347,11 @@ async def _broadcast_event(event: dict) -> None:
             _clients.pop(writer, None)
             with contextlib.suppress(Exception):
                 writer.close()
+
+    # concurrently, not one-at-a-time: sequential sends meant one stuck client
+    # delayed every broadcast to everyone after it by up to CLIENT_SEND_TIMEOUT,
+    # and with N clients a single stuck one could add up to N*CLIENT_SEND_TIMEOUT
+    await asyncio.gather(*(_push_one(w, l) for w, l in list(_clients.items())))
 
 
 def _broadcast_device_status(status: str, **fields) -> None:
@@ -525,11 +547,14 @@ def _sd_notify(message: str) -> None:
             s.sendall(message.encode())
 
 
+_heartbeat_unsupported_warned = False  # print the warning below at most once
+
+
 async def _watchdog() -> None:
     """Probe the device link when the mesh has been silent for too long, and
     ping systemd's watchdog every cycle so it can restart us if the event loop
     itself ever wedges (WatchdogSec in mesh-logger.service)."""
-    global _last_rx
+    global _last_rx, _heartbeat_unsupported_warned
     while True:
         await asyncio.sleep(WATCHDOG_PING_SECONDS)
         _sd_notify("WATCHDOG=1")
@@ -538,6 +563,16 @@ async def _watchdog() -> None:
         iface = _interface
         send_hb = getattr(iface, "sendHeartbeat", None) if iface else None
         if send_hb is None:
+            if iface is not None and not _heartbeat_unsupported_warned:
+                # not "not connected" (that's a separate, already-visible state) —
+                # connected, but this meshtastic lib version predates
+                # sendHeartbeat(), so a silently dead link (no connection.lost
+                # fired) will never be detected or reconnected until something
+                # else notices. Once per process, not once per silence window.
+                _heartbeat_unsupported_warned = True
+                print("[warn] mesh silent, but this meshtastic lib has no "
+                      "sendHeartbeat() — silent-link detection is disabled "
+                      "(pip install -U meshtastic to fix)", file=sys.stderr)
             continue
         try:
             await asyncio.wait_for(asyncio.to_thread(send_hb), timeout=15)
@@ -590,13 +625,13 @@ def _nodes_payload() -> list[dict]:
 
 
 def _send_emoji_packet(iface, text: str, channel_index: int, reply_id: int,
-                        handler, destination_id):
+                        handler, destination_id, pid_holder: dict):
     """Build and send a tapback-reaction packet by hand: the library's public
     sendText()/sendData() have no `emoji` kwarg (unlike the `Data` protobuf
     message, which does), so this mirrors sendData()'s internals with that one
     field added. Mirrors _do_traceroute()'s precedent for reaching past the
     public API when it doesn't expose a field we need."""
-    from meshtastic.protobuf import mesh_pb2, portnums_pb2
+    from meshtastic.protobuf import portnums_pb2
 
     packet = mesh_pb2.MeshPacket()
     packet.channel = channel_index
@@ -606,8 +641,24 @@ def _send_emoji_packet(iface, text: str, channel_index: int, reply_id: int,
     if reply_id:
         packet.decoded.reply_id = reply_id
     packet.id = iface._generatePacketId()
+    # set before registering the handler / transmitting — the ACK literally
+    # cannot arrive before this point, so pid_holder is race-free here (unlike
+    # the plain sendText() path below, where the library owns id generation)
+    pid_holder["pid"] = packet.id
     iface._addResponseHandler(packet.id, handler)
     return iface._sendPacket(packet, destination_id, wantAck=True)
+
+
+def _send_text_tracked(iface, text: str, kwargs: dict, pid_holder: dict):
+    """Wraps sendText() so pid_holder is populated inside the same worker
+    thread, immediately after the packet id is known — narrows (though,
+    since the library generates the id internally, can't fully close) the
+    window where a very fast ACK's handler() reads pid_holder before it's
+    set (see the ack_timeout/handler race that made /ping hang on a null
+    packet_id for near-instant ACKs, e.g. over USB)."""
+    sent = iface.sendText(text, **kwargs)
+    pid_holder["pid"] = _packet_id(sent)
+    return sent
 
 
 async def _send_message(cmd: str, text: str, channel_index: int, reply_id: int = 0,
@@ -624,6 +675,11 @@ async def _send_message(cmd: str, text: str, channel_index: int, reply_id: int =
     if reply_id and not emoji and "replyId" not in inspect.signature(iface.sendText).parameters:
         return {"ok": False, "error": "библиотека meshtastic не поддерживает replyId — "
                                        "обновите: pip install -U meshtastic"}
+
+    text_bytes = len(text.encode("utf-8"))
+    if text_bytes > MAX_PAYLOAD_BYTES:
+        return {"ok": False, "error": f"сообщение слишком длинное ({text_bytes} байт, "
+                                       f"максимум {MAX_PAYLOAD_BYTES})"}
 
     pid_holder = {}
     fired = {"done": False}
@@ -671,9 +727,15 @@ async def _send_message(cmd: str, text: str, channel_index: int, reply_id: int =
     try:
         if emoji:
             sent = await asyncio.to_thread(_send_emoji_packet, iface, text, channel_index,
-                                           reply_id, handler, destination_id)
+                                           reply_id, handler, destination_id, pid_holder)
         else:
-            sent = await asyncio.to_thread(iface.sendText, text, **kwargs)
+            sent = await asyncio.to_thread(_send_text_tracked, iface, text, kwargs, pid_holder)
+    except MeshInterface.MeshInterfaceError as e:
+        # payload validation (e.g. "Data payload too big") — raised synchronously
+        # before anything touches the link, so it's not a disconnect: nothing to
+        # retry or reconnect over, and queueing it would just fail identically
+        # every time it's flushed
+        return {"ok": False, "error": f"отправка не удалась: {e}"}
     except Exception as e:
         # линк умер, но connection.lost ещё не прилетел: сообщение — в outbox,
         # соединение — на переподключение (раньше сообщение просто терялось).
@@ -686,8 +748,10 @@ async def _send_message(cmd: str, text: str, channel_index: int, reply_id: int =
                             "attempts": attempts + 1, "emoji": emoji})
             return {"ok": True, "queued": True}
         return {"ok": False, "error": f"отправка не удалась: {e}"}
-    pid = _packet_id(sent)
-    pid_holder["pid"] = pid
+    # pid_holder is set inside the worker thread by _send_text_tracked/
+    # _send_emoji_packet, before handler() could possibly fire — _packet_id(sent)
+    # is only a fallback for the (should-never-happen) case it wasn't
+    pid = pid_holder.get("pid") or _packet_id(sent)
     _loop.create_task(ack_timeout_watcher())
 
     # именно iface, а не _interface: за время await мог случиться реконнект

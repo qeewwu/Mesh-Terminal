@@ -66,6 +66,32 @@ class TestMessageRoundTrip(unittest.TestCase):
         self.assertEqual(p.long_name, "Bob (admin)")
         self.assertEqual(p.short_name, "BB")
 
+    def test_short_name_with_close_paren_still_parses(self):
+        # short_name приходит с чужого узла (NodeInfo) непроверенным; ")"
+        # ломает регэксп-группу short (`[^)]*`), которая иначе останавливается
+        # на первой же закрывающей скобке — без санитизации всё сообщение
+        # стало бы непарсящимся (или, хуже, распарсилось бы со сдвигом)
+        line = format_message_line("11:00:00", "Bob", "A)B", "hi", 0)
+        p = parse_log_line(line)
+        self.assertIsNotNone(p)
+        self.assertEqual(p.long_name, "Bob")
+        self.assertNotIn(")", p.short_name)
+        self.assertEqual(p.text, "hi")
+        self.assertEqual(p.hops, 0)
+
+    def test_name_newline_injection(self):
+        # long_name/short_name — с чужого узла, как и текст сообщения (см.
+        # test_forged_line_injection): перенос строки в имени не должен
+        # порождать вторую "строку" лога
+        evil_long = "Evil\nnode"
+        evil_short = "EV\nnode"
+        line = format_message_line("12:00:00", evil_long, evil_short, "hi", 0)
+        self.assertEqual(len(line.splitlines()), 1)
+        p = parse_log_line(line)
+        self.assertIsNotNone(p)
+        self.assertNotIn("\n", p.long_name)
+        self.assertNotIn("\n", p.short_name)
+
     def test_name_with_dm_prefix_is_not_a_dm(self):
         # узел с именем «DM Master» не должен парситься как входящий DM
         line = format_message_line("12:00:00", "DM Master", "DMM", "hi", 0)
@@ -158,6 +184,13 @@ class TestQuoteRoundTrip(unittest.TestCase):
     def test_without_time_is_empty_string(self):
         q = parse_log_line(format_quote_line("A", "AA", "текст"))
         self.assertEqual(q.time_str, "")
+
+    def test_short_name_with_close_paren_still_parses(self):
+        q = parse_log_line(format_quote_line("Вася", "A)B", "исходный текст"))
+        self.assertIsNotNone(q)
+        self.assertEqual(q.long_name, "Вася")
+        self.assertNotIn(")", q.short_name)
+        self.assertEqual(q.text, "исходный текст")
 
     def test_legacy_quote_line_has_no_time(self):
         # старые записи в логах, сделанные до появления времени в цитатах
