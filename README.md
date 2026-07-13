@@ -1,4 +1,4 @@
-# Mesh
+# Mesh-Terminal
 
 Терминальный чат-клиент для Meshtastic по WiFi (TCP API).
 
