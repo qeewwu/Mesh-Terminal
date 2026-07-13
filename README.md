@@ -1,4 +1,4 @@
-# Mesh
+# Mesh-Terminal
 
 A terminal chat client for [Meshtastic](https://meshtastic.org/) mesh radio networks — over WiFi, USB serial, or Bluetooth LE.
 

@@ -1,4 +1,4 @@
-# Mesh
+# Mesh-Terminal
 
 Терминальный чат-клиент для mesh-радиосетей [Meshtastic](https://meshtastic.org/) — по WiFi, USB или Bluetooth LE.
 
