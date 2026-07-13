@@ -7,6 +7,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A terminal chat client for Meshtastic. Connects over WiFi (TCP API, default), USB serial, or
 Bluetooth LE — see `MESH_CONN_TYPE` in `.env`.
 
+## Documentation split
+
+`README.md` (English, canonical) and `README.ru.md` (Russian, kept as a faithful translation —
+same structure, same sections, same information, just the language) are user-facing: what the
+project is, what it does, how to install/run/use it, the command and config reference. No
+implementation rationale belongs there — no "why", no protocol internals, no history of bugs
+found and fixed. That's all here, in `CLAUDE.md`, instead.
+
+When a user-visible feature, command, or config key changes, update **both** README files
+together, keeping their structure identical — don't let one drift ahead of the other. If you're
+tempted to explain *why* something works a certain way in a README, that explanation belongs in
+this file, with at most a pointer from the README ("see CLAUDE.md" / "see SETTINGS.md").
+
 ## Setup / running
 
 ```bash
@@ -282,8 +295,12 @@ entry, so muting still works from a name typed directly (no live node match need
 that's currently offline). This only filters the passive feed — startup history
 (`_print_initial_history`), live tail (`_handle_event`'s `message` branch), `/ch`'s re-display,
 and reconnect replay (`_replay_missed`) — while `/search`, `/last`, and `/reply` targets stay
-reachable, same reasoning as why `/reply` ignores the channel filter: an explicit query should
-still find what you're looking for.
+reachable: `_handle_event` appends to `_replyables` before checking `_is_muted`, so a message
+from a muted sender still becomes a `/reply` target even though it never prints, same reasoning
+as `/search`/`/last` — an explicit query (or command) should still find what you're looking for.
+This is unlike the channel filter (see Channels below), which *does* also gate what becomes a
+`/reply` target — a `--channel`-filtered session is meant to be a clean view of just that
+channel, so a message on another channel never enters `_replyables` there in the first place.
 
 ### Position and distance (`/pos`)
 
@@ -447,3 +464,126 @@ sudo systemctl restart mesh-logger
 
 `mesh-logger.service` uses `Type=notify` + `WatchdogSec=150` (see the sd_notify watchdog note
 above) — after editing the unit file, `sudo systemctl daemon-reload` before restarting.
+
+## Fixed bugs and design decisions (session log)
+
+A running log of non-obvious bugs found and fixed, and judgment calls made along the way — kept
+so the reasoning behind them doesn't have to be rediscovered from scratch next time. Grouped by
+theme, not chronologically.
+
+### Send-path: oversized messages and a delivery-tracking race
+
+`sendData()` (which `sendText()` wraps) raises `MeshInterface.MeshInterfaceError("Data payload
+too big")` **synchronously**, before touching the link at all, once the UTF-8-encoded text
+exceeds `mesh_pb2.Constants.DATA_PAYLOAD_LEN` (233 bytes). `_send_message()` used to catch this
+with the same broad `except Exception` as an actual link failure — a too-long message would
+needlessly trip `_reconnect_event.set()` and get queued to the outbox, retried against a
+perfectly healthy connection, and still never succeed. Fixed with a pre-check (`MAX_PAYLOAD_BYTES`)
+that returns a clear error immediately, plus a dedicated `except MeshInterface.MeshInterfaceError`
+before the generic link-failure handler.
+
+Separately, `handler()` (the ACK callback passed to `sendText`) reads `pid_holder["pid"]` to know
+which packet a `delivery` event is for — but that dict used to only get populated *after*
+`await asyncio.to_thread(...)` returned control to the event loop. A very fast ACK (small hop
+count, e.g. over USB) could fire before that assignment ran, reading an empty `pid_holder` and
+leaving `/ping`'s waiting future unresolved until timeout. For reactions (`_send_emoji_packet`),
+fixed completely — `pid_holder["pid"]` is now set right after the locally-generated packet id is
+assigned, strictly before the response handler is even registered, so the ACK cannot possibly
+arrive first. For plain text (`_send_text_tracked`), only narrowed — the id is generated inside
+the meshtastic library itself, so the assignment happens as early as the worker thread allows
+(immediately after `sendText()` returns) but not any earlier.
+
+### Log format: names are as untrusted as message text
+
+`sanitize_text()` (collapses embedded `\n` into ` ⏎ `) already existed for message text, but
+`long_name`/`short_name` — which come from the same untrusted source, another node's broadcast
+NodeInfo — went into `format_message_line()`/`format_quote_line()` unsanitized. Two concrete
+consequences, both fixed by extending sanitization to both name fields:
+- A newline embedded in a name could forge extra fake log lines, the same class of attack
+  `sanitize_text()` already existed to prevent for message text (see `test_forged_line_injection`).
+- A `)` in `short_name` broke `parse_log_line`'s `_MSG_RE`/`_QUOTE_RE` outright — their `short`
+  capture group is `[^)]*`, so a `)` inside the value itself desyncs where the regex thinks the
+  name/short boundary is. `_sanitize_short_name()` replaces `)` with `⟩` at write time.
+
+**Known, deliberately unfixed**: a node's own `long_name` can contain a well-formed
+`(<short>): ` substring (matching literal parens, not just a stray `)`) that hijacks the parser's
+non-greedy name/short split — it finds the *first* syntactically valid boundary while scanning
+left to right, not necessarily the intended one. A node could name itself e.g.
+`"Notice (ADMIN): "` so that every message it ever sends displays as if sent by "ADMIN". This is
+purely a display-layer identity-spoofing issue (no new physical log line gets forged, nothing
+crashes) — closing it fully means disallowing literal `(`/`)` in `long_name`, which conflicts
+with the existing, intentionally-tested behavior in `test_name_with_parentheses` (a name like
+"Bob (admin)" is expected to round-trip with its real parens intact). Verified against ~12k lines
+of real production logs (`/Users/qeewwu/Desktop/logs/`, Jul 2026): zero occurrences of this
+pattern, malicious or accidental — left as-is by explicit decision, revisit if it's ever actually
+exploited. (Those same logs *did* independently confirm `sanitize_text()`'s value: 790 lines
+(6.5%) failed to parse before it reached production around 05–06 Jul — multi-line ping-bot
+replies and one human-pasted shell command forging extra "lines" — and zero after.)
+
+### Mute vs. `/reply` targets
+
+`_handle_event()`'s `message` branch used to check `_is_muted()` *before* appending to
+`_replyables`, so a muted sender's message could never become a `/reply` target — contradicting
+this file's own claim that `/search`, `/last`, and `/reply` all stay reachable for muted senders.
+Decision (confirmed with the user, not just inferred): mute is display-only, same precedent as
+`/search`/`/last` — moved the `_replyables.append` before the mute check. The channel filter is
+*not* held to the same standard: a `--channel`-filtered session is deliberately a clean view of
+just that channel (see Channels above), so it's allowed to also gate `/reply` targets, unlike
+mute. Both behaviors are intentional and now correctly reflect what the code does.
+
+### Client-side name resolution gaps
+
+`/dm`, `/trace`, `/ping`, `/pos`, `/mute`, and tab-completion all used to match node names
+against the raw `nodes` IPC payload — which only ever carries a name if the mesh's own NodeInfo
+reported one. A node visible in `/nodes` under its OneMesh-resolved display name (e.g. "Вася")
+was unmatchable by that exact name anywhere else — only by its raw `!hex` id. `/nodes` already
+computed the fix inline (`display_long`/`display_short`); factored it out as `_enrich_nodes()`
+and applied it everywhere a node list is matched or rendered, including `_update_node_completions`.
+`/mute` additionally now prefers `display_long` over the raw (often-`None`) `long_name` when
+naming what got muted, since `display_long` is what `mesh_logger.py`'s own OneMesh resolution
+actually writes into fresh log lines — matching the raw name would silently fail to ever match.
+
+### `--channel` at startup when the device isn't connected yet
+
+`mesh_chat.py --channel <name>` used to `sys.exit(1)` if the given channel name didn't resolve —
+but `_channels_payload()` degrades to a single fake `"Primary"` entry whenever `_interface` is
+`None`, indistinguishable from a genuine typo. A client started while the logger was still
+mid-reconnect (or the device was simply off) would hard-exit on a channel that actually exists.
+Fixed with a `_channel_resolved` flag: if the device wasn't connected at the "channels" lookup,
+the given name is accepted provisionally (sending defaults to Primary meanwhile) and
+`_try_resolve_pending_channel()` re-checks it for real off the next `device: connected` event —
+falling back to "all channels" only if it's still not found once the device actually answers.
+
+### Reconnect-to-logger race
+
+`_reconnect_logger()` used to assign `client.on_disconnect` *after* `await client.connect()`
+returned. A drop in that window (read_loop's `finally` runs with `on_disconnect` still `None`)
+went completely unnoticed — `_reconnecting` never got reset, so nothing would ever retry, and the
+client would sit silently disconnected until manually restarted. Fixed by assigning
+`on_disconnect` before `connect()`, plus a defensive check right after the post-connect `whoami`
+round trip (in case the connection dropped again during that handshake, while `_reconnecting` was
+still `True` and would have swallowed a real disconnect event as a no-op).
+
+### `_store_msg` dict/deque desync
+
+`_store` (dict) and `_store_order` (bounded deque, drives eviction) were meant to stay in
+lockstep, one entry each per tracked `packet_id`. Re-inserting an *already-tracked* `packet_id`
+(duplicate delivery, or a rare id collision) appended a second copy to the deque without a
+matching second dict entry — when the older copy of that duplicate reached the front and got
+evicted, it deleted the (still fresh) record out from under the newer copy, causing premature
+loss of quote-line data well before `STORE_SIZE` messages had actually passed. Fixed: an update
+to an already-tracked key now skips the `_store_order.append()` entirely.
+
+### Miscellaneous reliability
+
+- `_broadcast_event()` pushed to clients sequentially, each bounded by `CLIENT_SEND_TIMEOUT` — one
+  stuck client could delay live-message delivery to everyone *after* it in iteration order by up
+  to that timeout, compounding with more stuck clients. Switched to `asyncio.gather` so all
+  per-client pushes run concurrently.
+- `_watchdog()` silently no-op'd forever, with zero indication why, if the installed `meshtastic`
+  library predates `sendHeartbeat()` — silent-link detection would be permanently disabled.
+  Added a one-time (not per-cycle) `[warn]` line to stderr.
+- `/settings <key> <value>`'s default 10s IPC timeout was tight against the logger's own session-key
+  wait (up to `SESSION_KEY_TIMEOUT`) plus a synchronous `writeConfig()` round trip — bumped to 20s
+  (`SETTINGS_SET_TIMEOUT`) for the `set` action specifically.
+- `/trace` didn't pass the session's active channel filter, unlike `/dm`/`/ping` — now does.
