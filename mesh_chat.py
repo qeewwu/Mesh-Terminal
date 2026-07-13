@@ -1579,7 +1579,7 @@ async def _cmd_settings(args: str) -> None:
             ))
         print_formatted_text(HTML(
             "<ansigray>Изменить: /settings &lt;параметр&gt; &lt;значение&gt;. "
-            "Подробности — SETTINGS.md</ansigray>"
+            "Подробности — SETTINGS.ru.md</ansigray>"
         ))
         return
 
@@ -1668,7 +1668,7 @@ def _cmd_help() -> None:
         "  /mute &lt;имя&gt;         скрыть сообщения узла из чата (история — всё ещё в /search)",
         "  /unmute [имя]        снять мьют (без аргумента — список замьюченных)",
         "  /updatenames         подтянуть имена узлов с OneMesh (и так — раз в 30 мин фоном)",
-        "  /settings [параметр значение]  настройки локального узла (см. SETTINGS.md)",
+        "  /settings [параметр значение]  настройки локального узла (см. SETTINGS.ru.md)",
         "  /botping 0|1         бот в канале Ping: отвечает хопами до отправителя",
         "  /reboot             перезагрузить узел (требует /reboot confirm)",
         "  /clear               очистить экран",

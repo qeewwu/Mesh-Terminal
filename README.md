@@ -4,6 +4,8 @@ A terminal chat client for [Meshtastic](https://meshtastic.org/) mesh radio netw
 
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 
+*(Русская версия: [README.ru.md](README.ru.md))*
+
 > **Note:** the client's own messages and prompts are in Russian — see the screenshots-in-text below for what that actually looks like. Slash-command *names* (`/dm`, `/reply`, ...) are plain ASCII either way.
 
 ## About
@@ -231,7 +233,7 @@ mesh_logger.py         background daemon: device connection + logging + IPC serv
 mesh_chat.py           interactive client: IPC socket + history + TUI
 test_mesh_common.py    tests for the log line format/parser
 mesh-logger.service    example systemd unit for mesh_logger.py
-SETTINGS.md            full reference for /settings parameters
+SETTINGS.md            full reference for /settings parameters (ru: SETTINGS.ru.md)
 node_names_cache.json  /mute state
 onemesh_cache.json     node names resolved via OneMesh (written by mesh_logger.py)
 logs/                  daily chat logs, chat-YYYY-MM-DD.log
