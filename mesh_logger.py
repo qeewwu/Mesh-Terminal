@@ -147,6 +147,15 @@ _outbox: collections.deque[dict] = collections.deque()
 # what actually lands in freshly-written log lines instead of `!hex (???)`.
 _onemesh_names: dict[int, tuple[str, str]] = {}
 
+# node_ids seen via on_receive (or other _node_names() callers) that fell back
+# to the bare !hex (???) display because they're absent from _interface.nodes
+# entirely — the device relayed a packet from them but never got a full
+# NodeInfo. _run_onemesh_update() can't find these by scanning
+# _interface.nodes (they're not in it), so _node_names() records them here
+# instead, and the update sweep treats this set as extra targets alongside
+# the interface.nodes-without-"user" case.
+_unresolved_ids: set[int] = set()
+
 
 def _load_onemesh_cache() -> None:
     global _onemesh_names
@@ -188,24 +197,31 @@ def _fetch_onemesh_name(node_id: int) -> tuple[str, str] | None:
 
 
 def _run_onemesh_update() -> dict:
-    """Synchronous — scans the live NodeInfo table for nodes the mesh hasn't
-    told us a name for, and asks OneMesh for each not already cached. Call via
-    asyncio.to_thread (blocking network I/O). Runs at startup and every
-    ONEMESH_UPDATE_INTERVAL automatically (_periodic_onemesh_update), and once
-    on demand via the "updatenames" IPC command (mesh_chat.py's /updatenames)."""
-    if not _interface or not _interface.nodes:
+    """Synchronous — scans the live NodeInfo table plus _unresolved_ids (nodes
+    seen only via relayed packets, with no NodeInfo at all) for nodes the mesh
+    hasn't told us a name for, and asks OneMesh for each not already cached.
+    Call via asyncio.to_thread (blocking network I/O). Runs at startup and
+    every ONEMESH_UPDATE_INTERVAL automatically (_periodic_onemesh_update),
+    and once on demand via the "updatenames" IPC command (mesh_chat.py's
+    /updatenames)."""
+    targets = set()
+    if _interface and _interface.nodes:
+        for nid, node in list(_interface.nodes.items()):
+            num = nid if isinstance(nid, int) else int(str(nid).lstrip("!"), 16)
+            if not node.get("user") and num not in _onemesh_names:
+                targets.add(num)
+    # nodes seen only via relayed packets, never a NodeInfo — absent from
+    # _interface.nodes entirely, so the loop above can't find them
+    targets |= {nid for nid in _unresolved_ids if nid not in _onemesh_names}
+    if not targets:
         return {"resolved": 0, "targets": 0}
-    targets = []
-    for nid, node in list(_interface.nodes.items()):
-        num = nid if isinstance(nid, int) else int(str(nid).lstrip("!"), 16)
-        if not node.get("user") and num not in _onemesh_names:
-            targets.append(num)
 
     resolved = 0
     for nid in targets:
         result = _fetch_onemesh_name(nid)
         if result:
             _onemesh_names[nid] = result
+            _unresolved_ids.discard(nid)
             resolved += 1
         time.sleep(ONEMESH_DELAY)
 
@@ -254,6 +270,7 @@ def _node_names(node_id: int) -> tuple[str, str]:
     cached = _onemesh_names.get(node_id)
     if cached:
         return cached
+    _unresolved_ids.add(node_id)
     return hex_id, "???"
 
 
