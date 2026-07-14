@@ -591,6 +591,35 @@ sudo systemctl restart mesh-logger
 `mesh-logger.service` uses `Type=notify` + `WatchdogSec=150` (see the sd_notify watchdog note
 above) — after editing the unit file, `sudo systemctl daemon-reload` before restarting.
 
+### Backing up logs (`ops/`)
+
+Both `logs/*.log` (chat history) and `mesh-logger.py`'s own runtime output only ever exist on
+whichever machine runs the logger — for a server/Raspberry Pi deployment, that's a single point of
+loss if the disk dies. `ops/` holds two scripts to pull a copy onto another machine (a laptop, say)
+on demand, with no new dependency (`rsync` + `journalctl`, nothing else) and deliberately no
+scheduled automation — this project doesn't get touched often enough to justify a systemd
+timer/cron entry running forever for data that's only ever needed right before a debugging session:
+
+- **`ops/mesh-log-export.sh`** — run manually on the server, whenever you actually want the
+  process's own `[info]`/`[error]`/`[warn]` lines included in a backup. `journalctl -u mesh-logger`
+  is a binary journal, not a plain file, so this dumps entries since the last export (tracked via a
+  `service-logs/.last_export` timestamp file, falling back to the last 7 days on a first run) into
+  `service-logs/mesh-logger.log` — a plain-text file `ops/sync-logs.sh` can then pull like any other.
+- **`ops/sync-logs.sh`** — run manually on the backup destination (e.g. your laptop) right before
+  you need a local copy. Pulls `logs/` and `service-logs/` from the server via `rsync -avz`
+  (additive, no `--delete` — a briefly unreachable server just leaves the last successful mirror in
+  place, not a partial/wiped one) into `./backup/`. Remote host/path and local destination are all
+  overridable via env vars (`MESH_BACKUP_REMOTE`/`MESH_BACKUP_REMOTE_DIR`/`MESH_BACKUP_DEST`) so it
+  works whether or not you've set up an SSH config alias.
+
+One-time, machine-specific setup that's *not* in `ops/` because it's not something to run
+repeatedly: authorizing an SSH key on the server (or reusing whichever key already works — check
+`~/.ssh/known_hosts` / shell history for the host you connect to manually), and an optional
+`~/.ssh/config` alias so `sync-logs.sh` needs no env vars.
+
+`logs/`, `service-logs/`, and `backup/` are all gitignored — runtime output, generated fresh on
+whichever machine runs the relevant script, never checked in.
+
 ## Fixed bugs and design decisions (session log)
 
 A running log of non-obvious bugs found and fixed, and judgment calls made along the way — kept

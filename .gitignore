@@ -218,3 +218,8 @@ __marimo__/
 .streamlit/secrets.toml
 node_names_cache.json
 onemesh_cache.json
+
+# Mesh chat/service logs (see ops/) — generated locally, never checked in
+/logs/
+/service-logs/
+/backup/

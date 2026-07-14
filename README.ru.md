@@ -248,6 +248,7 @@ mesh_logger.py         фоновый демон: соединение с уст
 mesh_chat.py           интерактивный клиент: IPC-сокет + история + TUI
 test_mesh_common.py    тесты формата/парсера строк лога
 mesh-logger.service    пример systemd-юнита для mesh_logger.py
+ops/                   скрипты для бэкапа логов с сервера — см. CLAUDE.md
 SETTINGS.ru.md         полный справочник параметров /settings (англ. — SETTINGS.md)
 node_names_cache.json  состояние /mute
 onemesh_cache.json     имена узлов, резолвленные через OneMesh (пишет mesh_logger.py)

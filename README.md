@@ -248,6 +248,7 @@ mesh_logger.py         background daemon: device connection + logging + IPC serv
 mesh_chat.py           interactive client: IPC socket + history + TUI
 test_mesh_common.py    tests for the log line format/parser
 mesh-logger.service    example systemd unit for mesh_logger.py
+ops/                   scripts for backing up logs off the server — see CLAUDE.md
 SETTINGS.md            full reference for /settings parameters (ru: SETTINGS.ru.md)
 node_names_cache.json  /mute state
 onemesh_cache.json     node names resolved via OneMesh (written by mesh_logger.py)
