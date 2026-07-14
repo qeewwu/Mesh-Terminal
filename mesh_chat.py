@@ -190,8 +190,15 @@ def _find_node_in_list(nodes: list[dict], query: str) -> list[dict]:
     *display* name (falls back to the raw long/short_name if `nodes` wasn't
     run through _enrich_nodes) — a node visible only via `!hex (???)` on the
     wire but resolved via OneMesh (as /nodes shows it) would otherwise never
-    match by the name the user actually typed."""
-    q = query.lower()
+    match by the name the user actually typed. Tab-completion wraps a name
+    containing a space in quotes (see _update_node_completions) so the
+    completed text round-trips as one shell-like token — strip that same
+    pair back off here, or a completed `/who "Meshtastic 6914"` would search
+    for a node literally named with quote characters and never match."""
+    q = query.strip()
+    if len(q) >= 2 and q[0] == '"' and q[-1] == '"':
+        q = q[1:-1]
+    q = q.lower()
     exact, prefix, substr = [], [], []
     for n in nodes:
         ln = (n.get("display_long") or n.get("long_name") or "").lower()

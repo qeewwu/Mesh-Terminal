@@ -809,6 +809,21 @@ All three found by Claude Cowork during a testing session (2026-07-15); verified
 codebase and the first one reproduced live over Tailscale/SSH against the production server
 before fixing.
 
+### Tab-completed quoted names never matched
+
+`_update_node_completions` wraps a node's long name in `"..."` when it contains a space (e.g.
+`"Meshtastic 6914"`), so completing it inserts one shell-like token instead of several words —
+the completer's own matching (`MeshCompleter.get_completions`) already stripped those quotes
+before comparing. But `_find_node_in_list`, the shared matcher behind `_pick_node` (and so behind
+`/who`, `/dm`, `/trace`, `/ping`, `/ignore`, `/unignore`), never did — it compared the literal
+quoted string against unquoted node names and always came up empty, even for a name that would
+otherwise match exactly. Tab completion was the only way to hit this (typing the same name by
+hand without quotes worked fine, since this REPL isn't a shell and doesn't need quoting for a
+multi-word argument — `args.split(None, 1)` already keeps the whole rest of the line together),
+which is why it looked like an intermittent "node not found" rather than a deterministic bug.
+Fixed by stripping one surrounding `"..."` pair in `_find_node_in_list` itself, matching what the
+completer already assumed.
+
 ### Miscellaneous reliability
 
 - `_broadcast_event()` pushed to clients sequentially, each bounded by `CLIENT_SEND_TIMEOUT` — one
