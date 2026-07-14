@@ -206,6 +206,7 @@ sudo systemctl restart mesh-logger
 | `/updatenames` | Force an immediate node-name resolution sweep via OneMesh |
 | `/settings [key value]` | View or change local node settings — see [`SETTINGS.md`](SETTINGS.md) |
 | `/botping 0\|1` | Enable/disable the auto-reply ping-bot |
+| `/autoping [minutes\|off\|text ...]` | Configure the link-canary broadcast: interval, custom text, or turn it off |
 | `/reboot` / `/reboot confirm` | Reboot the node (two-step confirmation) |
 | `/reconnect [host]` | Force the logger to redial the device now, optionally at a new address (WiFi only) |
 | `/clear` | Clear the screen |
@@ -226,6 +227,8 @@ All settings live in `.env` (copy from `.env.example`); every key is optional an
 | `MESH_BLE_ADDRESS` | *(auto-detect)* | MAC/UUID for BLE |
 | `PING_CHANNEL` | `Ping` | Channel name the ping-bot and auto-ping canary use |
 | `BOTPING_ENABLED` | `0` | Managed by `/botping 0\|1` — no need to edit by hand |
+| `AUTOPING_INTERVAL_MIN` | `120` | Managed by `/autoping` — minutes between canary broadcasts, `0` disables it |
+| `AUTOPING_TEXT` | *(empty = default)* | Managed by `/autoping text ...` — custom canary text |
 | `NODE_LONG_NAME` / `NODE_SHORT_NAME` / `NODE_ID` | *(empty)* | Self-populated by `/who` — no need to edit by hand |
 
 ## Under the hood

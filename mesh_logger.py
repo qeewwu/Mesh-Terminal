@@ -71,7 +71,7 @@ SESSION_KEY_TIMEOUT = 5.0  # how long to wait for the admin session passkey hand
 ONEMESH_API = "https://map.onemesh.ru/api/v1/nodes/{}"
 ONEMESH_DELAY = 0.25  # between OneMesh lookups, so a full sweep doesn't hammer the API
 ONEMESH_UPDATE_INTERVAL = 30 * 60  # background resolution sweep: at startup, then every 30 min
-AUTOPING_INTERVAL = 2 * 60 * 60  # health-check broadcast into the Ping channel
+AUTOPING_INTERVAL_DEFAULT_MIN = 120  # 2h — matches the old hardcoded interval
 
 _interface = None
 _loop: asyncio.AbstractEventLoop | None = None
@@ -89,6 +89,30 @@ _last_rx: float = 0.0  # time.monotonic() of the last packet of any kind
 # same as HOST/PING_CHANNEL_NAME.
 _botping_enabled: bool = parse_env_file(ENV_FILE).get("BOTPING_ENABLED", "0") == "1"
 BOTPING_MARKER = "🤖"  # prefix on our own bot replies — see _maybe_botping_reply
+
+
+def _load_autoping_interval_min() -> int:
+    raw = parse_env_file(ENV_FILE).get("AUTOPING_INTERVAL_MIN", "").strip()
+    if not raw:
+        return AUTOPING_INTERVAL_DEFAULT_MIN
+    try:
+        return max(0, int(raw))  # 0 = disabled
+    except ValueError:
+        return AUTOPING_INTERVAL_DEFAULT_MIN
+
+
+# /autoping <minutes|off|text ...> in mesh_chat.py — both persisted to .env
+# (AUTOPING_INTERVAL_MIN, AUTOPING_TEXT) so they survive a logger restart,
+# loaded once at import like BOTPING_ENABLED/HOST. 0 minutes means disabled —
+# no separate on/off flag needed. Empty text means "use the localized
+# t('autoping_text') default", not a literal empty broadcast.
+_autoping_interval_min: int = _load_autoping_interval_min()
+_autoping_text_override: str = parse_env_file(ENV_FILE).get("AUTOPING_TEXT", "").strip()
+# wakes _periodic_autoping() early when interval/text changes, same
+# interrupt-a-sleep idiom as _hard_reconnect_event — so a change takes effect
+# starting from the next cycle immediately, not whenever the old interval
+# happened to be about to expire (which could be hours away)
+_autoping_changed_event: asyncio.Event | None = None
 
 
 class MsgRecord(NamedTuple):
@@ -281,6 +305,28 @@ def _set_botping(enabled: bool) -> None:
         update_env_file(ENV_FILE, {"BOTPING_ENABLED": "1" if enabled else "0"})
 
 
+def _notify_autoping_changed() -> None:
+    if _loop and _autoping_changed_event:
+        _loop.call_soon_threadsafe(_autoping_changed_event.set)
+
+
+def _set_autoping_interval(minutes: int) -> None:
+    global _autoping_interval_min
+    _autoping_interval_min = minutes
+    with contextlib.suppress(Exception):
+        update_env_file(ENV_FILE, {"AUTOPING_INTERVAL_MIN": str(minutes)})
+    _notify_autoping_changed()
+
+
+def _set_autoping_text(text: str) -> None:
+    """Empty `text` resets to the localized default (t("autoping_text"))."""
+    global _autoping_text_override
+    _autoping_text_override = text
+    with contextlib.suppress(Exception):
+        update_env_file(ENV_FILE, {"AUTOPING_TEXT": text})
+    _notify_autoping_changed()
+
+
 async def _send_botping_reply(reply_id: int, channel_index: int, hops: int) -> None:
     text = t("botping_reply", marker=BOTPING_MARKER, hops_phrase=plural("hops_forms", hops))
     await _send_message("send", text, channel_index, reply_id=reply_id)
@@ -309,16 +355,33 @@ async def _periodic_autoping() -> None:
     """Health-check heartbeat into the Ping channel: unrelated to /botping (runs
     regardless of whether the reply-bot is toggled on) — the point is a visible
     "the mesh link is alive" canary, for us and for anyone/anything listening on
-    that channel. Sleeps first so a logger restart doesn't immediately re-ping."""
+    that channel. Sleeps first so a logger restart doesn't immediately re-ping.
+    Interval/text/on-off are configurable via /autoping in mesh_chat.py; a
+    0-minute interval means disabled, in which case this waits indefinitely on
+    _autoping_changed_event rather than polling. A change while asleep wakes
+    this immediately and restarts the wait with the new settings — the next
+    canary fires one fresh interval from the change, not whenever the old
+    interval happened to be about to expire (which could be hours away)."""
     while True:
-        await asyncio.sleep(AUTOPING_INTERVAL)
+        interval_min = _autoping_interval_min
+        if interval_min <= 0:
+            await _autoping_changed_event.wait()
+            _autoping_changed_event.clear()
+            continue
+        try:
+            await asyncio.wait_for(_autoping_changed_event.wait(), timeout=interval_min * 60)
+            _autoping_changed_event.clear()
+            continue  # settings changed mid-sleep — re-read at the top, don't send early
+        except asyncio.TimeoutError:
+            pass
         if not _interface:
             continue
         idx = _ping_channel_index()
         if idx is None:
             continue
+        text = _autoping_text_override or t("autoping_text")
         try:
-            await _send_message("send", t("autoping_text"), idx)
+            await _send_message("send", text, idx)
         except Exception as e:
             print(f"[warn] autoping failed: {e}", file=sys.stderr)
 
@@ -1281,6 +1344,30 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                         _set_botping(value == "1")
                         resp = {"req_id": req_id, "ok": True, "enabled": _botping_enabled,
                                 "channel_found": _ping_channel_index() is not None}
+
+                elif cmd == "autoping":
+                    action = req.get("action", "get")
+                    if action == "get":
+                        resp = {"req_id": req_id, "ok": True,
+                                "interval_min": _autoping_interval_min,
+                                "text": _autoping_text_override or t("autoping_text"),
+                                "text_is_default": not _autoping_text_override,
+                                "channel_found": _ping_channel_index() is not None}
+                    elif action == "set_interval":
+                        minutes = req.get("minutes")
+                        if not isinstance(minutes, int) or isinstance(minutes, bool) or minutes < 0:
+                            resp["error"] = t("err_autoping_bad_interval")
+                        else:
+                            _set_autoping_interval(minutes)
+                            resp = {"req_id": req_id, "ok": True, "interval_min": minutes,
+                                    "channel_found": _ping_channel_index() is not None}
+                    elif action == "set_text":
+                        text = (req.get("text") or "").strip()
+                        _set_autoping_text(text)
+                        resp = {"req_id": req_id, "ok": True,
+                                "text": text or t("autoping_text"), "text_is_default": not text}
+                    else:
+                        resp["error"] = f"unknown autoping action: {action}"
                 else:
                     resp["error"] = f"unknown cmd: {cmd}"
             except Exception as e:
@@ -1312,10 +1399,11 @@ def _prepare_socket_path() -> None:
 
 
 async def main() -> None:
-    global _loop, _reconnect_event, _hard_reconnect_event
+    global _loop, _reconnect_event, _hard_reconnect_event, _autoping_changed_event
     _loop = asyncio.get_running_loop()
     _reconnect_event = asyncio.Event()
     _hard_reconnect_event = asyncio.Event()
+    _autoping_changed_event = asyncio.Event()
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     _load_onemesh_cache()

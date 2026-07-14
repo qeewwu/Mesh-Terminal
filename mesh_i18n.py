@@ -75,6 +75,7 @@ _RU: dict[str, object] = {
     "err_reconnect_wifi_only": (
         "смена адреса поддерживается только при MESH_CONN_TYPE=wifi (сейчас: {conn_type})"
     ),
+    "err_autoping_bad_interval": "ожидается неотрицательное целое число минут",
 
     # -- mesh_logger.py: over-the-air texts + shared plural forms -------------
     "hops_forms": ("хоп", "хопа", "хопов"),
@@ -254,6 +255,23 @@ _RU: dict[str, object] = {
         "бот включён, но реагировать пока не на что"
     ),
 
+    # -- mesh_chat.py: /autoping ------------------------------------------------------------------
+    "usage_autoping": (
+        "Использование: /autoping [минуты|off|text &lt;текст&gt;|text default] "
+        "(без аргументов — показать статус)"
+    ),
+    "err_autoping_fetch_failed": "Не удалось получить настройки автопинга: {error}",
+    "err_autoping_change_failed": "Не удалось изменить: {error}",
+    "autoping_status_off": "🏓 Автопинг выключен",
+    "autoping_status_on": "🏓 Автопинг включён: каждые {interval} мин, текст: «{text}»",
+    "autoping_no_channel": (
+        "На устройстве нет канала «Ping» (PING_CHANNEL в .env) — "
+        "автопинг включён, но слать пока некуда"
+    ),
+    "autoping_text_set": "✓ Текст автопинга: «{text}»",
+    "autoping_disabled": "✓ Автопинг выключен",
+    "autoping_interval_set": "✓ Автопинг: каждые {minutes} мин",
+
     # -- mesh_chat.py: /settings ---------------------------------------------------------------------
     "err_settings_fetch_failed": "Не удалось получить настройки: {error}",
     "hdr_settings": "─── Настройки узла ───",
@@ -312,6 +330,7 @@ _RU: dict[str, object] = {
         "  /updatenames         подтянуть имена узлов с OneMesh (и так — раз в 30 мин фоном)",
         "  /settings [параметр значение]  настройки локального узла (см. SETTINGS.ru.md)",
         "  /botping 0|1         бот в канале Ping: отвечает хопами до отправителя",
+        "  /autoping [мин|off|text текст]  канарейка связи (частота/текст/выкл, см. /autoping)",
         "  /reboot             перезагрузить узел (требует /reboot confirm)",
         "  /reconnect [host]    принудительно переподключиться (можно сменить IP/host для wifi)",
         "  /clear               очистить экран",
@@ -396,6 +415,7 @@ _EN: dict[str, object] = {
     "err_reconnect_wifi_only": (
         "changing the address is only supported for MESH_CONN_TYPE=wifi (current: {conn_type})"
     ),
+    "err_autoping_bad_interval": "expected a non-negative integer number of minutes",
 
     "hops_forms": ("hop", "hops"),
     "botping_reply": "{marker} {hops_phrase} from you",
@@ -551,6 +571,22 @@ _EN: dict[str, object] = {
         "the bot is on, but has nothing to react to yet"
     ),
 
+    "usage_autoping": (
+        "Usage: /autoping [minutes|off|text &lt;text&gt;|text default] "
+        "(no arguments — show status)"
+    ),
+    "err_autoping_fetch_failed": "Failed to fetch autoping settings: {error}",
+    "err_autoping_change_failed": "Failed to change: {error}",
+    "autoping_status_off": "🏓 Autoping is off",
+    "autoping_status_on": "🏓 Autoping is on: every {interval} min, text: «{text}»",
+    "autoping_no_channel": (
+        "The device has no «Ping» channel (PING_CHANNEL in .env) — "
+        "autoping is on, but has nowhere to send yet"
+    ),
+    "autoping_text_set": "✓ Autoping text: «{text}»",
+    "autoping_disabled": "✓ Autoping turned off",
+    "autoping_interval_set": "✓ Autoping: every {minutes} min",
+
     "err_settings_fetch_failed": "Failed to fetch settings: {error}",
     "hdr_settings": "─── Node settings ───",
     "settings_change_hint": "Change: /settings &lt;key&gt; &lt;value&gt;. Details — {doc}",
@@ -606,6 +642,7 @@ _EN: dict[str, object] = {
         "  /updatenames         pull node names from OneMesh (also runs every 30 min)",
         "  /settings [key value]  local node settings (see SETTINGS.md)",
         "  /botping 0|1         bot on the Ping channel: replies with hop count",
+        "  /autoping [min|off|text ...]  link canary (interval/text/off, see /autoping)",
         "  /reboot              reboot the node (requires /reboot confirm)",
         "  /reconnect [host]    force a reconnect (optionally change IP/host for wifi)",
         "  /clear               clear the screen",

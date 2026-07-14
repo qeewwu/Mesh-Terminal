@@ -438,20 +438,37 @@ IPC command → `_set_botping()`, which flips `_botping_enabled` and persists to
 (`BOTPING_ENABLED`) so the setting survives a `mesh_logger.py` restart; loaded once at import via
 the same `parse_env_file(ENV_FILE)` call used for `HOST`/`PING_CHANNEL_NAME`.
 
-### Auto-ping health check
+### Auto-ping health check (`/autoping`)
 
-`_periodic_autoping()` broadcasts `t("autoping_text")` (`"🏓 автопинг: проверка связи"` / `"🏓
-autoping: link check"`, see Interface language above) into `PING_CHANNEL_NAME` every
-`AUTOPING_INTERVAL` (2h), unconditionally — independent of `/botping`'s toggle. It's a liveness
-canary (is the mesh link actually carrying traffic), not the reply-bot, so it isn't gated by
-`_botping_enabled`. Sleeps first (doesn't fire immediately on a logger restart, so a crash-loop
-during a bad deploy doesn't spam the channel), and silently no-ops if the device isn't connected
-or has no channel matching `PING_CHANNEL_NAME` — same reasoning as `_ping_channel_index()`
-returning `None` for the bot. Deliberately minimal for now: collecting/parsing responses into a
-daily stats file (how many nodes answered, their hop counts) was scoped out as needing real
-per-bot response-format parsing (community ping bots reply in inconsistent formats) — this only
-sends the canary; `/stats`-style aggregation of who responds can be layered on later by reading
-`logs/` for replies to the autoping's own packet id, without changing this function.
+`_periodic_autoping()` broadcasts a text (default `t("autoping_text")` — `"🏓 автопинг: проверка
+связи"` / `"🏓 autoping: link check"`, see Interface language above) into `PING_CHANNEL_NAME` on a
+configurable interval, independent of `/botping`'s toggle. It's a liveness canary (is the mesh
+link actually carrying traffic), not the reply-bot, so it isn't gated by `_botping_enabled`.
+Silently no-ops if the device isn't connected or has no channel matching `PING_CHANNEL_NAME` —
+same reasoning as `_ping_channel_index()` returning `None` for the bot.
+
+Interval (`_autoping_interval_min`, minutes; `0` disables it) and text override
+(`_autoping_text_override`; empty means use the localized default) are runtime-mutable, exposed
+via `/autoping [minutes|off|text ...|text default]` in `mesh_chat.py` → the `"autoping"` IPC
+command (`action: "get"|"set_interval"|"set_text"`) → `_set_autoping_interval()`/
+`_set_autoping_text()`, which persist to `.env`'s `AUTOPING_INTERVAL_MIN`/`AUTOPING_TEXT` the same
+way `_set_botping()` does for `BOTPING_ENABLED`, and loaded once at import the same way too. `0`
+minutes was chosen over a separate on/off flag — one field, no risk of the two disagreeing.
+
+The wait between broadcasts uses the same interrupt-a-sleep idiom as `_hard_reconnect_event` (see
+Manual reconnect above): `_autoping_changed_event` is an `asyncio.Event` that `_periodic_autoping`
+awaits with `asyncio.wait_for(..., timeout=interval_min * 60)`, and both setters call it via
+`_notify_autoping_changed()`. This means a config change while asleep restarts the wait immediately
+with the new settings — the next canary fires one fresh interval from the *change*, not whenever
+the *old* interval happened to be about to expire, which could otherwise be up to 2 hours away by
+default. When disabled (`interval_min <= 0`), the loop `await`s the event with no timeout at all
+instead of polling — enabling it later wakes it immediately, no up-to-a-minute lag.
+
+Deliberately minimal for now: collecting/parsing responses into a daily stats file (how many nodes
+answered, their hop counts) was scoped out as needing real per-bot response-format parsing
+(community ping bots reply in inconsistent formats) — this only sends the canary; `/stats`-style
+aggregation of who responds can be layered on later by reading `logs/` for replies to the
+autoping's own packet id, without changing this function.
 
 ### Rebooting the node (`/reboot`)
 

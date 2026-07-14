@@ -284,8 +284,8 @@ def _resolve_display_name(long_name: str, short_name: str) -> tuple[str, str]:
 
 COMMANDS = ["/nodes", "/who", "/dm", "/reply", "/react", "/ch", "/send", "/search",
             "/last", "/trace", "/ping", "/pos", "/stats", "/mute", "/unmute",
-            "/updatenames", "/settings", "/botping", "/reboot", "/reconnect",
-            "/clear", "/help"]
+            "/updatenames", "/settings", "/botping", "/autoping", "/reboot",
+            "/reconnect", "/clear", "/help"]
 
 
 class MeshCompleter(Completer):
@@ -1518,6 +1518,72 @@ async def _cmd_botping(args: str) -> None:
         print_formatted_text(HTML(f"<ansiyellow>{t('botping_no_channel')}</ansiyellow>"))
 
 
+async def _cmd_autoping(args: str) -> None:
+    """Configures the liveness-canary broadcast into the Ping channel (lives
+    in mesh_logger.py's _periodic_autoping, independent of /botping — see
+    CLAUDE.md). Interval (minutes, 0 = off) and custom text both persist to
+    .env (AUTOPING_INTERVAL_MIN/AUTOPING_TEXT) and take effect immediately,
+    not just on the next already-scheduled tick."""
+    parts = args.strip().split(None, 1)
+
+    if not parts:
+        resp = await _client.request("autoping", action="get")
+        if not resp.get("ok"):
+            print_formatted_text(HTML(
+                f"<ansired>{t('err_autoping_fetch_failed', error=_safe(resp.get('error', '')))}</ansired>"
+            ))
+            return
+        interval = resp.get("interval_min", 0)
+        if interval <= 0:
+            print_formatted_text(HTML(f"<ansiyellow>{t('autoping_status_off')}</ansiyellow>"))
+        else:
+            print_formatted_text(HTML(
+                f"<ansiwhite>{t('autoping_status_on', interval=interval, text=_safe(resp.get('text', '')))}</ansiwhite>"
+            ))
+            if not resp.get("channel_found", True):
+                print_formatted_text(HTML(f"<ansiyellow>{t('autoping_no_channel')}</ansiyellow>"))
+        return
+
+    if parts[0].lower() == "text":
+        text = parts[1] if len(parts) > 1 else ""
+        if text.strip().lower() == "default":
+            text = ""
+        resp = await _client.request("autoping", action="set_text", text=text)
+        if not resp.get("ok"):
+            print_formatted_text(HTML(
+                f"<ansired>{t('err_autoping_change_failed', error=_safe(resp.get('error', '')))}</ansired>"
+            ))
+            return
+        print_formatted_text(HTML(
+            f"<ansigreen>{t('autoping_text_set', text=_safe(resp.get('text', '')))}</ansigreen>"
+        ))
+        return
+
+    if parts[0].lower() == "off":
+        minutes = 0
+    else:
+        try:
+            minutes = int(parts[0])
+            if minutes < 0:
+                raise ValueError
+        except ValueError:
+            print_formatted_text(HTML(f"<ansiyellow>{t('usage_autoping')}</ansiyellow>"))
+            return
+
+    resp = await _client.request("autoping", action="set_interval", minutes=minutes)
+    if not resp.get("ok"):
+        print_formatted_text(HTML(
+            f"<ansired>{t('err_autoping_change_failed', error=_safe(resp.get('error', '')))}</ansired>"
+        ))
+        return
+    if minutes <= 0:
+        print_formatted_text(HTML(f"<ansigreen>{t('autoping_disabled')}</ansigreen>"))
+    else:
+        print_formatted_text(HTML(f"<ansigreen>{t('autoping_interval_set', minutes=minutes)}</ansigreen>"))
+        if not resp.get("channel_found", True):
+            print_formatted_text(HTML(f"<ansiyellow>{t('autoping_no_channel')}</ansiyellow>"))
+
+
 async def _cmd_settings(args: str) -> None:
     """Список/изменение параметров ЛОКАЛЬНОГО узла (см. SETTINGS.md для полного
     описания каждого параметра и почему часть конфига устройства сюда
@@ -1638,6 +1704,7 @@ async def _handle_command(text: str) -> None:
     elif cmd == "updatenames": await _cmd_updatenames()
     elif cmd == "settings":    await _cmd_settings(args)
     elif cmd == "botping":     await _cmd_botping(args)
+    elif cmd == "autoping":    await _cmd_autoping(args)
     elif cmd == "reboot":     await _cmd_reboot(args)
     elif cmd == "reconnect":   await _cmd_reconnect(args)
     elif cmd == "clear":       _cmd_clear()
