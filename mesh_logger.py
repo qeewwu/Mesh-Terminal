@@ -735,14 +735,16 @@ async def _send_json(writer: asyncio.StreamWriter, obj: dict, lock: asyncio.Lock
 
 
 def _nodes_payload() -> list[dict]:
-    if not _interface or not _interface.nodes:
+    if not _interface:
         return []
     now_ts = datetime.datetime.now().timestamp()
     out = []
+    seen_ids = set()
     # snapshot: the dict is mutated by the meshtastic thread as nodes appear
     for nid, node in list(_interface.nodes.items()):
         u = node.get("user", {})
         num = nid if isinstance(nid, int) else int(str(nid).lstrip("!"), 16)
+        seen_ids.add(num)
         metrics = node.get("deviceMetrics", {})
         last_heard = node.get("lastHeard")
         # _fixupPosition() (mesh_interface.py) already converts latitudeI/longitudeI
@@ -761,6 +763,28 @@ def _nodes_payload() -> list[dict]:
             "lon": position.get("longitude"),
             "alt": position.get("altitude"),
         })
+    # nodes known only via relayed messages, never a NodeInfo — absent from
+    # _interface.nodes entirely, but with a real name already resolved via
+    # OneMesh (same class as _unresolved_ids). Without this, a sender visible
+    # by name in chat could still never show up in /nodes or /who <name> at
+    # all. No telemetry to offer for these — has_user False so the client
+    # falls back to its own name cache the same way it already does for a
+    # `!hex (???)` sender resolved after the fact.
+    for num in _onemesh_names:
+        if num not in seen_ids:
+            out.append({
+                "node_id": num,
+                "long_name": None,
+                "short_name": None,
+                "has_user": False,
+                "battery": None,
+                "snr": None,
+                "hops_away": None,
+                "seconds_ago": None,
+                "lat": None,
+                "lon": None,
+                "alt": None,
+            })
     return out
 
 

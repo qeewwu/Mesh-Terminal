@@ -573,6 +573,17 @@ breaking `/who` and the "is this my own message" color check in `_render_line()`
 device came back. `node_id` was added to the broadcast payload specifically to make this possible
 without an extra IPC round trip.
 
+### `/nodes` includes relay-only senders too
+
+`_nodes_payload()` used to be built purely from `_interface.nodes` — so a sender the device only
+ever knows via relayed text (no NodeInfo, the same class `_unresolved_ids` tracks — see Node name
+resolution above) never appeared in `/nodes` or `/who <name>` at all, even once its name was
+resolved via OneMesh and already visible in the chat log. Fixed by appending an entry for every id
+in `_onemesh_names` not already covered by the `_interface.nodes` scan — no telemetry to offer for
+these (`battery`/`snr`/`hops_away`/`seconds_ago`/position all `None`), and `has_user: False` so the
+client falls back to its own name cache exactly like it already does for any other OneMesh-resolved
+`!hex (???)` sender.
+
 ### `/nodes` sorting and online status
 
 `mesh_logger.py`'s `_nodes_payload()` includes `hops_away` (from the protobuf `NodeInfo.hops_away`,
