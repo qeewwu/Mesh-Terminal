@@ -38,6 +38,7 @@ from mesh_common import (
     CONN_TYPE,
     ENV_FILE,
     HOST,
+    IPC_LINE_LIMIT,
     LOG_DIR,
     ONEMESH_CACHE_FILE,
     SOCKET_PATH,
@@ -360,7 +361,15 @@ def on_receive(packet, interface):
         if decoded.get("portnum") != "TEXT_MESSAGE_APP":
             return
 
-        text      = decoded.get("text", "")
+        if "text" not in decoded:
+            # meshtastic's _onTextReceive omits the "text" key entirely on
+            # invalid utf-8 in the payload (logs "Malformatted utf8..." itself)
+            # — an absent key is not the same as a real empty-string message.
+            print("[warn] on_receive: dropping text message with invalid utf-8 payload",
+                  file=sys.stderr)
+            return
+
+        text      = decoded["text"]
         from_id   = packet.get("from", 0)
         to_id     = packet.get("to", BROADCAST_ADDR)
         packet_id = packet.get("id", 0)
@@ -1207,7 +1216,11 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                     emoji = bool(req.get("emoji"))
 
                     if not _interface:
-                        if len(_outbox) >= OUTBOX_MAX:
+                        text_bytes = len(text.encode("utf-8"))
+                        if text_bytes > MAX_PAYLOAD_BYTES:
+                            resp["error"] = t("err_message_too_long", bytes=text_bytes,
+                                              max=MAX_PAYLOAD_BYTES)
+                        elif len(_outbox) >= OUTBOX_MAX:
                             resp["error"] = t("err_outbox_full")
                         else:
                             _outbox.append({"cmd": cmd, "text": text,
@@ -1379,7 +1392,8 @@ async def main() -> None:
     reconnect_task = asyncio.create_task(_reconnect_loop())
     watchdog_task = asyncio.create_task(_watchdog())
     onemesh_task = asyncio.create_task(_periodic_onemesh_update())
-    server = await asyncio.start_unix_server(_handle_client, path=str(SOCKET_PATH))
+    server = await asyncio.start_unix_server(
+        _handle_client, path=str(SOCKET_PATH), limit=IPC_LINE_LIMIT)
     os.chmod(SOCKET_PATH, 0o600)  # only this user may send messages via IPC
     print(f"[info] listening on {SOCKET_PATH}")
     # ready as far as systemd is concerned even if the device itself isn't

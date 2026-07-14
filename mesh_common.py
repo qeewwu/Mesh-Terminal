@@ -79,6 +79,11 @@ if LANG not in ("ru", "en"):
     LANG = "ru"
 LOG_DIR = BASE_DIR / "logs"
 SOCKET_PATH = Path("/tmp/mesh_chat.sock")
+# asyncio's StreamReader defaults to a 64 KiB readline() limit — too small for
+# a "nodes" IPC response on a large mesh (one JSON line listing every known
+# node). Applied to both open_unix_connection (client) and start_unix_server
+# (logger) so neither side can desync the other's line framing.
+IPC_LINE_LIMIT = 8 * 1024 * 1024
 BROADCAST_ADDR = 0xFFFFFFFF
 QUOTE_MAX = 60
 ACK_TIMEOUT_SECONDS = 60  # how long to wait for a mesh ACK/NAK before reporting "unknown"

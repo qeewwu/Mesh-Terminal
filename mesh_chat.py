@@ -20,6 +20,7 @@ from prompt_toolkit.shortcuts import clear as pt_clear
 from mesh_common import (
     ACK_TIMEOUT_SECONDS,
     ENV_FILE,
+    IPC_LINE_LIMIT,
     ONEMESH_CACHE_FILE,
     SOCKET_PATH,
     bearing_deg,
@@ -336,7 +337,8 @@ class IPCClient:
         self.whoami_id: int | None = None
 
     async def connect(self) -> None:
-        self._reader, self._writer = await asyncio.open_unix_connection(str(SOCKET_PATH))
+        self._reader, self._writer = await asyncio.open_unix_connection(
+            str(SOCKET_PATH), limit=IPC_LINE_LIMIT)
         self.connected = True
         self._reader_task = asyncio.create_task(self._read_loop())
 
@@ -746,7 +748,11 @@ async def _cmd_nodes(args: str = "") -> None:
         return
 
     resp = await _client.request("nodes")
-    if not resp.get("ok") or not resp.get("nodes"):
+    if not resp.get("ok"):
+        print_formatted_text(HTML(
+            f"<ansiyellow>{_safe(resp.get('error') or t('err_no_node_data'))}</ansiyellow>"))
+        return
+    if not resp.get("nodes"):
         print_formatted_text(HTML(f"<ansiyellow>{t('err_no_node_data')}</ansiyellow>"))
         return
 
