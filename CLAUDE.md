@@ -179,9 +179,9 @@ shapes flow back to a client:
   lock in `drain()` forever, stalling broadcasts to everyone else — instead it gets disconnected.
   For received messages the event also carries `packet_id`, `from_id`, `is_dm`, `channel_index`
   — the client tracks the latest one as the `/reply` target. There is no polling — the logger
-  pushes live updates directly, so `mesh_chat.py` only reads history once at startup (last 50
-  messages, walking `logs/` files newest-first via `list_log_files()`) and then relies entirely
-  on pushed events.
+  pushes live updates directly, so `mesh_chat.py` only reads history once at startup (`HISTORY_SIZE`
+  messages, currently 100 — see Channels below — walking `logs/` files newest-first via
+  `list_log_files()`) and then relies entirely on pushed events.
 - The `send`/`dm` commands accept an optional `reply_id` (a packet id) which is passed to
   `sendText(replyId=...)` — requires a meshtastic lib version whose `sendText` has that
   parameter; the logger checks via `inspect.signature` and returns a clear error otherwise.
@@ -741,6 +741,14 @@ and `/updatenames` reported "nothing to update" even while they were visibly unr
 falls back to `!hex (???)` for into `_unresolved_ids`, and having `_run_onemesh_update()` treat that
 set as extra targets alongside the `_interface.nodes`-without-`user` case (see Node name resolution
 above).
+
+### `/ch` showed too little history after switching
+
+`/ch <channel>` used to re-print only the last 10 messages of that channel (`CH_SWITCH_HISTORY`),
+far less than the 100 shown at client startup (`HISTORY_SIZE`) — jarring when switching into a
+channel you haven't seen yet this session. There was no reason for the two to differ, so
+`CH_SWITCH_HISTORY` was removed and `_print_initial_history()` is now called with its default
+(`HISTORY_SIZE`) in both places.
 
 ### `_store_msg` dict/deque desync
 

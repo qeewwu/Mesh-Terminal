@@ -34,7 +34,6 @@ from mesh_i18n import plural, t, t_list
 
 NAME_CACHE_FILE = BASE_DIR / "node_names_cache.json"
 HISTORY_SIZE = 100
-CH_SWITCH_HISTORY = 10   # сколько истории показать после /ch
 SEARCH_LIMIT = 20
 LAST_LIMIT = 20
 ONLINE_THRESHOLD_SECONDS = 15 * 60  # узел считается «онлайн», если был на связи недавнее этого
@@ -1249,7 +1248,7 @@ async def _cmd_ch(args: str) -> None:
     print_formatted_text(HTML(
         f"<b><ansicyan>{t('channel_banner', name=_safe(_channel_filter))}</ansicyan></b>"
     ))
-    _print_initial_history(CH_SWITCH_HISTORY)
+    _print_initial_history()
 
 
 async def _cmd_send(args: str) -> None:
