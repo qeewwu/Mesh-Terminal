@@ -207,6 +207,9 @@ shapes flow back to a client:
   count, and the generic "✓ Доставлено" line show it too.
 - `cmd == "settings"` (`action: "list"|"set"`) reads/writes the local node's own device
   configuration — see "Local node settings" below.
+- Both `IPCClient.connect()` (`open_unix_connection`) and the logger's `start_unix_server()` pass
+  `limit=IPC_LINE_LIMIT` (`mesh_common.py`, 8 MiB) instead of accepting asyncio's 64 KiB default —
+  see "IPC readline limit broke `/nodes` on large meshes" under Fixed bugs below.
 
 ### Reply/quote handling
 
@@ -761,6 +764,50 @@ matching second dict entry — when the older copy of that duplicate reached the
 evicted, it deleted the (still fresh) record out from under the newer copy, causing premature
 loss of quote-line data well before `STORE_SIZE` messages had actually passed. Fixed: an update
 to an already-tracked key now skips the `_store_order.append()` entirely.
+
+### IPC readline limit broke `/nodes` on large meshes
+
+`IPCClient.connect()` called `asyncio.open_unix_connection()` with no `limit=`, so its
+`StreamReader` used the default 64 KiB cap on a single `readline()`. The `nodes` response is one
+JSON line listing every known node — on a real ~369-node mesh that line ran to ~83 KB, already
+over the limit. `reader.readline()` in `_read_loop()` then raised `asyncio.LimitOverrunError`,
+which fell through the narrow `except Exception` around `json.loads` into the outer one wrapping
+the whole loop — tearing down the *entire* IPC connection, not just failing the one request:
+`finally` set `connected = False`, resolved every in-flight request as `{"ok": False, ...}`, and
+fired `on_disconnect()`. `/reconnect` looked like a fix because it resets the *device's* node
+table, so the next `/nodes` response was briefly small enough — coincidence, not a cure. Found by
+Claude Cowork, reproduced live against the production server (confirmed by the client itself
+disconnecting mid-`/nodes`, twice, before `/reconnect`). Fixed by passing a much larger shared
+`IPC_LINE_LIMIT` (`mesh_common.py`) to both `open_unix_connection` and `start_unix_server` — the
+logger's own `_handle_client` reads client requests the same way and was equally exposed, even
+though incoming requests are small enough in practice that it wasn't observed failing.
+Separately, `_cmd_nodes` printed the same "Нет данных об узлах" for every `ok: False`, so this
+failure mode had no distinguishing error message on screen; it now surfaces `resp["error"]`.
+
+### Offline send/dm outbox skipped the oversized-message check
+
+`_send_message()` (used while the device is connected) rejects a message over
+`MAX_PAYLOAD_BYTES` (233 bytes, `mesh_pb2.Constants.DATA_PAYLOAD_LEN`) before it ever reaches the
+link. But `send`/`dm` while the device is *disconnected* go through a separate branch in
+`_handle_client` that appends straight to `_outbox` with no size check at all, replying
+`{"ok": true, "queued": true}`. The oversized message then sat in the outbox until the device
+reconnected and `_flush_outbox()` tried and failed to send it — the user found out possibly hours
+later, and only via a delivery-failure event instead of an immediate error. Fixed by adding the
+same `MAX_PAYLOAD_BYTES` check ahead of the `_outbox.append()` in the offline branch.
+
+### Invalid-utf8 text messages logged as empty strings
+
+The meshtastic library's own `_onTextReceive` omits the `"text"` key from `decoded` entirely
+(and just logs "Malformatted utf8 in text message: ...") when a packet's payload isn't valid
+utf-8. `on_receive()` read it as `decoded.get("text", "")`, which can't tell "no key" apart from
+"really is an empty string" — either way it wrote and broadcast a normal-looking message with
+empty text, a permanent, meaningless line in the log for every affected packet. Fixed by checking
+`"text" not in decoded` first and dropping the packet (with a `[warn]` line to stderr) instead of
+falling through with an empty string.
+
+All three found by Claude Cowork during a testing session (2026-07-15); verified against this
+codebase and the first one reproduced live over Tailscale/SSH against the production server
+before fixing.
 
 ### Miscellaneous reliability
 
