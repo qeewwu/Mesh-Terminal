@@ -76,6 +76,13 @@ AUTOPING_INTERVAL = 2 * 60 * 60  # health-check broadcast into the Ping channel
 _interface = None
 _loop: asyncio.AbstractEventLoop | None = None
 _reconnect_event: asyncio.Event | None = None
+# manual "/reconnect" override — see _trigger_hard_reconnect(). Distinct from
+# _reconnect_event: that one just wakes the reconnect loop up when it's idle;
+# this one additionally interrupts an in-progress backoff sleep, so a manual
+# reconnect doesn't have to wait out whatever delay an earlier automatic
+# retry happened to be sitting in.
+_hard_reconnect_event: asyncio.Event | None = None
+_hard_reconnect_host: str | None = None  # MESH_HOST override for wifi, sticky once set
 _last_rx: float = 0.0  # time.monotonic() of the last packet of any kind
 # /botping toggle (mesh_chat.py "botping" IPC cmd) — persisted to .env
 # (BOTPING_ENABLED) so it survives a logger restart; loaded once at import,
@@ -479,24 +486,32 @@ def _open_interface():
     """Construct the interface for the configured MESH_CONN_TYPE. USB/BLE
     targets are optional (None) — the meshtastic lib then auto-detects the
     sole attached serial device / does a BLE scan and connects if exactly one
-    Meshtastic device is found."""
+    Meshtastic device is found. `_hard_reconnect_host`, when set, overrides
+    the configured MESH_HOST for wifi — see _trigger_hard_reconnect()."""
     if CONN_TYPE == "usb":
         return meshtastic.serial_interface.SerialInterface(devPath=USB_PORT)
     if CONN_TYPE == "ble":
         return meshtastic.ble_interface.BLEInterface(address=BLE_ADDRESS)
-    return meshtastic.tcp_interface.TCPInterface(hostname=HOST)
+    return meshtastic.tcp_interface.TCPInterface(hostname=_hard_reconnect_host or HOST)
 
 
 def _do_connect() -> bool:
     global _interface, _last_rx
+    target = _hard_reconnect_host if (CONN_TYPE == "wifi" and _hard_reconnect_host) else CONN_TARGET
     try:
         _interface = _open_interface()
         _subscribe()
         _last_rx = time.monotonic()
         my_id = _interface.myInfo.my_node_num
         ln, sn = _node_names(my_id)
-        print(f"[info] connected via {CONN_TYPE} to {CONN_TARGET} as {ln} ({sn})")
+        print(f"[info] connected via {CONN_TYPE} to {target} as {ln} ({sn})")
         _broadcast_device_status("connected", long_name=ln, short_name=sn)
+        if CONN_TYPE == "wifi" and _hard_reconnect_host:
+            # sticky for the rest of this process's life either way; persisting
+            # to .env means a future restart also starts from the new address,
+            # not the stale one — same precedent as /who self-updating identity
+            with contextlib.suppress(Exception):
+                update_env_file(ENV_FILE, {"MESH_HOST": _hard_reconnect_host})
         if _loop and _outbox:
             _loop.call_soon_threadsafe(lambda: _loop.create_task(_flush_outbox()))
         return True
@@ -512,9 +527,24 @@ async def _reconnect_loop() -> None:
         await _reconnect_event.wait()
         _reconnect_event.clear()
         while True:
-            delay = delays[min(attempt, len(delays) - 1)]
-            print(f"[info] reconnecting in {delay}s (attempt {attempt + 1})")
-            await asyncio.sleep(delay)
+            if _hard_reconnect_event.is_set():
+                # manual override: skip the backoff wait entirely instead of
+                # just shortening it, so /reconnect feels immediate even if
+                # an unrelated automatic retry left us mid-60s-sleep
+                _hard_reconnect_event.clear()
+                delay = 0
+            else:
+                delay = delays[min(attempt, len(delays) - 1)]
+            if delay:
+                print(f"[info] reconnecting in {delay}s (attempt {attempt + 1})")
+                try:
+                    # a hard-reconnect trigger arriving *during* this sleep
+                    # wakes it early instead of waiting out the rest of delay
+                    await asyncio.wait_for(_hard_reconnect_event.wait(), timeout=delay)
+                    _hard_reconnect_event.clear()
+                    print("[info] hard reconnect requested, retrying now")
+                except asyncio.TimeoutError:
+                    pass
             _unsubscribe()
             with contextlib.suppress(Exception):
                 if _interface:
@@ -528,9 +558,25 @@ async def _reconnect_loop() -> None:
                 # соединению — без сброса свежий коннект тут же порвался бы.
                 # Пропущенный реальный обрыв в этом окне подстрахует watchdog.
                 _reconnect_event.clear()
+                _hard_reconnect_event.clear()
                 attempt = 0
                 break
             attempt += 1
+
+
+def _trigger_hard_reconnect(host: str | None = None) -> None:
+    """Forces an immediate reconnect attempt regardless of current state —
+    even if _interface looks fine (nothing has told _reconnect_loop anything
+    is wrong yet), or the loop is already mid-backoff-sleep for an earlier,
+    unrelated drop. Setting _hard_reconnect_event interrupts that sleep (see
+    _reconnect_loop above); setting _reconnect_event too covers the case
+    where the loop is currently idle, waiting on it."""
+    global _hard_reconnect_host
+    if host:
+        _hard_reconnect_host = host
+    if _loop:
+        _loop.call_soon_threadsafe(_hard_reconnect_event.set)
+        _loop.call_soon_threadsafe(_reconnect_event.set)
 
 
 def _sd_notify(message: str) -> None:
@@ -1195,6 +1241,17 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                         except Exception as e:
                             resp["error"] = t("err_reboot_failed", error=e)
 
+                elif cmd == "reconnect":
+                    # deliberately not gated behind `if not _interface` — the
+                    # whole point is to force a fresh connection regardless of
+                    # whether the logger currently thinks it's already fine
+                    host = (req.get("host") or "").strip() or None
+                    if host and CONN_TYPE != "wifi":
+                        resp["error"] = t("err_reconnect_wifi_only", conn_type=CONN_TYPE)
+                    else:
+                        _trigger_hard_reconnect(host)
+                        resp = {"req_id": req_id, "ok": True, "host": host}
+
                 elif cmd == "updatenames":
                     if not _interface:
                         resp["error"] = "not connected"
@@ -1241,9 +1298,10 @@ def _prepare_socket_path() -> None:
 
 
 async def main() -> None:
-    global _loop, _reconnect_event
+    global _loop, _reconnect_event, _hard_reconnect_event
     _loop = asyncio.get_running_loop()
     _reconnect_event = asyncio.Event()
+    _hard_reconnect_event = asyncio.Event()
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     _load_onemesh_cache()

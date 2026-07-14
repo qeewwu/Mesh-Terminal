@@ -284,7 +284,8 @@ def _resolve_display_name(long_name: str, short_name: str) -> tuple[str, str]:
 
 COMMANDS = ["/nodes", "/who", "/dm", "/reply", "/react", "/ch", "/send", "/search",
             "/last", "/trace", "/ping", "/pos", "/stats", "/mute", "/unmute",
-            "/updatenames", "/settings", "/botping", "/reboot", "/clear", "/help"]
+            "/updatenames", "/settings", "/botping", "/reboot", "/reconnect",
+            "/clear", "/help"]
 
 
 class MeshCompleter(Completer):
@@ -1573,6 +1574,26 @@ async def _cmd_reboot(args: str) -> None:
     ))
 
 
+async def _cmd_reconnect(args: str) -> None:
+    """Forces the logger to redial the device right now, regardless of
+    whether it currently thinks it's connected or is already mid-backoff
+    after an earlier drop — see _trigger_hard_reconnect() in mesh_logger.py.
+    Fire-and-forget like /reboot: the actual outcome shows up via the
+    existing "device" event (device_connected/device_disconnected), not a
+    blocking IPC response, since a real reconnect can take several seconds."""
+    host = args.strip() or None
+    resp = await _client.request("reconnect", host=host)
+    if not resp.get("ok"):
+        print_formatted_text(HTML(
+            f"<ansired>{t('err_reconnect_failed', error=_safe(resp.get('error', '')))}</ansired>"
+        ))
+        return
+    if host:
+        print_formatted_text(HTML(f"<ansiyellow>{t('reconnect_triggered_host', host=_safe(host))}</ansiyellow>"))
+    else:
+        print_formatted_text(HTML(f"<ansiyellow>{t('reconnect_triggered')}</ansiyellow>"))
+
+
 def _cmd_help() -> None:
     for line in t_list("help_lines"):
         print_formatted_text(HTML(f"<ansiwhite>{line}</ansiwhite>"))
@@ -1602,6 +1623,7 @@ async def _handle_command(text: str) -> None:
     elif cmd == "settings":    await _cmd_settings(args)
     elif cmd == "botping":     await _cmd_botping(args)
     elif cmd == "reboot":     await _cmd_reboot(args)
+    elif cmd == "reconnect":   await _cmd_reconnect(args)
     elif cmd == "clear":       _cmd_clear()
     elif cmd == "help":        _cmd_help()
     else:

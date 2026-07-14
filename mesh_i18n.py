@@ -72,6 +72,9 @@ _RU: dict[str, object] = {
     "err_apply_failed": "не удалось применить: {error}",
     "err_reboot_failed": "не удалось перезагрузить: {error}",
     "err_botping_value": "ожидается value: '0' или '1'",
+    "err_reconnect_wifi_only": (
+        "смена адреса поддерживается только при MESH_CONN_TYPE=wifi (сейчас: {conn_type})"
+    ),
 
     # -- mesh_logger.py: over-the-air texts + shared plural forms -------------
     "hops_forms": ("хоп", "хопа", "хопов"),
@@ -280,6 +283,10 @@ _RU: dict[str, object] = {
         "<b>/reboot confirm</b> — окно {window}с"
     ),
 
+    "err_reconnect_failed": "Не удалось запустить переподключение: {error}",
+    "reconnect_triggered": "🔌 Принудительное переподключение к устройству запущено",
+    "reconnect_triggered_host": "🔌 Переподключаюсь к {host}...",
+
     # -- mesh_chat.py: /help ------------------------------------------------------------------------------
     "help_lines": [
         "─── Команды ───────────────────────────────────────────────",
@@ -305,6 +312,7 @@ _RU: dict[str, object] = {
         "  /settings [параметр значение]  настройки локального узла (см. SETTINGS.ru.md)",
         "  /botping 0|1         бот в канале Ping: отвечает хопами до отправителя",
         "  /reboot             перезагрузить узел (требует /reboot confirm)",
+        "  /reconnect [host]    принудительно переподключиться (можно сменить IP/host для wifi)",
         "  /clear               очистить экран",
         "  /help                эта справка",
         "  Tab                  автодополнение команд, имён узлов и каналов",
@@ -384,6 +392,9 @@ _EN: dict[str, object] = {
     "err_apply_failed": "failed to apply: {error}",
     "err_reboot_failed": "failed to reboot: {error}",
     "err_botping_value": "expected value: '0' or '1'",
+    "err_reconnect_wifi_only": (
+        "changing the address is only supported for MESH_CONN_TYPE=wifi (current: {conn_type})"
+    ),
 
     "hops_forms": ("hop", "hops"),
     "botping_reply": "{marker} {hops_phrase} from you",
@@ -566,6 +577,10 @@ _EN: dict[str, object] = {
         "<b>/reboot confirm</b> — window: {window}s"
     ),
 
+    "err_reconnect_failed": "Failed to trigger reconnect: {error}",
+    "reconnect_triggered": "🔌 Forcing a reconnect to the device",
+    "reconnect_triggered_host": "🔌 Reconnecting to {host}...",
+
     "help_lines": [
         "─── Commands ──────────────────────────────────────────────",
         "  /nodes [online|names|hops]  list visible nodes (sort mode, default online)",
@@ -590,6 +605,7 @@ _EN: dict[str, object] = {
         "  /settings [key value]  local node settings (see SETTINGS.md)",
         "  /botping 0|1         bot on the Ping channel: replies with hop count",
         "  /reboot              reboot the node (requires /reboot confirm)",
+        "  /reconnect [host]    force a reconnect (optionally change IP/host for wifi)",
         "  /clear               clear the screen",
         "  /help                this help",
         "  Tab                  autocomplete commands, node names, and channels",

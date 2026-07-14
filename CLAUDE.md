@@ -467,6 +467,43 @@ rather than a y/n prompt so the handler doesn't need access to the `PromptSessio
 in `main()`. The reboot drops the TCP connection like any other disconnect — the logger's normal
 reconnect loop (`on_connection_lost` → `_reconnect_loop`) picks it back up with no special-casing.
 
+### Manual reconnect (`/reconnect`)
+
+The automatic reconnect logic above (connection.lost → `_reconnect_loop`, plus the silence
+watchdog) only ever triggers itself — there was no way for a user to say "reconnect now" from
+`mesh_chat.py`. `/reconnect [host]` closes that gap: it must work **regardless of what the logger
+currently believes its own state is** — connected-and-fine, or already mid-backoff for an earlier,
+unrelated drop — and optionally redirect the connection to a different address (a device's DHCP
+lease changing is the main reason to want this).
+
+The implementation deliberately does *not* spawn a second, parallel connect attempt alongside
+whatever `_reconnect_loop` might already be doing — two coroutines racing to assign `_interface`
+would be a real bug. Instead, `_trigger_hard_reconnect(host)` signals the *same* loop task:
+
+- `_hard_reconnect_event` (parallel to `_reconnect_event`) interrupts an in-progress backoff sleep.
+  `_reconnect_loop`'s sleep is `await asyncio.wait_for(_hard_reconnect_event.wait(), timeout=delay)`
+  instead of a bare `asyncio.sleep(delay)`, so setting the event wakes it immediately instead of
+  waiting out however much of the exponential-backoff delay (up to 60s) was left.
+- `_reconnect_event` is set too, covering the case where the loop is currently idle at the outer
+  `await _reconnect_event.wait()` (nothing has told it anything is wrong yet) — without this, a
+  hard reconnect while the logger thinks it's happily connected would do nothing.
+- When `_hard_reconnect_event` is observed set at the top of an inner-loop iteration, `delay` is
+  forced to `0` — a manual reconnect always tries immediately, never waits out backoff at all, not
+  even the first attempt's normal `delays[0]` (3s).
+
+`_hard_reconnect_host` overrides `HOST` in `_open_interface()`'s wifi branch only (checked via
+`CONN_TYPE == "wifi"` in the IPC handler; USB/BLE targets aren't addressed by hostname, so a
+`host` argument there returns `err_reconnect_wifi_only` instead of being silently ignored). It's
+sticky for the rest of the process's life once set, and gets persisted to `.env`'s `MESH_HOST` in
+`_do_connect()` on the first successful connect that used it — same precedent as `/who`
+self-updating `NODE_LONG_NAME` — so a later logger restart also starts from the new address
+instead of the stale one.
+
+The IPC `reconnect` command itself doesn't block waiting for the outcome (a real reconnect can
+take several seconds — DNS + TCP handshake, or a full BLE scan). It fires the trigger and returns
+`{"ok": True}` immediately; `mesh_chat.py` reports the eventual result the same way `/reboot`
+does — via the existing `"device"` event (see below), not a synchronous response.
+
 ### Device connection status (`"device"` event)
 
 Without this, `/reboot confirm` was a UX dead end: the IPC response only confirms the admin

@@ -124,6 +124,16 @@ A deliberately curated set of safe-to-expose settings — WiFi credentials, Blue
 
 If the device drops out — reboots, WiFi hiccups — nothing you send is lost: it queues and goes out the moment the connection is back. The client itself reconnects to the logger the same way if the logger process restarts, and replays whatever you missed.
 
+Reconnection is otherwise automatic, but if it ever needs a nudge — or the device's IP changed — `/reconnect [host]` forces a fresh connection attempt immediately, regardless of what the logger currently thinks its state is:
+
+```
+> /reconnect
+🔌 Forcing a reconnect to the device
+
+> /reconnect 192.168.1.50
+🔌 Reconnecting to 192.168.1.50...
+```
+
 ## Quick start
 
 **Requirements:** Python 3.10+, and a Meshtastic device reachable over WiFi, USB, or Bluetooth LE.
@@ -197,6 +207,7 @@ sudo systemctl restart mesh-logger
 | `/settings [key value]` | View or change local node settings — see [`SETTINGS.md`](SETTINGS.md) |
 | `/botping 0\|1` | Enable/disable the auto-reply ping-bot |
 | `/reboot` / `/reboot confirm` | Reboot the node (two-step confirmation) |
+| `/reconnect [host]` | Force the logger to redial the device now, optionally at a new address (WiFi only) |
 | `/clear` | Clear the screen |
 | `/help` | Command help |
 
