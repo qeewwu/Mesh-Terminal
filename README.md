@@ -32,9 +32,9 @@ This split exists because a Meshtastic device only accepts **one connection at a
 - **Messaging** — all channels at once, or filtered to one; direct messages; real Meshtastic replies with quoted context (`/reply`, visible in official clients too); tapback reactions (`/react`)
 - **History & search** — logs kept per day automatically, full-text search, per-sender history, message statistics
 - **Network diagnostics** — node list with battery/SNR/hop count/online status, position and distance/bearing to a node, traceroute, ping (round-trip time)
-- **Device control** — read and change your node's own settings remotely, reboot it, toggle an auto-reply ping-bot
+- **Device control** — read and change your node's own settings remotely, reboot it
 - **Reliability** — messages sent while the device is offline queue up and go out on reconnect; both the logger↔device and client↔logger links auto-reconnect; delivery is confirmed with ✓/✗
-- **Quality of life** — node names auto-resolved from the public [OneMesh](https://map.onemesh.ru/) map, muting for noisy senders, Tab-completion for commands/names/channels, interface language switchable between Russian and English (`MESH_LANG`)
+- **Quality of life** — node names auto-resolved from the public [OneMesh](https://map.onemesh.ru/) map, device-level ignore for spammy senders, Tab-completion for commands/names/channels, interface language switchable between Russian and English (`MESH_LANG`)
 
 ## Chat
 
@@ -100,7 +100,7 @@ ping [18:44:02] Я (ME): разбудите меня если что | 0
   Самый активный час: 18:00 (612 сообщений)
 ```
 
-`/search` looks across the whole history on disk (respecting the active channel filter, if any); `/last <name>` narrows to one sender's recent messages; `/stats [day|node]` breaks the numbers down by day or by top talkers.
+`/search` looks across the whole history on disk (respecting the active channel filter, if any); `/who <name>` also shows a sender's recent messages alongside their node info; `/stats [day|node]` breaks the numbers down by day or by top talkers — defaults to the Primary channel rather than every channel mixed together.
 
 ## Device settings
 
@@ -199,15 +199,12 @@ sudo systemctl restart mesh-logger
 | `/ch [name\|all]` | Show channels, or switch the session to one (or back to all) |
 | `/send <channel> <text>` | One-off send to a channel without switching your session |
 | `/search <text>` | Full-text search across all log history |
-| `/last <name>` | Most recent messages from one sender (exact name match) |
-| `/stats [day\|node]` | Message statistics: overview, by day, or by top senders |
+| `/stats [day\|node]` | Message statistics: overview, by day, or by top senders (defaults to Primary) |
 | `/trace <name>` | Traceroute — SNR for each hop, both directions |
 | `/ping <name>` | Round-trip time and hop count to a node |
-| `/mute <name>` / `/unmute [name]` | Hide a sender from the live feed (search still finds them) |
+| `/ignore <name>` / `/unignore [name]` | Device-level ignore for a node (no argument — list ignored nodes) |
 | `/updatenames` | Force an immediate node-name resolution sweep via OneMesh |
 | `/settings [key value]` | View or change local node settings — see [`SETTINGS.md`](SETTINGS.md) |
-| `/botping 0\|1` | Enable/disable the auto-reply ping-bot |
-| `/autoping [minutes\|off\|text ...]` | Configure the link-canary broadcast: interval, custom text, or turn it off |
 | `/reboot` / `/reboot confirm` | Reboot the node (two-step confirmation) |
 | `/reconnect [host]` | Force the logger to redial the device now, optionally at a new address (WiFi only) |
 | `/clear` | Clear the screen |
@@ -222,14 +219,10 @@ All settings live in `.env` (copy from `.env.example`); every key is optional an
 | Key | Default | Purpose |
 |---|---|---|
 | `MESH_CONN_TYPE` | `wifi` | `wifi` \| `usb` \| `ble` — how the logger connects to the device |
-| `MESH_LANG` | `ru` | `ru` \| `en` — interface language (messages, bot replies, settings descriptions) |
+| `MESH_LANG` | `ru` | `ru` \| `en` — interface language (messages, settings descriptions) |
 | `MESH_HOST` | `meshtastic.local` | Device address for WiFi |
 | `MESH_USB_PORT` | *(auto-detect)* | Serial port for USB, e.g. `/dev/ttyUSB0` |
 | `MESH_BLE_ADDRESS` | *(auto-detect)* | MAC/UUID for BLE |
-| `PING_CHANNEL` | `Ping` | Channel name the ping-bot and auto-ping canary use |
-| `BOTPING_ENABLED` | `0` | Managed by `/botping 0\|1` — no need to edit by hand |
-| `AUTOPING_INTERVAL_MIN` | `120` | Managed by `/autoping` — minutes between canary broadcasts, `0` disables it |
-| `AUTOPING_TEXT` | *(empty = default)* | Managed by `/autoping text ...` — custom canary text |
 | `NODE_LONG_NAME` / `NODE_SHORT_NAME` / `NODE_ID` | *(empty)* | Self-populated by `/who` — no need to edit by hand |
 
 ## Under the hood
@@ -251,7 +244,6 @@ test_mesh_common.py    tests for the log line format/parser
 mesh-logger.service    example systemd unit for mesh_logger.py
 ops/                   scripts for backing up logs off the server — see CLAUDE.md
 SETTINGS.md            full reference for /settings parameters (ru: SETTINGS.ru.md)
-node_names_cache.json  /mute state
 onemesh_cache.json     node names resolved via OneMesh (written by mesh_logger.py)
 logs/                  daily chat logs, chat-YYYY-MM-DD.log
 ```

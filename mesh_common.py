@@ -70,7 +70,6 @@ HOST = _ENV.get("MESH_HOST", "meshtastic.local")
 CONN_TYPE = _ENV.get("MESH_CONN_TYPE", "wifi").strip().lower()
 USB_PORT = _ENV.get("MESH_USB_PORT", "").strip() or None
 BLE_ADDRESS = _ENV.get("MESH_BLE_ADDRESS", "").strip() or None
-PING_CHANNEL_NAME = _ENV.get("PING_CHANNEL", "Ping")
 # interface language for mesh_i18n.py (ru|en, default ru — unchanged behavior
 # for existing users). Read here, not in mesh_i18n.py itself, to avoid a
 # circular import (mesh_i18n imports LANG from this module); mesh_common must

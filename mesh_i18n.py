@@ -3,9 +3,7 @@
 format_quote_line, parse_log_line, channel names, "DM "/"DM → " tags) is
 **never** localized — it's a persistent on-disk format both processes must
 agree on regardless of interface language. This module only holds
-presentation strings: command output, error messages, and the two
-over-the-air texts (botping reply, autoping canary) that also happen to be
-human-readable.
+presentation strings: command output and error messages.
 
 Convention: templates hold the same prompt_toolkit HTML markup the old
 f-strings did (`<ansired>`, literal `<b>`, pre-escaped `&lt;name&gt;`) and are
@@ -71,16 +69,12 @@ _RU: dict[str, object] = {
     "err_unknown_param": "неизвестный параметр: {key}",
     "err_apply_failed": "не удалось применить: {error}",
     "err_reboot_failed": "не удалось перезагрузить: {error}",
-    "err_botping_value": "ожидается value: '0' или '1'",
     "err_reconnect_wifi_only": (
         "смена адреса поддерживается только при MESH_CONN_TYPE=wifi (сейчас: {conn_type})"
     ),
-    "err_autoping_bad_interval": "ожидается неотрицательное целое число минут",
 
-    # -- mesh_logger.py: over-the-air texts + shared plural forms -------------
+    # -- shared plural forms ---------------------------------------------------
     "hops_forms": ("хоп", "хопа", "хопов"),
-    "botping_reply": "{marker} {hops_phrase} от вас",
-    "autoping_text": "🏓 автопинг: проверка связи",
 
     # -- mesh_chat.py: argparse ------------------------------------------------
     "argparse_description": "Терминальный чат-клиент Meshtastic (работает через mesh_logger.py)",
@@ -149,7 +143,6 @@ _RU: dict[str, object] = {
     # -- mesh_chat.py: /ping -------------------------------------------------------------
     "usage_ping": "Использование: /ping &lt;имя узла&gt;",
     "pinging": "🏓 Пингую {ln} ({sn})...",
-    "ping_queued": "⏳ Устройство офлайн — пинг встал в очередь, RTT не измерить",
     "err_no_packet_id": "Не удалось получить packet_id для пинга",
     "ping_no_reply": "🏓 {ln}: нет ответа за {timeout}с",
     "ping_delivered": "🏓 {ln}: доставлено за {elapsed}с{hop_str}",
@@ -214,8 +207,7 @@ _RU: dict[str, object] = {
     "search_empty": "По запросу «{query}» ничего не найдено",
     "shown_last_n": " (показаны последние {limit})",
 
-    # -- mesh_chat.py: /last ------------------------------------------------------------------
-    "usage_last": "Использование: /last &lt;имя узла&gt; (короткое или полное, точное совпадение)",
+    # -- mesh_chat.py: /who (recent messages from that sender) --------------------------------
     "hdr_last_from": "─── Последние сообщения от «{query}»",
     "last_empty": "Сообщений от «{query}» не найдено",
 
@@ -234,42 +226,15 @@ _RU: dict[str, object] = {
     "nothing_to_update": "Нечего обновлять — все видимые узлы уже с именами",
     "update_done": "Готово: обновлено {resolved} из {targets} имён",
 
-    # -- mesh_chat.py: /mute, /unmute --------------------------------------------------------------
-    "empty_muted_list": "Список замьюченных пуст",
-    "hdr_muted": "─── Замьюченные ───",
-    "unmute_hint": "Снять: /unmute &lt;имя&gt;",
-    "already_muted": "«{name}» уже замьючен",
-    "muted_msg": "🔇 «{name}» замьючен — больше не появится в чате (/search и /last по-прежнему находят)",
-    "not_muted": "«{name}» не в списке замьюченных — /unmute без аргументов покажет список",
-    "unmuted_msg": "🔊 «{name}» размьючен",
-
-    # -- mesh_chat.py: /botping -------------------------------------------------------------------
-    "usage_botping": "Использование: /botping 0|1 (0 — выключить, 1 — включить)",
-    "err_botping_change_failed": "Не удалось изменить: {error}",
-    "botping_on": "включён",
-    "botping_off": "выключен",
-    "botping_state": "🤖 botping {state}",
-    "botping_no_channel": (
-        "На устройстве нет канала «Ping» (PING_CHANNEL в .env) — "
-        "бот включён, но реагировать пока не на что"
-    ),
-
-    # -- mesh_chat.py: /autoping ------------------------------------------------------------------
-    "usage_autoping": (
-        "Использование: /autoping [минуты|off|text &lt;текст&gt;|text default] "
-        "(без аргументов — показать статус)"
-    ),
-    "err_autoping_fetch_failed": "Не удалось получить настройки автопинга: {error}",
-    "err_autoping_change_failed": "Не удалось изменить: {error}",
-    "autoping_status_off": "🏓 Автопинг выключен",
-    "autoping_status_on": "🏓 Автопинг включён: каждые {interval} мин, текст: «{text}»",
-    "autoping_no_channel": (
-        "На устройстве нет канала «Ping» (PING_CHANNEL в .env) — "
-        "автопинг включён, но слать пока некуда"
-    ),
-    "autoping_text_set": "✓ Текст автопинга: «{text}»",
-    "autoping_disabled": "✓ Автопинг выключен",
-    "autoping_interval_set": "✓ Автопинг: каждые {minutes} мин",
+    # -- mesh_chat.py: /ignore, /unignore ----------------------------------------------------------
+    "empty_ignored_list": "Список игнорируемых пуст",
+    "hdr_ignored": "─── Игнорируемые ───",
+    "unignore_hint": "Снять: /unignore &lt;имя&gt;",
+    "already_ignored": "«{name}» уже в игноре",
+    "ignored_msg": "🔇 «{name}» добавлен в игнор устройства — его сообщения больше не будут доходить и логироваться",
+    "not_ignored": "«{name}» не в списке игнорируемых — /unignore без аргументов покажет список",
+    "unignored_msg": "🔊 «{name}» убран из игнора",
+    "err_ignore_failed": "не удалось изменить игнор: {error}",
 
     # -- mesh_chat.py: /settings ---------------------------------------------------------------------
     "err_settings_fetch_failed": "Не удалось получить настройки: {error}",
@@ -309,7 +274,7 @@ _RU: dict[str, object] = {
     "help_lines": [
         "─── Команды ───────────────────────────────────────────────",
         "  /nodes [online|names|hops]  список видимых узлов (сортировка, по умолчанию online)",
-        "  /who [имя]           информация о себе, или об узле — имена, hex id, батарея/SNR/хопы, позиция",
+        "  /who [имя]           информация о себе, или об узле — имена, hex id, батарея/SNR/хопы, позиция, последние сообщения",
         "  /dm &lt;имя&gt; &lt;текст&gt;   личное сообщение (имя с пробелами — в кавычках)",
         "  /reply               список недавних сообщений, на которые можно ответить",
         "  /reply &lt;текст&gt;       ответ (с цитатой) на последнее полученное сообщение",
@@ -319,16 +284,13 @@ _RU: dict[str, object] = {
         "  /ch [имя|all]        показать/сменить канал",
         "  /send &lt;канал&gt; &lt;текст&gt; разовая отправка в канал без переключения сессии",
         "  /search &lt;текст&gt;     поиск по истории (учитывает текущий канал)",
-        "  /last &lt;имя&gt;         последние сообщения узла (точное имя, короткое или полное)",
-        "  /stats [день|узел]   статистика по истории переписки",
+        "  /stats [день|узел]   статистика по истории переписки (по умолчанию — канал Primary)",
         "  /trace &lt;имя&gt;        маршрут пакетов до узла (traceroute)",
         "  /ping &lt;имя&gt;         время доставки (RTT) и число хопов до узла",
-        "  /mute &lt;имя&gt;         скрыть сообщения узла из чата (история — всё ещё в /search)",
-        "  /unmute [имя]        снять мьют (без аргумента — список замьюченных)",
+        "  /ignore &lt;имя&gt;       игнорировать узел на уровне устройства (без аргумента — список)",
+        "  /unignore [имя]      снять игнор (без аргумента — список игнорируемых)",
         "  /updatenames         подтянуть имена узлов с OneMesh (и так — раз в 30 мин фоном)",
         "  /settings [параметр значение]  настройки локального узла (см. SETTINGS.ru.md)",
-        "  /botping 0|1         бот в канале Ping: отвечает хопами до отправителя",
-        "  /autoping [мин|off|text текст]  канарейка связи (частота/текст/выкл, см. /autoping)",
         "  /reboot             перезагрузить узел (требует /reboot confirm)",
         "  /reconnect [host]    принудительно переподключиться (можно сменить IP/host для wifi)",
         "  /clear               очистить экран",
@@ -409,15 +371,11 @@ _EN: dict[str, object] = {
     "err_unknown_param": "unknown parameter: {key}",
     "err_apply_failed": "failed to apply: {error}",
     "err_reboot_failed": "failed to reboot: {error}",
-    "err_botping_value": "expected value: '0' or '1'",
     "err_reconnect_wifi_only": (
         "changing the address is only supported for MESH_CONN_TYPE=wifi (current: {conn_type})"
     ),
-    "err_autoping_bad_interval": "expected a non-negative integer number of minutes",
 
     "hops_forms": ("hop", "hops"),
-    "botping_reply": "{marker} {hops_phrase} from you",
-    "autoping_text": "🏓 autoping: link check",
 
     "argparse_description": "Terminal chat client for Meshtastic (talks to mesh_logger.py)",
     "argparse_channel_metavar": "NAME",
@@ -473,7 +431,6 @@ _EN: dict[str, object] = {
 
     "usage_ping": "Usage: /ping &lt;node name&gt;",
     "pinging": "🏓 Pinging {ln} ({sn})...",
-    "ping_queued": "⏳ Device offline — ping queued, can't measure RTT",
     "err_no_packet_id": "Couldn't get a packet_id for the ping",
     "ping_no_reply": "🏓 {ln}: no response in {timeout}s",
     "ping_delivered": "🏓 {ln}: delivered in {elapsed}s{hop_str}",
@@ -533,7 +490,6 @@ _EN: dict[str, object] = {
     "search_empty": "No results for «{query}»",
     "shown_last_n": " (showing last {limit})",
 
-    "usage_last": "Usage: /last &lt;node name&gt; (short or full, exact match)",
     "hdr_last_from": "─── Recent messages from «{query}»",
     "last_empty": "No messages found from «{query}»",
 
@@ -550,39 +506,14 @@ _EN: dict[str, object] = {
     "nothing_to_update": "Nothing to update — all visible nodes already have names",
     "update_done": "Done: resolved {resolved} of {targets} names",
 
-    "empty_muted_list": "Mute list is empty",
-    "hdr_muted": "─── Muted ───",
-    "unmute_hint": "Unmute: /unmute &lt;name&gt;",
-    "already_muted": "«{name}» is already muted",
-    "muted_msg": "🔇 «{name}» muted — won't appear in chat anymore (/search and /last still find them)",
-    "not_muted": "«{name}» isn't in the mute list — /unmute with no arguments shows the list",
-    "unmuted_msg": "🔊 «{name}» unmuted",
-
-    "usage_botping": "Usage: /botping 0|1 (0 = off, 1 = on)",
-    "err_botping_change_failed": "Failed to change: {error}",
-    "botping_on": "on",
-    "botping_off": "off",
-    "botping_state": "🤖 botping {state}",
-    "botping_no_channel": (
-        "The device has no «Ping» channel (PING_CHANNEL in .env) — "
-        "the bot is on, but has nothing to react to yet"
-    ),
-
-    "usage_autoping": (
-        "Usage: /autoping [minutes|off|text &lt;text&gt;|text default] "
-        "(no arguments — show status)"
-    ),
-    "err_autoping_fetch_failed": "Failed to fetch autoping settings: {error}",
-    "err_autoping_change_failed": "Failed to change: {error}",
-    "autoping_status_off": "🏓 Autoping is off",
-    "autoping_status_on": "🏓 Autoping is on: every {interval} min, text: «{text}»",
-    "autoping_no_channel": (
-        "The device has no «Ping» channel (PING_CHANNEL in .env) — "
-        "autoping is on, but has nowhere to send yet"
-    ),
-    "autoping_text_set": "✓ Autoping text: «{text}»",
-    "autoping_disabled": "✓ Autoping turned off",
-    "autoping_interval_set": "✓ Autoping: every {minutes} min",
+    "empty_ignored_list": "Ignore list is empty",
+    "hdr_ignored": "─── Ignored ───",
+    "unignore_hint": "Un-ignore: /unignore &lt;name&gt;",
+    "already_ignored": "«{name}» is already ignored",
+    "ignored_msg": "🔇 «{name}» added to the device's ignore list — their messages will no longer arrive or get logged",
+    "not_ignored": "«{name}» isn't in the ignore list — /unignore with no arguments shows the list",
+    "unignored_msg": "🔊 «{name}» un-ignored",
+    "err_ignore_failed": "failed to change ignore state: {error}",
 
     "err_settings_fetch_failed": "Failed to fetch settings: {error}",
     "hdr_settings": "─── Node settings ───",
@@ -619,7 +550,7 @@ _EN: dict[str, object] = {
     "help_lines": [
         "─── Commands ──────────────────────────────────────────────",
         "  /nodes [online|names|hops]  list visible nodes (sort mode, default online)",
-        "  /who [name]          info about your own node, or another — names, hex id, battery/SNR/hops, position",
+        "  /who [name]          info about your own node, or another — names, hex id, battery/SNR/hops, position, recent messages",
         "  /dm &lt;name&gt; &lt;text&gt;   direct message (quote names containing spaces)",
         "  /reply               list recent messages you can reply to",
         "  /reply &lt;text&gt;       reply (with quote) to the latest received message",
@@ -629,16 +560,13 @@ _EN: dict[str, object] = {
         "  /ch [name|all]       show/switch channel",
         "  /send &lt;channel&gt; &lt;text&gt; one-off send to a channel without switching session",
         "  /search &lt;text&gt;      search history (respects the active channel)",
-        "  /last &lt;name&gt;        recent messages from a node (exact name, short or full)",
-        "  /stats [day|node]    message history statistics",
+        "  /stats [day|node]    message history statistics (defaults to the Primary channel)",
         "  /trace &lt;name&gt;       packet route to a node (traceroute)",
         "  /ping &lt;name&gt;        delivery time (RTT) and hop count to a node",
-        "  /mute &lt;name&gt;        hide a node's messages from chat (still in /search)",
-        "  /unmute [name]       remove mute (no argument — list muted senders)",
+        "  /ignore &lt;name&gt;      device-level ignore for a node (no argument — list)",
+        "  /unignore [name]     remove ignore (no argument — list ignored nodes)",
         "  /updatenames         pull node names from OneMesh (also runs every 30 min)",
         "  /settings [key value]  local node settings (see SETTINGS.md)",
-        "  /botping 0|1         bot on the Ping channel: replies with hop count",
-        "  /autoping [min|off|text ...]  link canary (interval/text/off, see /autoping)",
         "  /reboot              reboot the node (requires /reboot confirm)",
         "  /reconnect [host]    force a reconnect (optionally change IP/host for wifi)",
         "  /clear               clear the screen",

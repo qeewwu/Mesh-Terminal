@@ -91,8 +91,7 @@ connection:
   `_render_unit` stays in use where re-showing is intended (`/ch` recent history, `/search`).
   `/dm` and `/trace` resolve names via `_pick_node`: exact name/`!hex`-id match beats prefix
   beats substring, and an ambiguous query lists the candidates instead of picking one silently.
-  So do `/ping` and `/who <name>`; `/mute` uses the unwrapped `_find_node_in_list` instead (see Muting
-  below — it wants a single exact match or a silent fallback, not an error message).
+  So do `/ping`, `/who <name>`, and `/ignore`/`/unignore` (see Ignoring below).
 - **`mesh_common.py`** — shared source of truth for both processes: the daily log file naming
   scheme (`logs/chat-YYYY-MM-DD.log`, computed from the current date so rotation is automatic —
   no explicit rollover logic needed), and the log line format/parser (`format_message_line`,
@@ -103,19 +102,16 @@ connection:
 
 `parse_env_file()`/`update_env_file()` in `mesh_common.py` are a deliberately minimal stdlib
 `KEY=VALUE` reader/writer (no `python-dotenv` — the project has no other third-party deps to
-justify one). `_ENV` is parsed once at import time; `HOST` (device hostname, `MESH_HOST`),
-`CONN_TYPE` (`MESH_CONN_TYPE`), and `PING_CHANNEL_NAME` (`PING_CHANNEL`) fall back to their old
-hardcoded defaults if `.env` is missing or a key isn't set, so a fresh checkout with no `.env` at
-all still runs (and connects over wifi, same as before this setting existed). `USB_PORT`
-(`MESH_USB_PORT`) and `BLE_ADDRESS` (`MESH_BLE_ADDRESS`) fall back to `None` instead, which is a
-meaningful value to the meshtastic lib (auto-detect), not just an unset placeholder. `.env.example`
-in the repo documents every key with a placeholder/default; `.env` itself is gitignored.
-`update_env_file()` rewrites only the keys it's given, preserving every other line (comments,
-unrelated vars) — `mesh_chat.py`'s `/who` calls it with the freshly-learned `NODE_LONG_NAME`/
-`NODE_SHORT_NAME`/`NODE_ID` every time it runs, so `.env` self-updates with the current node
-identity instead of needing manual upkeep. `PING_CHANNEL_NAME` exists for the ping-channel bot
-and auto-ping features (see below) to agree on which channel is "the" ping channel without
-hardcoding its name.
+justify one). `_ENV` is parsed once at import time; `HOST` (device hostname, `MESH_HOST`) and
+`CONN_TYPE` (`MESH_CONN_TYPE`) fall back to their old hardcoded defaults if `.env` is missing or a
+key isn't set, so a fresh checkout with no `.env` at all still runs (and connects over wifi, same
+as before this setting existed). `USB_PORT` (`MESH_USB_PORT`) and `BLE_ADDRESS`
+(`MESH_BLE_ADDRESS`) fall back to `None` instead, which is a meaningful value to the meshtastic lib
+(auto-detect), not just an unset placeholder. `.env.example` in the repo documents every key with a
+placeholder/default; `.env` itself is gitignored. `update_env_file()` rewrites only the keys it's
+given, preserving every other line (comments, unrelated vars) — `mesh_chat.py`'s `/who` calls it
+with the freshly-learned `NODE_LONG_NAME`/`NODE_SHORT_NAME`/`NODE_ID` every time it runs, so `.env`
+self-updates with the current node identity instead of needing manual upkeep.
 
 ### Interface language (`mesh_i18n.py`)
 
@@ -146,10 +142,8 @@ interpolated *value* is `_safe()`-escaped by the caller before being passed as a
 `MESH_LANG` existed, regardless of which language the UI is in. `test_mesh_i18n.py`'s key/
 placeholder-parity tests guard the string tables themselves; the log format's own invariant is
 still guarded the usual way, by `test_mesh_common.py`'s round-trip tests never touching
-`mesh_i18n`. `BOTPING_MARKER` (`"🤖"`) and the other bare status glyphs (`🏓 ✓ ✗ ⏳`, the `───`
-rule characters) are deliberately *not* looked up per-language — `BOTPING_MARKER` in particular
-is the loop-prevention protocol between nodes (see Ping-channel bot below), so a `ru` node and an
-`en` node must still recognize each other's bot replies by the same prefix.
+`mesh_i18n`. The bare status glyphs (`🏓 ✓ ✗ ⏳`, the `───` rule characters) are deliberately *not*
+looked up per-language.
 
 `compass_point()` (`/who`'s bearing labels) is the one localized string that lives outside
 `mesh_i18n.py`, in `mesh_common.py` itself, purely because of the import direction above — it
@@ -225,7 +219,22 @@ The client's `/reply` command sends a real reply: it keeps a deque of the last 2
 "message" events (with their `packet_id`), `/reply` alone lists them numbered (#1 = newest),
 `/reply #N <text>` targets one, `/reply <text>` targets #1. Only messages received while the
 client was running are replyable (log files carry no packet ids). Switching channels via
-`/ch` drops targets from other channels.
+`/ch` drops targets from other channels. When the session is unfiltered (multiple channels mixed
+together), each listed entry shows which channel it's on (`_reply_label`, same magenta-prefix
+convention as live rendering in `_print_msg`) — with channels interleaved, picking the wrong #N
+because it wasn't obvious which channel it belonged to was an easy miss.
+
+`#N` is resolved against `_last_reply_snapshot` — a copy of the list taken at the moment `/reply`
+(or `/react`) last printed it with no arguments — not against the live `_replyables` deque at
+send time. Traffic keeps flowing between looking at the list and typing the command, and on a busy
+channel that can be several messages within seconds; worse, **our own outgoing send is itself a
+pushed "message" event** and gets appended to `_replyables` too, so even a single successful
+`/reply #N` shifts every number for the *next* one. Resolving live meant "#5" could silently point
+at a completely different message by the time the command ran — no error, just the wrong target.
+Bare `/reply <text>` (no explicit number) deliberately stays live (`_replyables[-1]`, not the
+snapshot) — it means "reply to whatever's newest right now," which doesn't presuppose the list was
+ever shown, unlike an explicit `#N` which only makes sense relative to a list the user actually
+looked at.
 Note: many community "ping bots" embed the target's hex node ID as plain text in their reply
 (e.g. `🤖 Pong !1ba60314`) instead of using the real `replyId` field — these will never show a
 quote line, which is expected, not a bug.
@@ -323,33 +332,24 @@ triggers an extra sweep on demand and reloads the shared cache to show the resul
 long-running client picks up names the logger resolved in the background, without needing a
 restart — no network calls happen client-side.
 
-### `node_names_cache.json` (mute state only)
+### Ignoring (`/ignore`, `/unignore`)
 
-This file predates the OneMesh-resolution move and used to also cache resolved names
-(`{"names": {...}, "muted": [...]}`); now it stores only `{"muted": [...]}` — names live in
-`onemesh_cache.json` instead. `_load_name_cache()` still reads an old file's `"names"` section
-once, as a seed, so upgrading doesn't lose already-resolved names before the logger gets around
-to re-resolving them; `_reload_onemesh_cache()` immediately overlays the shared cache on top
-(newer entries win on conflict), and `_save_name_cache()` only ever writes the `"muted"` key back
-— nothing in `mesh_chat.py` writes to `"names"` anymore.
+Not an app-level filter — a real firmware feature. `node.setIgnored(nodeId)`/`removeIgnored(nodeId)`
+(`_set_ignored_node()` in `mesh_logger.py`, an admin message like `writeConfig`/`reboot`, same
+`_ensure_session_key()` race to close first) tells the device's own NodeDB to ignore that node id;
+`is_ignored`/`is_muted` are real fields on the protobuf `NodeInfo` message, so `_nodes_payload()`
+exposes `is_ignored` straight from `_interface.nodes` for `/ignore`/`/who`/`/nodes` to read. This
+replaced an earlier app-level `/mute` (keyed by display name, filtering the client's own render of
+already-logged lines) once it turned out the firmware already has a proper per-node ignore list —
+no reason to reimplement a weaker version of it in `mesh_chat.py`.
 
-### Muting (`/mute`, `/unmute`)
-
-Mutes are keyed by **display name**, not node ID, even though `/mute <query>` resolves through
-the live `nodes` list first (via `_find_node_in_list`, to get the canonical `long_name` and avoid
-typos) — because the log format itself only ever stores names, never numeric IDs (see Log line
-format above). A node-ID-keyed mute could not be checked against a plain history line at all.
-`_is_muted()` treats a message as muted if either its `long_name` or `short_name` matches an
-entry, so muting still works from a name typed directly (no live node match needed — e.g. a bot
-that's currently offline). This only filters the passive feed — startup history
-(`_print_initial_history`), live tail (`_handle_event`'s `message` branch), `/ch`'s re-display,
-and reconnect replay (`_replay_missed`) — while `/search`, `/last`, and `/reply` targets stay
-reachable: `_handle_event` appends to `_replyables` before checking `_is_muted`, so a message
-from a muted sender still becomes a `/reply` target even though it never prints, same reasoning
-as `/search`/`/last` — an explicit query (or command) should still find what you're looking for.
-This is unlike the channel filter (see Channels below), which *does* also gate what becomes a
-`/reply` target — a `--channel`-filtered session is meant to be a clean view of just that
-channel, so a message on another channel never enters `_replyables` there in the first place.
+Consequence worth knowing: because the device drops an ignored node's packets before
+`mesh_logger.py` ever sees them, an ignored sender's messages stop being logged **at all**, not
+just hidden from the live feed — unlike the old `/mute`, there's no falling back to `/search` for
+them afterward. It's also node-id-keyed rather than name-keyed, so (unlike the old `/mute`)
+`/ignore <name>` can only target a node currently visible in `/nodes` — resolves through
+`_pick_node()`/`_enrich_nodes()` like every other by-name command, and needs a real `node_id` to
+send the admin message, so it can't blindly ignore-by-name-only the way the old mute could.
 
 ### Node lookup and position (`/who <name>`)
 
@@ -375,22 +375,40 @@ prompt_toolkit).
 
 ### RTT measurement (`/ping`)
 
-`/ping <node>` sends a DM with `wantAck=True` (via the normal `dm` IPC command) and measures wall
-time until the matching `delivery` event arrives. Since `send`/`dm`'s `packet_id` comes back
-immediately in the request response while delivery is a separate, asynchronously pushed event,
-`_cmd_ping()` registers `_pending_pings[packet_id] = future` and `_handle_event()`'s `delivery`
-branch resolves that future *instead of* printing the generic "✓ Доставлено" line when a match is
-found — `/ping` renders its own line (with the elapsed time and hop count) so the same delivery
-doesn't get reported twice.
+`/ping <node>` sends its own dedicated `ping` IPC command (not `dm`) and measures wall time until
+the matching `delivery` event arrives. It used to piggyback on `dm` with a literal `"🏓 ping"` text
+— which worked for RTT, but meant a real chat message landed in the *target's* DM inbox just to
+measure round-trip time, purely as a side effect of how the probe was implemented (see Fixed bugs
+below). `_send_ping_packet()` in `mesh_logger.py` instead builds a bare `wantAck=True` packet on
+`PRIVATE_APP` by hand (same `_sendPacket()`-by-hand precedent as `_send_emoji_packet`/
+`_do_traceroute`) — the mesh-layer ACK/NAK that `/ping` actually measures fires for any unicast
+packet with `wantAck=True` regardless of portnum, so there's no need for `TEXT_MESSAGE_APP` at all;
+official Meshtastic apps don't render `PRIVATE_APP` packets in their chat UI. `_send_message()`'s
+`ping=True` branch skips the text-size check, the `_write_message()`/`_store_msg()` local-log calls
+(there's no text to log, and nothing was actually sent to anyone's visible chat), and outbox
+queueing on a transient link failure (a ping delivered late after a reconnect wouldn't measure
+anything meaningful, unlike a real queued message).
 
-### Statistics and per-sender history (`/stats`, `/last`)
+Since `send`/`dm`/`ping`'s `packet_id` comes back immediately in the request response while
+delivery is a separate, asynchronously pushed event, `_cmd_ping()` registers
+`_pending_pings[packet_id] = future` and `_handle_event()`'s `delivery` branch resolves that future
+*instead of* printing the generic "✓ Доставлено" line when a match is found — `/ping` renders its
+own line (with the elapsed time and hop count) so the same delivery doesn't get reported twice.
 
-Both read only from `logs/` (no device round-trip) and share the walk-newest-first/limit/ordering
-logic in `_scan_units()` — the same helper `/search` uses, parameterized by a match predicate.
-`/last <node>` requires an *exact* (case-insensitive) match on `long_name` or `short_name`,
-unlike `/search`'s substring match — the intent is "this specific sender", not "reminds me of".
-`/stats` computed via `_collect_stats()` runs in `asyncio.to_thread` since walking every log file
-in a long-lived install can take a moment and would otherwise stall the prompt.
+### Statistics and per-sender history (`/stats`, folded into `/who <name>`)
+
+`/last <name>` used to be its own command; it's now the tail end of `/who <name>` instead (an
+*exact*, case-insensitive match on `long_name`/`short_name` — unlike `/search`'s substring match,
+the intent is "this specific sender", not "reminds me of" — matched against the resolved display
+name `_pick_node()` returned, not the raw typed query, since that's what log lines are actually
+written under). Both it and `/stats` read only from `logs/` (no device round-trip) and share the
+walk-newest-first/limit/ordering logic in `_scan_units()` — the same helper `/search` uses,
+parameterized by a match predicate. `/stats` computed via `_collect_stats()` runs in
+`asyncio.to_thread` since walking every log file in a long-lived install can take a moment and
+would otherwise stall the prompt; it defaults to the Primary channel (`_channel_filter or
+"Primary"`) rather than every channel mixed together — an unfiltered aggregate conflated unrelated
+groups' traffic into one meaningless total — but still respects an explicit `/ch` switch to some
+other channel, since that's already a deliberate one-channel view.
 
 ### Local node settings (`/settings`)
 
@@ -431,60 +449,6 @@ always runs inside the same `asyncio.to_thread` call as the admin action it prec
 `_apply_setting`) until `_has_session_key()` sees the passkey cached or `SESSION_KEY_TIMEOUT`
 elapses; on timeout it proceeds anyway rather than inventing a new error path; some setups may
 not need a passkey at all, in which case this is a no-op wait that costs nothing.
-
-### Ping-channel bot (`/botping`)
-
-Auto-replies with a hop count on the channel named `PING_CHANNEL_NAME` (`.env`'s
-`PING_CHANNEL`, default "Ping") — lives entirely in `mesh_logger.py` so it keeps answering
-whether or not any `mesh_chat.py` client is open, unlike a feature built into the TUI would.
-`on_receive()` calls `_maybe_botping_reply()` after logging every message; it schedules
-`_send_botping_reply()` onto the event loop (same `call_soon_threadsafe` pattern as
-`_write_message`'s broadcast, since `on_receive` runs on meshtastic's callback thread) only
-when: the bot is enabled, the channel matches, it's not a DM, and it's not already a reply —
-that last check plus a text-prefix check (`BOTPING_MARKER = "🤖"`) matters because **two nodes
-both running botping would otherwise reply to each other's replies forever**; a message that's
-already a reply or already starts with the marker is assumed to be a bot reply (ours or someone
-else's) and is never replied to. The reply itself is sent with `reply_id` set to the triggering
-message's own packet id — a real reply with a quote line, not a bare broadcast, per the request
-("функция реплай"). `_ping_channel_index()` resolves `PING_CHANNEL_NAME` to a channel index by
-name each time (channel lists are tiny, not worth caching) — if the device has no channel with
-that name, it returns `None`, which can never equal a real `channel_index`, so the bot silently
-never fires rather than erroring. Toggled via `/botping 0|1` in `mesh_chat.py` → the `"botping"`
-IPC command → `_set_botping()`, which flips `_botping_enabled` and persists to `.env`
-(`BOTPING_ENABLED`) so the setting survives a `mesh_logger.py` restart; loaded once at import via
-the same `parse_env_file(ENV_FILE)` call used for `HOST`/`PING_CHANNEL_NAME`.
-
-### Auto-ping health check (`/autoping`)
-
-`_periodic_autoping()` broadcasts a text (default `t("autoping_text")` — `"🏓 автопинг: проверка
-связи"` / `"🏓 autoping: link check"`, see Interface language above) into `PING_CHANNEL_NAME` on a
-configurable interval, independent of `/botping`'s toggle. It's a liveness canary (is the mesh
-link actually carrying traffic), not the reply-bot, so it isn't gated by `_botping_enabled`.
-Silently no-ops if the device isn't connected or has no channel matching `PING_CHANNEL_NAME` —
-same reasoning as `_ping_channel_index()` returning `None` for the bot.
-
-Interval (`_autoping_interval_min`, minutes; `0` disables it) and text override
-(`_autoping_text_override`; empty means use the localized default) are runtime-mutable, exposed
-via `/autoping [minutes|off|text ...|text default]` in `mesh_chat.py` → the `"autoping"` IPC
-command (`action: "get"|"set_interval"|"set_text"`) → `_set_autoping_interval()`/
-`_set_autoping_text()`, which persist to `.env`'s `AUTOPING_INTERVAL_MIN`/`AUTOPING_TEXT` the same
-way `_set_botping()` does for `BOTPING_ENABLED`, and loaded once at import the same way too. `0`
-minutes was chosen over a separate on/off flag — one field, no risk of the two disagreeing.
-
-The wait between broadcasts uses the same interrupt-a-sleep idiom as `_hard_reconnect_event` (see
-Manual reconnect above): `_autoping_changed_event` is an `asyncio.Event` that `_periodic_autoping`
-awaits with `asyncio.wait_for(..., timeout=interval_min * 60)`, and both setters call it via
-`_notify_autoping_changed()`. This means a config change while asleep restarts the wait immediately
-with the new settings — the next canary fires one fresh interval from the *change*, not whenever
-the *old* interval happened to be about to expire, which could otherwise be up to 2 hours away by
-default. When disabled (`interval_min <= 0`), the loop `await`s the event with no timeout at all
-instead of polling — enabling it later wakes it immediately, no up-to-a-minute lag.
-
-Deliberately minimal for now: collecting/parsing responses into a daily stats file (how many nodes
-answered, their hop counts) was scoped out as needing real per-bot response-format parsing
-(community ping bots reply in inconsistent formats) — this only sends the canary; `/stats`-style
-aggregation of who responds can be layered on later by reading `logs/` for replies to the
-autoping's own packet id, without changing this function.
 
 ### Rebooting the node (`/reboot`)
 
@@ -649,6 +613,32 @@ A running log of non-obvious bugs found and fixed, and judgment calls made along
 so the reasoning behind them doesn't have to be rediscovered from scratch next time. Grouped by
 theme, not chronologically.
 
+### `/ping` was writing a visible message into the target's DM inbox
+
+`/ping` used to send a real `TEXT_MESSAGE_APP` DM (`"🏓 ping"`, via the normal `dm` IPC command) just
+to get a `wantAck` round trip — but that's an actual chat message the target's own Meshtastic app
+displays and notifies on, which is rude to send to a node you're merely curious about (e.g. probing
+someone else's node found via `/nodes` or `/who`). The mesh-layer ACK/NAK `/ping` measures doesn't
+care about portnum — any unicast packet with `wantAck=True` gets one — so the fix
+(`_send_ping_packet()` on `PRIVATE_APP`, see RTT measurement above) removes the text message
+entirely rather than trying to make it less objectionable (e.g. a shorter or quieter text would
+still be a message the recipient didn't ask for).
+
+### Broadcast sends spammed "delivery not confirmed" as if something was wrong
+
+`_send_message()` sets `wantAck=True` on every send regardless of destination, but Meshtastic only
+has a real per-recipient ACK for a **unicast** (DM) packet — a broadcast has no single node
+responsible for acknowledging it, only an unreliable "implicit ack" (the sender hearing a neighbor
+rebroadcast it, which may just not happen on a busy or lossy channel). The client used to print the
+same `delivery_unconfirmed` warning for a timed-out broadcast as for a timed-out DM, but for a
+broadcast that timeout is the *normal*, expected outcome, not a signal anything failed — and on a
+noisy channel (e.g. a community "Ping" channel with constant traffic) it fired on nearly every send,
+reading as a string of alarming failures for something that most likely went out fine. Fixed by
+tagging the `delivery` event with `is_dm` (`mesh_logger.py`'s `emit_delivery`) and only printing the
+"not confirmed" line when it's true; a broadcast that times out now says nothing, same as it would
+if the implicit ack happened to arrive a moment too late to matter. `not_delivered` (a real NAK, `ok
+is False`) and `delivered` (`ok is True`) still print either way — those aren't ambiguous.
+
 ### Send-path: oversized messages and a delivery-tracking race
 
 `sendData()` (which `sendText()` wraps) raises `MeshInterface.MeshInterfaceError("Data payload
@@ -698,28 +688,15 @@ exploited. (Those same logs *did* independently confirm `sanitize_text()`'s valu
 (6.5%) failed to parse before it reached production around 05–06 Jul — multi-line ping-bot
 replies and one human-pasted shell command forging extra "lines" — and zero after.)
 
-### Mute vs. `/reply` targets
-
-`_handle_event()`'s `message` branch used to check `_is_muted()` *before* appending to
-`_replyables`, so a muted sender's message could never become a `/reply` target — contradicting
-this file's own claim that `/search`, `/last`, and `/reply` all stay reachable for muted senders.
-Decision (confirmed with the user, not just inferred): mute is display-only, same precedent as
-`/search`/`/last` — moved the `_replyables.append` before the mute check. The channel filter is
-*not* held to the same standard: a `--channel`-filtered session is deliberately a clean view of
-just that channel (see Channels above), so it's allowed to also gate `/reply` targets, unlike
-mute. Both behaviors are intentional and now correctly reflect what the code does.
-
 ### Client-side name resolution gaps
 
-`/dm`, `/trace`, `/ping`, `/who <name>` (`/pos` at the time), `/mute`, and tab-completion all used to match node names
+`/dm`, `/trace`, `/ping`, `/who <name>` (`/pos` at the time), the old `/mute` (see Ignoring above —
+since replaced by the firmware-level `/ignore`), and tab-completion all used to match node names
 against the raw `nodes` IPC payload — which only ever carries a name if the mesh's own NodeInfo
 reported one. A node visible in `/nodes` under its OneMesh-resolved display name (e.g. "Вася")
 was unmatchable by that exact name anywhere else — only by its raw `!hex` id. `/nodes` already
 computed the fix inline (`display_long`/`display_short`); factored it out as `_enrich_nodes()`
 and applied it everywhere a node list is matched or rendered, including `_update_node_completions`.
-`/mute` additionally now prefers `display_long` over the raw (often-`None`) `long_name` when
-naming what got muted, since `display_long` is what `mesh_logger.py`'s own OneMesh resolution
-actually writes into fresh log lines — matching the raw name would silently fail to ever match.
 
 ### `--channel` at startup when the device isn't connected yet
 
@@ -760,6 +737,20 @@ far less than the 100 shown at client startup (`HISTORY_SIZE`) — jarring when 
 channel you haven't seen yet this session. There was no reason for the two to differ, so
 `CH_SWITCH_HISTORY` was removed and `_print_initial_history()` is now called with its default
 (`HISTORY_SIZE`) in both places.
+
+### Command cleanup: `/botping`, `/autoping` removed; `/last` folded into `/who`
+
+A review of every command's actual usefulness (not a bug fix, a judgment call): `/botping` (auto-
+reply bot on the Ping channel) and `/autoping` (periodic liveness canary into the same channel)
+were both removed outright — their entire purpose was broadcasting extra traffic onto the mesh,
+which is the opposite of what you want on a shared, bandwidth-constrained LoRa network, and neither
+saw real use. All the plumbing came out together: the `_botping_enabled`/`_autoping_interval_min`/
+`_autoping_text_override` globals and their `.env` keys (`BOTPING_ENABLED`, `AUTOPING_INTERVAL_MIN`,
+`AUTOPING_TEXT`), `PING_CHANNEL`/`PING_CHANNEL_NAME` and `_ping_channel_index()` (nothing else used
+it), the `"botping"`/`"autoping"` IPC commands, and both `mesh_chat.py` command handlers. `/last`
+wasn't removed for the same reason — it stayed useful — but its output was a strict subset of what
+`/who <name>` already needed to show anyway (see Node lookup above), so it was folded in rather than
+kept as a separate command with overlapping by-name lookup logic.
 
 ### `_store_msg` dict/deque desync
 

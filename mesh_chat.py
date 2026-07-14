@@ -19,7 +19,6 @@ from prompt_toolkit.shortcuts import clear as pt_clear
 
 from mesh_common import (
     ACK_TIMEOUT_SECONDS,
-    BASE_DIR,
     ENV_FILE,
     ONEMESH_CACHE_FILE,
     SOCKET_PATH,
@@ -32,7 +31,6 @@ from mesh_common import (
 )
 from mesh_i18n import plural, t, t_list
 
-NAME_CACHE_FILE = BASE_DIR / "node_names_cache.json"
 HISTORY_SIZE = 100
 SEARCH_LIMIT = 20
 LAST_LIMIT = 20
@@ -70,10 +68,6 @@ _reboot_confirm_deadline: float | None = None
 # прочитано из onemesh_cache.json (пишет и резолвит только mesh_logger.py —
 # см. "Node name resolution" в CLAUDE.md); клиент только перечитывает файл
 _name_cache: dict[int, tuple[str, str]] = {}
-# отображаемое имя (long_name), в нижнем регистре — устройство не хранит
-# node_id в текстовом логе, поэтому мьют матчится по имени, а не по id
-# (см. CLAUDE.md); переживает переименование ноды только для новых сообщений
-_muted_names: set[str] = set()
 
 # None => show/send on every channel (send defaults to Primary); otherwise the
 # canonical channel name (and matching index) this session is restricted to.
@@ -91,6 +85,15 @@ _channel_resolved: bool = True
 # только на сообщения, пришедшие после запуска клиента.
 REPLYABLE_SIZE = 20
 _replyables: collections.deque[dict] = collections.deque(maxlen=REPLYABLE_SIZE)
+# Снимок _replyables (уже в порядке #1=новое..#N), сделанный в момент последнего
+# показа списка через /reply или /react без аргументов. Явные #N обязаны бить
+# точно в то, что человек реально видел на экране — если резолвить #N против
+# живого _replyables в момент отправки, каждое новое входящее (а хуже того —
+# каждое НАШЕ собственное отправленное сообщение, которое тоже прилетает
+# обратно как live "message"-событие и добавляется в _replyables) сдвигает
+# нумерацию, и то, что было #5 при печати списка, к моменту команды может
+# оказаться совсем другим сообщением без единого предупреждения.
+_last_reply_snapshot: list[dict] = []
 
 # Кандидаты для tab-автодополнения (обновляются из ответов логгера)
 _completion_nodes: list[str] = []
@@ -127,18 +130,6 @@ def _channel_matches(msg_line: str) -> bool:
     return parsed.channel.lower() == _channel_filter.lower()
 
 
-def _is_muted(msg_line: str) -> bool:
-    """Only gates the live/history feed (startup, live tail, /ch, reconnect
-    replay) — /search and /last still surface muted senders on an explicit
-    query, same as /reply staying reachable for them."""
-    if not _muted_names:
-        return False
-    parsed = parse_log_line(msg_line)
-    if not parsed or parsed.kind != "message":
-        return False
-    return (parsed.long_name.strip().lower() in _muted_names
-            or parsed.short_name.strip().lower() in _muted_names)
-
 # Live "message" events pushed by the logger before history has finished
 # printing are buffered here, then flushed in order once history is done.
 _history_ready = False
@@ -149,41 +140,6 @@ _pending_live: list[list[str]] = []
 
 def _safe(text: str) -> str:
     return html.escape(_XML_INVALID.sub("", text or ""))
-
-
-def _load_name_cache() -> None:
-    """node_names_cache.json now only stores /mute state — name resolution
-    moved to mesh_logger.py (onemesh_cache.json), so it can run continuously
-    instead of only while a chat client happens to be connected. An old file
-    from before that move may still have a "names" section; kept here once as
-    a seed so existing users don't lose already-resolved names on upgrade —
-    _reload_onemesh_cache() below overlays the shared (fresher, logger-owned)
-    cache on top, and only that file grows from here on."""
-    global _name_cache, _muted_names
-    _name_cache = {}
-    _muted_names = set()
-    if NAME_CACHE_FILE.exists():
-        try:
-            raw = json.loads(NAME_CACHE_FILE.read_text(encoding="utf-8"))
-            if "names" in raw or "muted" in raw:
-                legacy_names, muted = raw.get("names", {}), raw.get("muted", [])
-            else:
-                legacy_names, muted = raw, []
-            _name_cache = {int(k): (v["long"], v["short"]) for k, v in legacy_names.items()}
-            _muted_names = set(muted)
-        except Exception:
-            pass
-    _reload_onemesh_cache()
-
-
-def _save_name_cache() -> None:
-    try:
-        NAME_CACHE_FILE.write_text(
-            json.dumps({"muted": sorted(_muted_names)}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
 
 
 def _reload_onemesh_cache() -> None:
@@ -213,7 +169,7 @@ def _enrich_nodes(nodes: list[dict]) -> list[dict]:
     _nodes_payload()) are only ever what the mesh's own NodeInfo carries —
     None for a node we only know as `!hex (???)` with a since-resolved
     OneMesh cache entry. /nodes already computed this inline; factored out
-    so /dm, /trace, /ping, /who, /mute and tab-completion can match and
+    so /dm, /trace, /ping, /who, /ignore and tab-completion can match and
     display against the same name the user actually sees in /nodes, instead
     of only ever matching by raw name or !hex id for such a node."""
     out = []
@@ -282,8 +238,8 @@ def _resolve_display_name(long_name: str, short_name: str) -> tuple[str, str]:
 # ── tab completion ────────────────────────────────────────────────────────────
 
 COMMANDS = ["/nodes", "/who", "/dm", "/reply", "/react", "/ch", "/send", "/search",
-            "/last", "/trace", "/ping", "/stats", "/mute", "/unmute",
-            "/updatenames", "/settings", "/botping", "/autoping", "/reboot",
+            "/trace", "/ping", "/stats", "/ignore", "/unignore",
+            "/updatenames", "/settings", "/reboot",
             "/reconnect", "/clear", "/help"]
 
 
@@ -301,7 +257,7 @@ class MeshCompleter(Completer):
             return
         cmd, _, arg = text.partition(" ")
         cmd = cmd.lower()
-        if cmd in ("/dm", "/trace", "/ping", "/mute", "/unmute", "/last", "/who"):
+        if cmd in ("/dm", "/trace", "/ping", "/ignore", "/unignore", "/who"):
             probe = arg.lstrip('"').lower()
             for cand in _completion_nodes:
                 if cand.strip('"').lower().startswith(probe):
@@ -323,10 +279,6 @@ class MeshCompleter(Completer):
         elif cmd == "/stats":
             for cand in t_list("stats_completions"):
                 if cand.startswith(arg.lower()):
-                    yield Completion(cand, start_position=-len(arg))
-        elif cmd == "/botping":
-            for cand in ("0", "1"):
-                if cand.startswith(arg):
                     yield Completion(cand, start_position=-len(arg))
         elif cmd == "/settings":
             if " " not in arg:
@@ -477,19 +429,21 @@ def _handle_event(obj: dict) -> None:
             print_formatted_text(HTML(
                 f"<ansired>{t('not_delivered', error=_safe(str(obj.get('error', ''))), ref=ref)}</ansired>"
             ))
-        else:
+        elif obj.get("is_dm"):
+            # a DM has one real recipient — a routing-layer ACK genuinely means
+            # something, so a timeout here is worth flagging
             print_formatted_text(HTML(
                 f"<ansiyellow>{t('delivery_unconfirmed', ref=ref)}</ansiyellow>"
             ))
+        # else: broadcast/channel send with no ack — Meshtastic has no single
+        # recipient to ACK a broadcast, only an unreliable "implicit ack" (heard
+        # a neighbor rebroadcast it); a timeout here is the *normal*, expected
+        # outcome on a busy shared channel, not a sign anything went wrong, so
+        # printing it every time was pure noise — silently say nothing instead
     elif kind == "message":
         lines = obj.get("lines", [])
         if not lines or not _channel_matches(lines[-1]):
             return
-        # mute only hides from the screen — /reply targets stay reachable even
-        # for a muted sender, same as /search and /last (see Muting in
-        # CLAUDE.md); the channel filter above is different: a filtered
-        # session is meant to be a clean view of just that channel, so it's
-        # allowed to also gate what becomes a /reply target
         if obj.get("packet_id"):
             _replyables.append({
                 "packet_id": obj["packet_id"],
@@ -499,8 +453,6 @@ def _handle_event(obj: dict) -> None:
                 "channel_index": obj.get("channel_index", 0),
                 "line": lines[-1],
             })
-        if _is_muted(lines[-1]):
-            return
         if _history_ready:
             quote = lines[0] if len(lines) == 2 else None
             _render_if_new(quote, lines[-1])
@@ -661,8 +613,6 @@ def _print_initial_history(n: int = HISTORY_SIZE) -> None:
         file_units = _split_into_units(lines)
         if _channel_filter is not None:
             file_units = [u for u in file_units if _channel_matches(u[1])]
-        if _muted_names:
-            file_units = [u for u in file_units if not _is_muted(u[1])]
         units = file_units + units
         if len(units) >= n:
             break
@@ -710,8 +660,6 @@ def _replay_missed(lost_at: datetime.datetime) -> None:
             if file_date == lost_at.date() and parsed.time_str < cutoff_time:
                 continue
             if not _channel_matches(msg):
-                continue
-            if _is_muted(msg):
                 continue
             _render_if_new(quote, msg)
 
@@ -906,6 +854,17 @@ async def _cmd_who(args: str = "") -> None:
     else:
         print_formatted_text(HTML(f"<ansigray>{t('err_no_position', name=_safe(ln))}</ansigray>"))
 
+    # matches against the resolved display name, not the raw typed query —
+    # _pick_node may have resolved a prefix/substring to the full name, and
+    # log lines are written under the same resolved name (see Node name
+    # resolution in CLAUDE.md), so this is what actually appears in logs/
+    matches = _scan_units(
+        lambda p: p.long_name.lower() == ln.lower() or p.short_name.lower() == sn.lower(),
+        LAST_LIMIT,
+    )
+    _print_unit_matches(t("hdr_last_from", query=_safe(ln)), matches, LAST_LIMIT,
+                        t("last_empty", query=_safe(ln)))
+
 
 def _handle_send_response(resp: dict, text: str) -> None:
     if resp.get("ok"):
@@ -1010,9 +969,11 @@ async def _cmd_trace(args: str) -> None:
 
 
 async def _cmd_ping(args: str) -> None:
-    """Меряет RTT до узла: DM с wantAck, дожидаемся своего delivery-события
-    по packet_id (см. _pending_pings в _handle_event) и печатаем время + число
-    хопов, которое ACK принёс с собой (см. handler() в mesh_logger.py)."""
+    """Меряет RTT до узла: silent wantAck-пакет (не текстовое сообщение — см.
+    _send_ping_packet в mesh_logger.py, ничего не появляется в DM у адресата),
+    дожидаемся своего delivery-события по packet_id (см. _pending_pings в
+    _handle_event) и печатаем время + число хопов, которое ACK принёс с собой
+    (см. handler() в mesh_logger.py)."""
     target_name = args.strip()
     if not target_name:
         print_formatted_text(HTML(f"<ansiyellow>{t('usage_ping')}</ansiyellow>"))
@@ -1033,16 +994,10 @@ async def _cmd_ping(args: str) -> None:
     print_formatted_text(HTML(f"<ansiwhite>{t('pinging', ln=_safe(ln), sn=_safe(sn))}</ansiwhite>"))
 
     start = _loop.time()
-    send_resp = await _client.request("dm", node_id=node["node_id"], text="🏓 ping",
-                                       channel=_channel_index)
+    send_resp = await _client.request("ping", node_id=node["node_id"], channel=_channel_index)
     if not send_resp.get("ok"):
         print_formatted_text(HTML(
             f"<ansired>{t('err_send_error', error=_safe(send_resp.get('error', '')))}</ansired>"
-        ))
-        return
-    if send_resp.get("queued"):
-        print_formatted_text(HTML(
-            f"<ansiyellow>{t('ping_queued')}</ansiyellow>"
         ))
         return
     pid = send_resp.get("packet_id")
@@ -1085,19 +1040,34 @@ def _reply_label(r: dict, num: int) -> str:
         return f"#{num}"
     ln, _ = _resolve_display_name(parsed.long_name, parsed.short_name)
     dm = "DM " if parsed.is_dm else ""
-    return (f"  #{num} [{_safe(parsed.time_str)}] {dm}<b>{_safe(ln)}</b>: "
+    # same convention as live rendering (_print_msg): only show which channel
+    # a message is from when the session isn't already filtered to one —
+    # otherwise every listed item is obviously on that one channel already.
+    # Unfiltered sessions mix channels together, and replying to the wrong
+    # one because it wasn't obvious which channel #N was on is an easy miss.
+    ch = f"<ansimagenta>{_safe(parsed.channel)}</ansimagenta> " if _channel_filter is None else ""
+    return (f"  #{num} {ch}[{_safe(parsed.time_str)}] {dm}<b>{_safe(ln)}</b>: "
             f"{_safe(_snippet(parsed.text, 50))}")
 
 
 def _list_replyables() -> None:
+    global _last_reply_snapshot
+    _last_reply_snapshot = list(reversed(_replyables))
     print_formatted_text(HTML(f"<ansiwhite>{t('hdr_replyables')}</ansiwhite>"))
-    for num, r in enumerate(reversed(_replyables), start=1):
+    for num, r in enumerate(_last_reply_snapshot, start=1):
         print_formatted_text(HTML(f"<ansiwhite>{_reply_label(r, num)}</ansiwhite>"))
     print_formatted_text(HTML(f"<ansigray>{t('reply_hint')}</ansigray>"))
 
 
 def _parse_target_and_text(args: str, usage_html: str) -> tuple[dict, str] | None:
-    """Общий разбор `#N <текст>` / `<текст>` (на #1), используется /reply и /react."""
+    """Общий разбор `#N <текст>` / `<текст>` (на #1), используется /reply и /react.
+    `#N` резолвится против _last_reply_snapshot — того самого списка, который
+    человек только что видел на экране от /reply или /react без аргументов —
+    а не против живого _replyables, чтобы номер не "уехал" из-за сообщений,
+    прилетевших между показом списка и отправкой команды (см. комментарий у
+    _last_reply_snapshot). Без номера (реплай на #1) — намеренно живой:
+    "ответить на самое свежее прямо сейчас" не подразумевает, что список
+    вообще показывался."""
     if args.startswith("#"):
         num_str, _, text = args[1:].partition(" ")
         text = text.strip()
@@ -1105,12 +1075,13 @@ def _parse_target_and_text(args: str, usage_html: str) -> tuple[dict, str] | Non
             print_formatted_text(HTML(usage_html))
             return None
         num = int(num_str)
-        if not 1 <= num <= len(_replyables):
+        pool = _last_reply_snapshot or list(reversed(_replyables))
+        if not 1 <= num <= len(pool):
             print_formatted_text(HTML(
-                f"<ansired>{t('err_no_such_reply', num=num, max=len(_replyables))}</ansired>"
+                f"<ansired>{t('err_no_such_reply', num=num, max=len(pool))}</ansired>"
             ))
             return None
-        return _replyables[-num], text
+        return pool[num - 1], text
     return _replyables[-1], args
 
 
@@ -1245,6 +1216,7 @@ async def _cmd_ch(args: str) -> None:
     kept = [r for r in _replyables if r["channel_index"] == match["index"]]
     _replyables.clear()
     _replyables.extend(kept)
+    _last_reply_snapshot.clear()  # старые номера относились к прежнему списку каналов
     print_formatted_text(HTML(
         f"<b><ansicyan>{t('channel_banner', name=_safe(_channel_filter))}</ansicyan></b>"
     ))
@@ -1331,25 +1303,15 @@ def _cmd_search(args: str) -> None:
                         t("search_empty", query=_safe(query)))
 
 
-def _cmd_last(args: str) -> None:
-    query = args.strip()
-    if not query:
-        print_formatted_text(HTML(f"<ansiyellow>{t('usage_last')}</ansiyellow>"))
-        return
-
-    q = query.lower()
-    matches = _scan_units(
-        lambda p: p.long_name.lower() == q or p.short_name.lower() == q,
-        LAST_LIMIT,
-    )
-    _print_unit_matches(t("hdr_last_from", query=_safe(query)), matches, LAST_LIMIT,
-                        t("last_empty", query=_safe(query)))
-
-
 def _collect_stats() -> dict:
     """Synchronous — called via asyncio.to_thread so a large logs/ directory
     doesn't stall the prompt. Device connection not needed: everything comes
-    from logs/, same as /search."""
+    from logs/, same as /search. Defaults to the Primary channel rather than
+    every channel mixed together (all-channels stats conflated unrelated
+    groups' traffic into one meaningless total) — but still respects an
+    explicit /ch switch to some other channel, since that's already a
+    deliberate one-channel view."""
+    channel_name = _channel_filter or "Primary"
     per_day: collections.Counter = collections.Counter()
     per_node: collections.Counter = collections.Counter()
     per_hour: collections.Counter = collections.Counter()
@@ -1364,7 +1326,7 @@ def _collect_stats() -> dict:
             parsed = parse_log_line(line)
             if not parsed or parsed.kind != "message":
                 continue
-            if _channel_filter is not None and parsed.channel.lower() != _channel_filter.lower():
+            if parsed.channel.lower() != channel_name.lower():
                 continue
             total += 1
             per_day[date_str] += 1
@@ -1450,153 +1412,76 @@ async def _cmd_updatenames() -> None:
         ))
 
 
-def _list_muted() -> None:
-    if not _muted_names:
-        print_formatted_text(HTML(f"<ansiyellow>{t('empty_muted_list')}</ansiyellow>"))
+def _list_ignored(nodes: list[dict]) -> None:
+    ignored = [n for n in nodes if n.get("is_ignored")]
+    if not ignored:
+        print_formatted_text(HTML(f"<ansiyellow>{t('empty_ignored_list')}</ansiyellow>"))
         return
-    print_formatted_text(HTML(f"<ansiwhite>{t('hdr_muted')}</ansiwhite>"))
-    for name in sorted(_muted_names):
-        print_formatted_text(HTML(f"  {_safe(name)}"))
-    print_formatted_text(HTML(f"<ansigray>{t('unmute_hint')}</ansigray>"))
+    print_formatted_text(HTML(f"<ansiwhite>{t('hdr_ignored')}</ansiwhite>"))
+    for n in ignored:
+        ln = n.get("display_long") or n.get("long_name") or f"!{n['node_id']:08x}"
+        sn = n.get("display_short") or n.get("short_name") or "???"
+        print_formatted_text(HTML(f"  {_safe(ln)} ({_safe(sn)})"))
+    print_formatted_text(HTML(f"<ansigray>{t('unignore_hint')}</ansigray>"))
 
 
-async def _cmd_mute(args: str) -> None:
-    """Мьютит по имени, а не по node_id: лог хранит только текстовые имена
-    (см. CLAUDE.md), поэтому это единственный ключ, который работает и для
-    живых, и для исторических сообщений. Живой список узлов используется
-    только чтобы взять каноническое long_name при точном совпадении; если
-    узел сейчас не виден (офлайн/неизвестен), мьютим по введённому тексту
-    напрямую — тоже сработает, раз /is_muted проверяет и short_name."""
+async def _cmd_ignore(args: str) -> None:
+    """Настоящий firmware-уровневый игнор (node.setIgnored(), см.
+    _set_ignored_node в mesh_logger.py) — не app-level фильтр вроде старого
+    /mute. Устройство отбрасывает пакеты игнорируемого узла ещё до того, как
+    mesh_logger.py их увидит: сообщения перестают логироваться совсем, а не
+    просто скрываются из живой ленты. Из-за этого, в отличие от /mute,
+    игнорировать можно только реально видимый сейчас узел (нужен его
+    node_id) — по имени вслепую, как раньше, больше не сработает."""
     query = args.strip()
-    if not query:
-        _list_muted()
-        return
-
     resp = await _client.request("nodes")
     nodes = _enrich_nodes(resp.get("nodes", [])) if resp.get("ok") else []
-    matches = _find_node_in_list(nodes, query)
-    # display_long over long_name: mesh_logger.py's own OneMesh resolution
-    # feeds the same name into _node_names(), so it's what actually ends up
-    # written in the log lines /is_muted matches against — muting by the raw
-    # (possibly None, for a !hex-only node) long_name would silently fail to
-    # match anything once the logger resolves the name
-    canonical = matches[0].get("display_long") or matches[0].get("long_name") \
-        if len(matches) == 1 else None
-    target = canonical or query
-
-    key = target.strip().lower()
-    if key in _muted_names:
-        print_formatted_text(HTML(f"<ansiyellow>{t('already_muted', name=_safe(target))}</ansiyellow>"))
-        return
-    _muted_names.add(key)
-    _save_name_cache()
-    print_formatted_text(HTML(
-        f"<ansigray>{t('muted_msg', name=_safe(target))}</ansigray>"
-    ))
-
-
-async def _cmd_unmute(args: str) -> None:
-    query = args.strip()
     if not query:
-        _list_muted()
+        _list_ignored(nodes)
         return
-    key = query.lower()
-    if key not in _muted_names:
+
+    node = _pick_node(nodes, query)
+    if not node:
+        return
+    ln = node.get("display_long") or node.get("long_name") or "?"
+    if node.get("is_ignored"):
+        print_formatted_text(HTML(f"<ansiyellow>{t('already_ignored', name=_safe(ln))}</ansiyellow>"))
+        return
+
+    ignore_resp = await _client.request("ignore", action="add", node_id=node["node_id"])
+    if not ignore_resp.get("ok"):
         print_formatted_text(HTML(
-            f"<ansiyellow>{t('not_muted', name=_safe(query))}</ansiyellow>"
+            f"<ansired>{t('err_ignore_failed', error=_safe(ignore_resp.get('error', '')))}</ansired>"
         ))
         return
-    _muted_names.discard(key)
-    _save_name_cache()
-    print_formatted_text(HTML(f"<ansigreen>{t('unmuted_msg', name=_safe(query))}</ansigreen>"))
+    print_formatted_text(HTML(f"<ansigray>{t('ignored_msg', name=_safe(ln))}</ansigray>"))
 
 
-async def _cmd_botping(args: str) -> None:
-    """Включает/выключает бота (живёт в mesh_logger.py, работает независимо
-    от того, открыт ли какой-то клиент): он отвечает в канале PING_CHANNEL
-    на любое сообщение количеством хопов от отправителя, настоящим reply
-    (с цитатой). Состояние (BOTPING_ENABLED) переживает рестарт логгера —
-    хранится в .env."""
-    value = args.strip()
-    if value not in ("0", "1"):
-        print_formatted_text(HTML(f"<ansiyellow>{t('usage_botping')}</ansiyellow>"))
+async def _cmd_unignore(args: str) -> None:
+    query = args.strip()
+    resp = await _client.request("nodes")
+    nodes = _enrich_nodes(resp.get("nodes", [])) if resp.get("ok") else []
+    if not query:
+        _list_ignored(nodes)
         return
-    resp = await _client.request("botping", value=value)
-    if not resp.get("ok"):
+
+    node = _pick_node(nodes, query)
+    if not node:
+        return
+    ln = node.get("display_long") or node.get("long_name") or "?"
+    if not node.get("is_ignored"):
+        print_formatted_text(HTML(f"<ansiyellow>{t('not_ignored', name=_safe(ln))}</ansiyellow>"))
+        return
+
+    ignore_resp = await _client.request("ignore", action="remove", node_id=node["node_id"])
+    if not ignore_resp.get("ok"):
         print_formatted_text(HTML(
-            f"<ansired>{t('err_botping_change_failed', error=_safe(resp.get('error', '')))}</ansired>"
+            f"<ansired>{t('err_ignore_failed', error=_safe(ignore_resp.get('error', '')))}</ansired>"
         ))
         return
-    state = t("botping_on") if resp.get("enabled") else t("botping_off")
-    print_formatted_text(HTML(f"<ansigreen>{t('botping_state', state=state)}</ansigreen>"))
-    if resp.get("enabled") and not resp.get("channel_found", True):
-        print_formatted_text(HTML(f"<ansiyellow>{t('botping_no_channel')}</ansiyellow>"))
+    print_formatted_text(HTML(f"<ansigreen>{t('unignored_msg', name=_safe(ln))}</ansigreen>"))
 
 
-async def _cmd_autoping(args: str) -> None:
-    """Configures the liveness-canary broadcast into the Ping channel (lives
-    in mesh_logger.py's _periodic_autoping, independent of /botping — see
-    CLAUDE.md). Interval (minutes, 0 = off) and custom text both persist to
-    .env (AUTOPING_INTERVAL_MIN/AUTOPING_TEXT) and take effect immediately,
-    not just on the next already-scheduled tick."""
-    parts = args.strip().split(None, 1)
-
-    if not parts:
-        resp = await _client.request("autoping", action="get")
-        if not resp.get("ok"):
-            print_formatted_text(HTML(
-                f"<ansired>{t('err_autoping_fetch_failed', error=_safe(resp.get('error', '')))}</ansired>"
-            ))
-            return
-        interval = resp.get("interval_min", 0)
-        if interval <= 0:
-            print_formatted_text(HTML(f"<ansiyellow>{t('autoping_status_off')}</ansiyellow>"))
-        else:
-            print_formatted_text(HTML(
-                f"<ansiwhite>{t('autoping_status_on', interval=interval, text=_safe(resp.get('text', '')))}</ansiwhite>"
-            ))
-            if not resp.get("channel_found", True):
-                print_formatted_text(HTML(f"<ansiyellow>{t('autoping_no_channel')}</ansiyellow>"))
-        return
-
-    if parts[0].lower() == "text":
-        text = parts[1] if len(parts) > 1 else ""
-        if text.strip().lower() == "default":
-            text = ""
-        resp = await _client.request("autoping", action="set_text", text=text)
-        if not resp.get("ok"):
-            print_formatted_text(HTML(
-                f"<ansired>{t('err_autoping_change_failed', error=_safe(resp.get('error', '')))}</ansired>"
-            ))
-            return
-        print_formatted_text(HTML(
-            f"<ansigreen>{t('autoping_text_set', text=_safe(resp.get('text', '')))}</ansigreen>"
-        ))
-        return
-
-    if parts[0].lower() == "off":
-        minutes = 0
-    else:
-        try:
-            minutes = int(parts[0])
-            if minutes < 0:
-                raise ValueError
-        except ValueError:
-            print_formatted_text(HTML(f"<ansiyellow>{t('usage_autoping')}</ansiyellow>"))
-            return
-
-    resp = await _client.request("autoping", action="set_interval", minutes=minutes)
-    if not resp.get("ok"):
-        print_formatted_text(HTML(
-            f"<ansired>{t('err_autoping_change_failed', error=_safe(resp.get('error', '')))}</ansired>"
-        ))
-        return
-    if minutes <= 0:
-        print_formatted_text(HTML(f"<ansigreen>{t('autoping_disabled')}</ansigreen>"))
-    else:
-        print_formatted_text(HTML(f"<ansigreen>{t('autoping_interval_set', minutes=minutes)}</ansigreen>"))
-        if not resp.get("channel_found", True):
-            print_formatted_text(HTML(f"<ansiyellow>{t('autoping_no_channel')}</ansiyellow>"))
 
 
 async def _cmd_settings(args: str) -> None:
@@ -1709,16 +1594,13 @@ async def _handle_command(text: str) -> None:
     elif cmd == "ch":          await _cmd_ch(args)
     elif cmd == "send":        await _cmd_send(args)
     elif cmd == "search":      _cmd_search(args)
-    elif cmd == "last":        _cmd_last(args)
     elif cmd == "stats":       await _cmd_stats(args)
     elif cmd == "trace":       await _cmd_trace(args)
     elif cmd == "ping":        await _cmd_ping(args)
-    elif cmd == "mute":        await _cmd_mute(args)
-    elif cmd == "unmute":      await _cmd_unmute(args)
+    elif cmd == "ignore":      await _cmd_ignore(args)
+    elif cmd == "unignore":    await _cmd_unignore(args)
     elif cmd == "updatenames": await _cmd_updatenames()
     elif cmd == "settings":    await _cmd_settings(args)
-    elif cmd == "botping":     await _cmd_botping(args)
-    elif cmd == "autoping":    await _cmd_autoping(args)
     elif cmd == "reboot":     await _cmd_reboot(args)
     elif cmd == "reconnect":   await _cmd_reconnect(args)
     elif cmd == "clear":       _cmd_clear()
@@ -1734,7 +1616,7 @@ async def _handle_command(text: str) -> None:
 async def main() -> None:
     global _loop, _client, _history_ready, _channel_filter, _channel_index, _channel_resolved
     _loop = asyncio.get_running_loop()
-    _load_name_cache()
+    _reload_onemesh_cache()
     _channel_filter, history_size = _parse_args()
 
     if not SOCKET_PATH.exists():

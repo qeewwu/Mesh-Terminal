@@ -40,7 +40,6 @@ from mesh_common import (
     HOST,
     LOG_DIR,
     ONEMESH_CACHE_FILE,
-    PING_CHANNEL_NAME,
     SOCKET_PATH,
     USB_PORT,
     current_log_file,
@@ -71,7 +70,6 @@ SESSION_KEY_TIMEOUT = 5.0  # how long to wait for the admin session passkey hand
 ONEMESH_API = "https://map.onemesh.ru/api/v1/nodes/{}"
 ONEMESH_DELAY = 0.25  # between OneMesh lookups, so a full sweep doesn't hammer the API
 ONEMESH_UPDATE_INTERVAL = 30 * 60  # background resolution sweep: at startup, then every 30 min
-AUTOPING_INTERVAL_DEFAULT_MIN = 120  # 2h — matches the old hardcoded interval
 
 _interface = None
 _loop: asyncio.AbstractEventLoop | None = None
@@ -84,35 +82,6 @@ _reconnect_event: asyncio.Event | None = None
 _hard_reconnect_event: asyncio.Event | None = None
 _hard_reconnect_host: str | None = None  # MESH_HOST override for wifi, sticky once set
 _last_rx: float = 0.0  # time.monotonic() of the last packet of any kind
-# /botping toggle (mesh_chat.py "botping" IPC cmd) — persisted to .env
-# (BOTPING_ENABLED) so it survives a logger restart; loaded once at import,
-# same as HOST/PING_CHANNEL_NAME.
-_botping_enabled: bool = parse_env_file(ENV_FILE).get("BOTPING_ENABLED", "0") == "1"
-BOTPING_MARKER = "🤖"  # prefix on our own bot replies — see _maybe_botping_reply
-
-
-def _load_autoping_interval_min() -> int:
-    raw = parse_env_file(ENV_FILE).get("AUTOPING_INTERVAL_MIN", "").strip()
-    if not raw:
-        return AUTOPING_INTERVAL_DEFAULT_MIN
-    try:
-        return max(0, int(raw))  # 0 = disabled
-    except ValueError:
-        return AUTOPING_INTERVAL_DEFAULT_MIN
-
-
-# /autoping <minutes|off|text ...> in mesh_chat.py — both persisted to .env
-# (AUTOPING_INTERVAL_MIN, AUTOPING_TEXT) so they survive a logger restart,
-# loaded once at import like BOTPING_ENABLED/HOST. 0 minutes means disabled —
-# no separate on/off flag needed. Empty text means "use the localized
-# t('autoping_text') default", not a literal empty broadcast.
-_autoping_interval_min: int = _load_autoping_interval_min()
-_autoping_text_override: str = parse_env_file(ENV_FILE).get("AUTOPING_TEXT", "").strip()
-# wakes _periodic_autoping() early when interval/text changes, same
-# interrupt-a-sleep idiom as _hard_reconnect_event — so a change takes effect
-# starting from the next cycle immediately, not whenever the old interval
-# happened to be about to expire (which could be hours away)
-_autoping_changed_event: asyncio.Event | None = None
 
 
 class MsgRecord(NamedTuple):
@@ -302,107 +271,6 @@ def _channels_payload() -> list[dict]:
     return out
 
 
-def _ping_channel_index() -> int | None:
-    """None if the device has no channel named PING_CHANNEL_NAME (bot simply
-    never fires — channel_index never equals None) or channels aren't known yet."""
-    try:
-        channels = _interface.localNode.channels or []
-    except Exception:
-        return None
-    for ch in channels:
-        if ch.role != 0 and ch.settings.name.lower() == PING_CHANNEL_NAME.lower():
-            return ch.index
-    return None
-
-
-def _set_botping(enabled: bool) -> None:
-    global _botping_enabled
-    _botping_enabled = enabled
-    with contextlib.suppress(Exception):
-        update_env_file(ENV_FILE, {"BOTPING_ENABLED": "1" if enabled else "0"})
-
-
-def _notify_autoping_changed() -> None:
-    if _loop and _autoping_changed_event:
-        _loop.call_soon_threadsafe(_autoping_changed_event.set)
-
-
-def _set_autoping_interval(minutes: int) -> None:
-    global _autoping_interval_min
-    _autoping_interval_min = minutes
-    with contextlib.suppress(Exception):
-        update_env_file(ENV_FILE, {"AUTOPING_INTERVAL_MIN": str(minutes)})
-    _notify_autoping_changed()
-
-
-def _set_autoping_text(text: str) -> None:
-    """Empty `text` resets to the localized default (t("autoping_text"))."""
-    global _autoping_text_override
-    _autoping_text_override = text
-    with contextlib.suppress(Exception):
-        update_env_file(ENV_FILE, {"AUTOPING_TEXT": text})
-    _notify_autoping_changed()
-
-
-async def _send_botping_reply(reply_id: int, channel_index: int, hops: int) -> None:
-    text = t("botping_reply", marker=BOTPING_MARKER, hops_phrase=plural("hops_forms", hops))
-    await _send_message("send", text, channel_index, reply_id=reply_id)
-
-
-def _maybe_botping_reply(from_id: int, packet_id: int, channel_index: int,
-                          is_dm: bool, is_reply: bool, text: str, hops: int) -> None:
-    """Called from on_receive() (meshtastic's callback thread) — only ever
-    schedules work onto the event loop, never sends directly from here."""
-    if not _botping_enabled or is_dm or not packet_id:
-        return
-    if channel_index != _ping_channel_index():
-        return
-    if _interface and from_id == _interface.myInfo.my_node_num:
-        return  # никогда не должно сработать (свои пакеты не приходят через on_receive), но дёшево перестраховаться
-    # без этой проверки два узла с включённым botping отвечали бы друг другу
-    # бесконечно: сообщение с маркером — это уже чей-то ответ бота, не исходное
-    if is_reply or text.strip().startswith(BOTPING_MARKER):
-        return
-    if _loop:
-        _loop.call_soon_threadsafe(
-            lambda: _loop.create_task(_send_botping_reply(packet_id, channel_index, hops)))
-
-
-async def _periodic_autoping() -> None:
-    """Health-check heartbeat into the Ping channel: unrelated to /botping (runs
-    regardless of whether the reply-bot is toggled on) — the point is a visible
-    "the mesh link is alive" canary, for us and for anyone/anything listening on
-    that channel. Sleeps first so a logger restart doesn't immediately re-ping.
-    Interval/text/on-off are configurable via /autoping in mesh_chat.py; a
-    0-minute interval means disabled, in which case this waits indefinitely on
-    _autoping_changed_event rather than polling. A change while asleep wakes
-    this immediately and restarts the wait with the new settings — the next
-    canary fires one fresh interval from the change, not whenever the old
-    interval happened to be about to expire (which could be hours away)."""
-    while True:
-        interval_min = _autoping_interval_min
-        if interval_min <= 0:
-            await _autoping_changed_event.wait()
-            _autoping_changed_event.clear()
-            continue
-        try:
-            await asyncio.wait_for(_autoping_changed_event.wait(), timeout=interval_min * 60)
-            _autoping_changed_event.clear()
-            continue  # settings changed mid-sleep — re-read at the top, don't send early
-        except asyncio.TimeoutError:
-            pass
-        if not _interface:
-            continue
-        idx = _ping_channel_index()
-        if idx is None:
-            continue
-        text = _autoping_text_override or t("autoping_text")
-        try:
-            await _send_message("send", text, idx)
-        except Exception as e:
-            print(f"[warn] autoping failed: {e}", file=sys.stderr)
-
-
 # _write_message runs both on the meshtastic callback thread (on_receive) and
 # the event loop thread (send/dm) — without a lock a quote+message pair could
 # interleave with a concurrent write.
@@ -520,8 +388,6 @@ def on_receive(packet, interface):
                              "is_dm": is_dm, "channel_index": channel_index,
                              "is_emoji": is_emoji})
         print(_console(f"[recv] {long_name} ({short_name}): {text}"))
-        _maybe_botping_reply(from_id, packet_id, channel_index, is_dm,
-                              bool(reply_id), text, hops)
     except Exception as e:
         print(f"[error] on_receive: {e}", file=sys.stderr)
 
@@ -762,6 +628,7 @@ def _nodes_payload() -> list[dict]:
             "lat": position.get("latitude"),
             "lon": position.get("longitude"),
             "alt": position.get("altitude"),
+            "is_ignored": bool(node.get("isIgnored")),
         })
     # nodes known only via relayed messages, never a NodeInfo — absent from
     # _interface.nodes entirely, but with a real name already resolved via
@@ -784,6 +651,7 @@ def _nodes_payload() -> list[dict]:
                 "lat": None,
                 "lon": None,
                 "alt": None,
+                "is_ignored": False,
             })
     return out
 
@@ -813,6 +681,26 @@ def _send_emoji_packet(iface, text: str, channel_index: int, reply_id: int,
     return iface._sendPacket(packet, destination_id, wantAck=True)
 
 
+def _send_ping_packet(iface, channel_index: int, handler, destination_id, pid_holder: dict):
+    """Builds a bare wantAck packet instead of sendText()'s TEXT_MESSAGE_APP — the
+    mesh-layer ACK/NAK (what /ping actually measures: RTT + hops from the ACK
+    packet's hopStart/hopLimit) fires for any unicast packet with wantAck=True
+    regardless of portnum, so there's no need to write an actual chat message
+    into the target's DM inbox just to measure round-trip time. PRIVATE_APP is
+    the portnum Meshtastic itself reserves for exactly this kind of custom,
+    non-chat traffic — official apps don't render it in the chat UI, unlike
+    TEXT_MESSAGE_APP. Same _sendPacket()-by-hand precedent as _send_emoji_packet."""
+    from meshtastic.protobuf import portnums_pb2
+
+    packet = mesh_pb2.MeshPacket()
+    packet.channel = channel_index
+    packet.decoded.portnum = portnums_pb2.PortNum.PRIVATE_APP
+    packet.id = iface._generatePacketId()
+    pid_holder["pid"] = packet.id
+    iface._addResponseHandler(packet.id, handler)
+    return iface._sendPacket(packet, destination_id, wantAck=True)
+
+
 def _send_text_tracked(iface, text: str, kwargs: dict, pid_holder: dict):
     """Wraps sendText() so pid_holder is populated inside the same worker
     thread, immediately after the packet id is known — narrows (though,
@@ -829,9 +717,12 @@ async def _send_message(cmd: str, text: str, channel_index: int, reply_id: int =
                          node_id: int | None = None,
                          notify_writer: asyncio.StreamWriter | None = None,
                          notify_lock: asyncio.Lock | None = None,
-                         attempts: int = 0, emoji: bool = False) -> dict:
+                         attempts: int = 0, emoji: bool = False, ping: bool = False) -> dict:
     """Transmit via the device (send or dm) and log the result. Shared by the
-    live IPC handler and the outbox flush after a reconnect."""
+    live IPC handler and the outbox flush after a reconnect. `ping=True` is a
+    silent RTT probe (see _send_ping_packet) — no text payload, and never
+    logged or queued to the outbox the way a real message would be, since a
+    ping delivered late after a reconnect wouldn't mean anything."""
     if not _interface:
         return {"ok": False, "error": "not connected"}
 
@@ -839,10 +730,11 @@ async def _send_message(cmd: str, text: str, channel_index: int, reply_id: int =
     if reply_id and not emoji and "replyId" not in inspect.signature(iface.sendText).parameters:
         return {"ok": False, "error": t("err_no_replyid_support")}
 
-    text_bytes = len(text.encode("utf-8"))
-    if text_bytes > MAX_PAYLOAD_BYTES:
-        return {"ok": False, "error": t("err_message_too_long", bytes=text_bytes,
-                                        max=MAX_PAYLOAD_BYTES)}
+    if not ping:
+        text_bytes = len(text.encode("utf-8"))
+        if text_bytes > MAX_PAYLOAD_BYTES:
+            return {"ok": False, "error": t("err_message_too_long", bytes=text_bytes,
+                                            max=MAX_PAYLOAD_BYTES)}
 
     pid_holder = {}
     fired = {"done": False}
@@ -854,7 +746,7 @@ async def _send_message(cmd: str, text: str, channel_index: int, reply_id: int =
         if notify_writer is None or notify_lock is None:
             return
         event = {"event": "delivery", "packet_id": pid_holder.get("pid"),
-                  "ok": ok, "text": text}
+                  "ok": ok, "text": text, "is_dm": cmd in ("dm", "ping")}
         if error:
             event["error"] = error
         if hops is not None:
@@ -878,9 +770,9 @@ async def _send_message(cmd: str, text: str, channel_index: int, reply_id: int =
         await asyncio.sleep(ACK_TIMEOUT_SECONDS)
         emit_delivery(None, "timeout")
 
-    destination_id = node_id if cmd == "dm" else BROADCAST_ADDR
+    destination_id = node_id if cmd in ("dm", "ping") else BROADCAST_ADDR
     kwargs = dict(wantAck=True, channelIndex=channel_index, onResponse=handler)
-    if cmd == "dm":
+    if cmd in ("dm", "ping"):
         kwargs["destinationId"] = node_id
     if reply_id:
         kwargs["replyId"] = reply_id
@@ -888,7 +780,10 @@ async def _send_message(cmd: str, text: str, channel_index: int, reply_id: int =
     # sendText does a synchronous socket write — if the device link is
     # stalled it would freeze the whole event loop
     try:
-        if emoji:
+        if ping:
+            sent = await asyncio.to_thread(_send_ping_packet, iface, channel_index,
+                                           handler, destination_id, pid_holder)
+        elif emoji:
             sent = await asyncio.to_thread(_send_emoji_packet, iface, text, channel_index,
                                            reply_id, handler, destination_id, pid_holder)
         else:
@@ -900,10 +795,14 @@ async def _send_message(cmd: str, text: str, channel_index: int, reply_id: int =
         # every time it's flushed
         return {"ok": False, "error": t("err_send_failed", error=e)}
     except Exception as e:
+        _reconnect_event.set()
+        if ping:
+            # a ping delivered late after a reconnect wouldn't measure anything
+            # meaningful — fail it now instead of queueing like a real message
+            return {"ok": False, "error": t("err_send_failed", error=e)}
         # линк умер, но connection.lost ещё не прилетел: сообщение — в outbox,
         # соединение — на переподключение (раньше сообщение просто терялось).
         # attempts не даёт «ядовитому» сообщению бесконечно ронять flush.
-        _reconnect_event.set()
         if attempts < OUTBOX_RETRIES and len(_outbox) < OUTBOX_MAX:
             _outbox.append({"cmd": cmd, "text": text, "channel_index": channel_index,
                             "reply_id": reply_id, "node_id": node_id,
@@ -912,10 +811,14 @@ async def _send_message(cmd: str, text: str, channel_index: int, reply_id: int =
             return {"ok": True, "queued": True}
         return {"ok": False, "error": t("err_send_failed", error=e)}
     # pid_holder is set inside the worker thread by _send_text_tracked/
-    # _send_emoji_packet, before handler() could possibly fire — _packet_id(sent)
-    # is only a fallback for the (should-never-happen) case it wasn't
+    # _send_emoji_packet/_send_ping_packet, before handler() could possibly
+    # fire — _packet_id(sent) is only a fallback for the (should-never-happen)
+    # case it wasn't
     pid = pid_holder.get("pid") or _packet_id(sent)
     _loop.create_task(ack_timeout_watcher())
+
+    if ping:
+        return {"ok": True, "packet_id": pid}
 
     # именно iface, а не _interface: за время await мог случиться реконнект
     my_id = iface.myInfo.my_node_num
@@ -1248,6 +1151,21 @@ def _reboot_node(node) -> None:
     node.reboot(REBOOT_DELAY_SECS)
 
 
+def _set_ignored_node(node, node_id: int, ignored: bool) -> None:
+    """node.setIgnored()/removeIgnored() are admin messages (set_ignored_node/
+    remove_ignored_node) — same session-key race as _apply_setting()/
+    _reboot_node(), so wait for the passkey first. This is the real firmware-
+    level NodeDB ignore list (/ignore), not the old app-level /mute: packets
+    from an ignored node are dropped by the device itself, before mesh_logger
+    ever sees them — so unlike the old /mute, an ignored sender's messages
+    stop being logged entirely, not just hidden from the live feed."""
+    _ensure_session_key(node)
+    if ignored:
+        node.setIgnored(node_id)
+    else:
+        node.removeIgnored(node_id)
+
+
 async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     write_lock = asyncio.Lock()
     _clients[writer] = write_lock
@@ -1302,6 +1220,20 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                         result = await _send_message(cmd, text, channel_index, reply_id,
                                                      node_id, notify_writer=writer,
                                                      notify_lock=write_lock, emoji=emoji)
+                        resp = {"req_id": req_id, **result}
+
+                elif cmd == "ping":
+                    # a silent RTT probe (see _send_ping_packet) — not a chat
+                    # message, so unlike send/dm it's never queued to the
+                    # outbox while offline: a delayed ping means nothing
+                    if not _interface:
+                        resp["error"] = "not connected"
+                    else:
+                        node_id = req.get("node_id")
+                        channel_index = req.get("channel", 0)
+                        result = await _send_message("ping", "", channel_index,
+                                                     node_id=node_id, notify_writer=writer,
+                                                     notify_lock=write_lock, ping=True)
                         resp = {"req_id": req_id, **result}
 
                 elif cmd == "trace":
@@ -1359,6 +1291,23 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                         except Exception as e:
                             resp["error"] = t("err_reboot_failed", error=e)
 
+                elif cmd == "ignore":
+                    if not _interface:
+                        resp["error"] = "not connected"
+                    else:
+                        action = req.get("action", "add")
+                        node_id = req.get("node_id")
+                        if action not in ("add", "remove") or node_id is None:
+                            resp["error"] = f"unknown ignore action: {action}"
+                        else:
+                            try:
+                                await asyncio.to_thread(_set_ignored_node, _interface.localNode,
+                                                        node_id, action == "add")
+                                resp = {"req_id": req_id, "ok": True, "node_id": node_id,
+                                        "ignored": action == "add"}
+                            except Exception as e:
+                                resp["error"] = t("err_apply_failed", error=e)
+
                 elif cmd == "reconnect":
                     # deliberately not gated behind `if not _interface` — the
                     # whole point is to force a fresh connection regardless of
@@ -1377,38 +1326,6 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                         result = await asyncio.to_thread(_run_onemesh_update)
                         resp = {"req_id": req_id, "ok": True, **result}
 
-                elif cmd == "botping":
-                    value = req.get("value")
-                    if value not in ("0", "1"):
-                        resp["error"] = t("err_botping_value")
-                    else:
-                        _set_botping(value == "1")
-                        resp = {"req_id": req_id, "ok": True, "enabled": _botping_enabled,
-                                "channel_found": _ping_channel_index() is not None}
-
-                elif cmd == "autoping":
-                    action = req.get("action", "get")
-                    if action == "get":
-                        resp = {"req_id": req_id, "ok": True,
-                                "interval_min": _autoping_interval_min,
-                                "text": _autoping_text_override or t("autoping_text"),
-                                "text_is_default": not _autoping_text_override,
-                                "channel_found": _ping_channel_index() is not None}
-                    elif action == "set_interval":
-                        minutes = req.get("minutes")
-                        if not isinstance(minutes, int) or isinstance(minutes, bool) or minutes < 0:
-                            resp["error"] = t("err_autoping_bad_interval")
-                        else:
-                            _set_autoping_interval(minutes)
-                            resp = {"req_id": req_id, "ok": True, "interval_min": minutes,
-                                    "channel_found": _ping_channel_index() is not None}
-                    elif action == "set_text":
-                        text = (req.get("text") or "").strip()
-                        _set_autoping_text(text)
-                        resp = {"req_id": req_id, "ok": True,
-                                "text": text or t("autoping_text"), "text_is_default": not text}
-                    else:
-                        resp["error"] = f"unknown autoping action: {action}"
                 else:
                     resp["error"] = f"unknown cmd: {cmd}"
             except Exception as e:
@@ -1440,11 +1357,10 @@ def _prepare_socket_path() -> None:
 
 
 async def main() -> None:
-    global _loop, _reconnect_event, _hard_reconnect_event, _autoping_changed_event
+    global _loop, _reconnect_event, _hard_reconnect_event
     _loop = asyncio.get_running_loop()
     _reconnect_event = asyncio.Event()
     _hard_reconnect_event = asyncio.Event()
-    _autoping_changed_event = asyncio.Event()
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     _load_onemesh_cache()
@@ -1463,7 +1379,6 @@ async def main() -> None:
     reconnect_task = asyncio.create_task(_reconnect_loop())
     watchdog_task = asyncio.create_task(_watchdog())
     onemesh_task = asyncio.create_task(_periodic_onemesh_update())
-    autoping_task = asyncio.create_task(_periodic_autoping())
     server = await asyncio.start_unix_server(_handle_client, path=str(SOCKET_PATH))
     os.chmod(SOCKET_PATH, 0o600)  # only this user may send messages via IPC
     print(f"[info] listening on {SOCKET_PATH}")
@@ -1478,7 +1393,6 @@ async def main() -> None:
         reconnect_task.cancel()
         watchdog_task.cancel()
         onemesh_task.cancel()
-        autoping_task.cancel()
         _unsubscribe()
         with contextlib.suppress(Exception):
             _interface.close()
