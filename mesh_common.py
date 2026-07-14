@@ -223,7 +223,7 @@ def parse_log_line(line: str):
     return None
 
 
-# ── geo helpers (used by mesh_chat.py's /pos) ─────────────────────────────────
+# ── geo helpers (used by mesh_chat.py's /who <name>) ───────────────────────────
 
 _EARTH_RADIUS_KM = 6371.0088
 _COMPASS_POINTS_RU = ["С", "ССВ", "СВ", "ВСВ", "В", "ВЮВ", "ЮВ", "ЮЮВ",

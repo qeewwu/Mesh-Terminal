@@ -125,6 +125,7 @@ _RU: dict[str, object] = {
     # -- mesh_chat.py: /who --------------------------------------------------------
     "err_no_self_info": "Информация о себе недоступна",
     "who_me_label": "Я: ",
+    "who_node_line": "👤 {ln} ({sn}) {id_str}",
 
     # -- mesh_chat.py: _handle_send_response ----------------------------------------
     "queued": (
@@ -158,14 +159,12 @@ _RU: dict[str, object] = {
         "(мог дойти, но ACK не получен)"
     ),
 
-    # -- mesh_chat.py: /pos ---------------------------------------------------------------
-    "usage_pos": "Использование: /pos &lt;имя узла&gt;",
+    # -- mesh_chat.py: /who (position lines, shown when the node has GPS data) ------------
     "unit_m": "м",
     "unit_km": "км",
     "err_no_position": "У узла {name} нет данных о позиции (не шлёт GPS-координаты)",
     "pos_line": "📍 {ln} ({sn}): {lat}, {lon}{alt_str}",
     "pos_distance": "   от меня: {dist_str}, азимут {brng}° ({compass})",
-    "pos_no_own_position": "   (у моего узла нет своей позиции — расстояние не посчитать)",
 
     # -- mesh_chat.py: /reply, /react (shared _replyables plumbing) -----------------------
     "hdr_replyables": "─── На что можно ответить (#1 — самое свежее) ───",
@@ -310,7 +309,7 @@ _RU: dict[str, object] = {
     "help_lines": [
         "─── Команды ───────────────────────────────────────────────",
         "  /nodes [online|names|hops]  список видимых узлов (сортировка, по умолчанию online)",
-        "  /who                 информация о себе",
+        "  /who [имя]           информация о себе, или об узле — имена, hex id, батарея/SNR/хопы, позиция",
         "  /dm &lt;имя&gt; &lt;текст&gt;   личное сообщение (имя с пробелами — в кавычках)",
         "  /reply               список недавних сообщений, на которые можно ответить",
         "  /reply &lt;текст&gt;       ответ (с цитатой) на последнее полученное сообщение",
@@ -324,7 +323,6 @@ _RU: dict[str, object] = {
         "  /stats [день|узел]   статистика по истории переписки",
         "  /trace &lt;имя&gt;        маршрут пакетов до узла (traceroute)",
         "  /ping &lt;имя&gt;         время доставки (RTT) и число хопов до узла",
-        "  /pos &lt;имя&gt;          позиция узла, расстояние и азимут от меня",
         "  /mute &lt;имя&gt;         скрыть сообщения узла из чата (история — всё ещё в /search)",
         "  /unmute [имя]        снять мьют (без аргумента — список замьюченных)",
         "  /updatenames         подтянуть имена узлов с OneMesh (и так — раз в 30 мин фоном)",
@@ -455,6 +453,7 @@ _EN: dict[str, object] = {
 
     "err_no_self_info": "Info about your own node is unavailable",
     "who_me_label": "Me: ",
+    "who_node_line": "👤 {ln} ({sn}) {id_str}",
 
     "queued": (
         "  ⏳ Queued: «{snippet}» — device "
@@ -484,13 +483,11 @@ _EN: dict[str, object] = {
         "(may have arrived, but no ACK received)"
     ),
 
-    "usage_pos": "Usage: /pos &lt;node name&gt;",
     "unit_m": "m",
     "unit_km": "km",
     "err_no_position": "Node {name} has no position data (doesn't send GPS coordinates)",
     "pos_line": "📍 {ln} ({sn}): {lat}, {lon}{alt_str}",
     "pos_distance": "   from me: {dist_str}, bearing {brng}° ({compass})",
-    "pos_no_own_position": "   (your own node has no position — can't compute distance)",
 
     "hdr_replyables": "─── Replyable messages (#1 = newest) ───",
     "reply_hint": "Reply: /reply #&lt;number&gt; &lt;text&gt; — or /reply &lt;text&gt; for #1",
@@ -622,7 +619,7 @@ _EN: dict[str, object] = {
     "help_lines": [
         "─── Commands ──────────────────────────────────────────────",
         "  /nodes [online|names|hops]  list visible nodes (sort mode, default online)",
-        "  /who                 info about your own node",
+        "  /who [name]          info about your own node, or another — names, hex id, battery/SNR/hops, position",
         "  /dm &lt;name&gt; &lt;text&gt;   direct message (quote names containing spaces)",
         "  /reply               list recent messages you can reply to",
         "  /reply &lt;text&gt;       reply (with quote) to the latest received message",
@@ -636,7 +633,6 @@ _EN: dict[str, object] = {
         "  /stats [day|node]    message history statistics",
         "  /trace &lt;name&gt;       packet route to a node (traceroute)",
         "  /ping &lt;name&gt;        delivery time (RTT) and hop count to a node",
-        "  /pos &lt;name&gt;         node position, distance and bearing from me",
         "  /mute &lt;name&gt;        hide a node's messages from chat (still in /search)",
         "  /unmute [name]       remove mute (no argument — list muted senders)",
         "  /updatenames         pull node names from OneMesh (also runs every 30 min)",

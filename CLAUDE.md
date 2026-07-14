@@ -91,7 +91,7 @@ connection:
   `_render_unit` stays in use where re-showing is intended (`/ch` recent history, `/search`).
   `/dm` and `/trace` resolve names via `_pick_node`: exact name/`!hex`-id match beats prefix
   beats substring, and an ambiguous query lists the candidates instead of picking one silently.
-  So do `/ping` and `/pos`; `/mute` uses the unwrapped `_find_node_in_list` instead (see Muting
+  So do `/ping` and `/who <name>`; `/mute` uses the unwrapped `_find_node_in_list` instead (see Muting
   below — it wants a single exact match or a silent fallback, not an error message).
 - **`mesh_common.py`** — shared source of truth for both processes: the daily log file naming
   scheme (`logs/chat-YYYY-MM-DD.log`, computed from the current date so rotation is automatic —
@@ -151,7 +151,7 @@ rule characters) are deliberately *not* looked up per-language — `BOTPING_MARK
 is the loop-prevention protocol between nodes (see Ping-channel bot below), so a `ru` node and an
 `en` node must still recognize each other's bot replies by the same prefix.
 
-`compass_point()` (`/pos`'s bearing labels) is the one localized string that lives outside
+`compass_point()` (`/who`'s bearing labels) is the one localized string that lives outside
 `mesh_i18n.py`, in `mesh_common.py` itself, purely because of the import direction above — it
 takes an optional `lang` parameter (defaulting to the module-level `LANG`) so tests can pin both
 languages without touching `.env`.
@@ -351,12 +351,24 @@ This is unlike the channel filter (see Channels below), which *does* also gate w
 `/reply` target — a `--channel`-filtered session is meant to be a clean view of just that
 channel, so a message on another channel never enters `_replyables` there in the first place.
 
-### Position and distance (`/pos`)
+### Node lookup and position (`/who <name>`)
 
-`_nodes_payload()` in `mesh_logger.py` exposes `lat`/`lon`/`alt` from `node["position"]` — already
-converted from the raw `latitudeI`/`longitudeI` integers to float degrees by the meshtastic
-library's own `_fixupPosition()`, so no unit conversion happens on this side. `/pos <node>` reads
-the target's position plus our own (found by matching `whoami_id` in the same `nodes` list) and
+`/who` with no argument is unchanged — self info plus the `.env` self-update (see `.env` above).
+`/who <name>` is a separate branch (`_cmd_who`, dispatching to `_cmd_who_self()` for the no-arg
+case) that looks up *any* visible node via the same `_enrich_nodes()`/`_pick_node()` pair every
+other by-name command uses, and prints everything about it in one place: display name, hex id,
+battery/SNR/hops, last-heard status, and position/distance-from-us if available. Deliberately
+never touches `.env`: that self-update is specifically about *this* node's own identity persisting
+across a logger restart, and writing another node's name into it would be nonsensical.
+`_format_last_heard()` (the online/`Nм назад`/`Nч назад`/`?` label+color logic) was factored out of
+`_cmd_nodes` so `/who` doesn't duplicate it.
+
+The position half used to be a separate `/pos <node>` command, removed once `/who` covered the same
+ground — no point maintaining two commands with overlapping by-name lookup and near-identical
+output. `_nodes_payload()` in `mesh_logger.py` exposes `lat`/`lon`/`alt` from `node["position"]` —
+already converted from the raw `latitudeI`/`longitudeI` integers to float degrees by the meshtastic
+library's own `_fixupPosition()`, so no unit conversion happens on this side. `_cmd_who` reads the
+target's position plus our own (found by matching `whoami_id` in the same `nodes` list) and
 computes distance/bearing with `haversine_km()`/`bearing_deg()` in `mesh_common.py` (kept there,
 not in `mesh_chat.py`, purely so they're plain stdlib math and can be unit-tested without
 prompt_toolkit).
@@ -688,7 +700,7 @@ mute. Both behaviors are intentional and now correctly reflect what the code doe
 
 ### Client-side name resolution gaps
 
-`/dm`, `/trace`, `/ping`, `/pos`, `/mute`, and tab-completion all used to match node names
+`/dm`, `/trace`, `/ping`, `/who <name>` (`/pos` at the time), `/mute`, and tab-completion all used to match node names
 against the raw `nodes` IPC payload — which only ever carries a name if the mesh's own NodeInfo
 reported one. A node visible in `/nodes` under its OneMesh-resolved display name (e.g. "Вася")
 was unmatchable by that exact name anywhere else — only by its raw `!hex` id. `/nodes` already

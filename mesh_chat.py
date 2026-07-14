@@ -214,7 +214,7 @@ def _enrich_nodes(nodes: list[dict]) -> list[dict]:
     _nodes_payload()) are only ever what the mesh's own NodeInfo carries —
     None for a node we only know as `!hex (???)` with a since-resolved
     OneMesh cache entry. /nodes already computed this inline; factored out
-    so /dm, /trace, /ping, /pos, /mute and tab-completion can match and
+    so /dm, /trace, /ping, /who, /mute and tab-completion can match and
     display against the same name the user actually sees in /nodes, instead
     of only ever matching by raw name or !hex id for such a node."""
     out = []
@@ -283,7 +283,7 @@ def _resolve_display_name(long_name: str, short_name: str) -> tuple[str, str]:
 # ── tab completion ────────────────────────────────────────────────────────────
 
 COMMANDS = ["/nodes", "/who", "/dm", "/reply", "/react", "/ch", "/send", "/search",
-            "/last", "/trace", "/ping", "/pos", "/stats", "/mute", "/unmute",
+            "/last", "/trace", "/ping", "/stats", "/mute", "/unmute",
             "/updatenames", "/settings", "/botping", "/autoping", "/reboot",
             "/reconnect", "/clear", "/help"]
 
@@ -302,7 +302,7 @@ class MeshCompleter(Completer):
             return
         cmd, _, arg = text.partition(" ")
         cmd = cmd.lower()
-        if cmd in ("/dm", "/trace", "/ping", "/pos", "/mute", "/unmute", "/last"):
+        if cmd in ("/dm", "/trace", "/ping", "/mute", "/unmute", "/last", "/who"):
             probe = arg.lstrip('"').lower()
             for cand in _completion_nodes:
                 if cand.strip('"').lower().startswith(probe):
@@ -777,6 +777,19 @@ def _node_sort_key(n: dict, mode: str = "online"):
     return (not is_online, name_key, hops_key)  # mode == "online" (default)
 
 
+def _format_last_heard(ago: int | None) -> tuple[str, str]:
+    """(label, ansi-color) for a node's last-seen time — shared by /nodes and /who
+    so the "online / Nм назад / Nч назад / ?" logic and thresholds don't drift
+    between the two."""
+    if ago is not None and ago < ONLINE_THRESHOLD_SECONDS:
+        return t("online_now"), "ansigreen"
+    if ago is not None:
+        if ago < 3600:
+            return t("ago_minutes", mins=ago // 60), "ansiyellow"
+        return t("ago_hours", hrs=ago // 3600), "ansigray"
+    return t("unknown_time"), "ansigray"
+
+
 async def _cmd_nodes(args: str = "") -> None:
     mode = args.strip().lower() or "online"
     if mode not in NODE_SORT_MODES:
@@ -806,16 +819,7 @@ async def _cmd_nodes(args: str = "") -> None:
         hops = n.get("hops_away")
         hops_str = f" · {plural('hops_forms', hops)}" if hops is not None else ""
 
-        ago = n["seconds_ago"]
-        if ago is not None and ago < ONLINE_THRESHOLD_SECONDS:
-            heard, color = t("online_now"), "ansigreen"
-        elif ago is not None:
-            if ago < 3600:
-                heard, color = t("ago_minutes", mins=ago // 60), "ansiyellow"
-            else:
-                heard, color = t("ago_hours", hrs=ago // 3600), "ansigray"
-        else:
-            heard, color = t("unknown_time"), "ansigray"
+        heard, color = _format_last_heard(n["seconds_ago"])
 
         print_formatted_text(HTML(
             f"  <b><ansigreen>{ln}</ansigreen></b> <ansigreen>({sn})</ansigreen>"
@@ -824,7 +828,7 @@ async def _cmd_nodes(args: str = "") -> None:
         ))
 
 
-def _cmd_who() -> None:
+def _cmd_who_self() -> None:
     if not _client.whoami:
         print_formatted_text(HTML(f"<ansiyellow>{t('err_no_self_info')}</ansiyellow>"))
         return
@@ -842,6 +846,66 @@ def _cmd_who() -> None:
         update_env_file(ENV_FILE, {
             "NODE_LONG_NAME": ln, "NODE_SHORT_NAME": sn, "NODE_ID": id_str,
         })
+
+
+async def _cmd_who(args: str = "") -> None:
+    """`/who` без аргумента — информация о себе (и, как раньше, самообновление
+    .env). `/who <имя>` — полная информация о любом видимом узле (имена, hex id,
+    батарея/SNR/хопы, когда был на связи, позиция и расстояние от нас); .env
+    при этом не трогаем — тот self-update относится только к собственной ноде."""
+    target = args.strip()
+    if not target:
+        _cmd_who_self()
+        return
+
+    resp = await _client.request("nodes")
+    if not resp.get("ok"):
+        print_formatted_text(HTML(
+            f"<ansired>{t('err_nodes_fetch_failed', error=_safe(resp.get('error', '')))}</ansired>"
+        ))
+        return
+    nodes = _enrich_nodes(resp["nodes"])
+    node = _pick_node(nodes, target)
+    if not node:
+        return
+
+    ln = node.get("display_long") or node.get("long_name") or "?"
+    sn = node.get("display_short") or node.get("short_name") or "?"
+    id_str = f"!{node['node_id']:08x}"
+    print_formatted_text(HTML(
+        f"<ansiwhite>{t('who_node_line', ln=_safe(ln), sn=_safe(sn), id_str=id_str)}</ansiwhite>"
+    ))
+
+    battery = node.get("battery")
+    bat_str = f" 🔋{battery}%" if battery is not None else ""
+    snr = node.get("snr")
+    snr_str = f" SNR:{snr:.1f}" if snr is not None else ""
+    hops = node.get("hops_away")
+    hops_str = f" · {plural('hops_forms', hops)}" if hops is not None else ""
+    heard, color = _format_last_heard(node["seconds_ago"])
+    print_formatted_text(HTML(
+        f"  <ansiwhite>{bat_str}{snr_str}{hops_str}</ansiwhite> <{color}>· {heard}</{color}>"
+    ))
+
+    if node.get("lat") is not None and node.get("lon") is not None:
+        alt = node.get("alt")
+        alt_str = f", {alt} {t('unit_m')}" if alt is not None else ""
+        lat_str = f"{node['lat']:.5f}"
+        lon_str = f"{node['lon']:.5f}"
+        print_formatted_text(HTML(
+            f"<ansiwhite>{t('pos_line', ln=_safe(ln), sn=_safe(sn), lat=lat_str, lon=lon_str, alt_str=alt_str)}</ansiwhite>"
+        ))
+        me = next((n for n in nodes if n["node_id"] == _client.whoami_id), None) \
+            if _client.whoami_id is not None else None
+        if me and me.get("lat") is not None and me.get("lon") is not None and me["node_id"] != node["node_id"]:
+            dist = haversine_km(me["lat"], me["lon"], node["lat"], node["lon"])
+            brng = bearing_deg(me["lat"], me["lon"], node["lat"], node["lon"])
+            dist_str = f"{dist:.1f} {t('unit_km')}" if dist >= 1 else f"{dist * 1000:.0f} {t('unit_m')}"
+            print_formatted_text(HTML(
+                f"<ansiwhite>{t('pos_distance', dist_str=dist_str, brng=f'{brng:.0f}', compass=compass_point(brng))}</ansiwhite>"
+            ))
+    else:
+        print_formatted_text(HTML(f"<ansigray>{t('err_no_position', name=_safe(ln))}</ansigray>"))
 
 
 def _handle_send_response(resp: dict, text: str) -> None:
@@ -1013,54 +1077,6 @@ async def _cmd_ping(args: str) -> None:
     else:
         print_formatted_text(HTML(
             f"<ansiyellow>{t('ping_unconfirmed', ln=_safe(ln), elapsed=f'{elapsed:.1f}')}</ansiyellow>"
-        ))
-
-
-async def _cmd_pos(args: str) -> None:
-    target_name = args.strip()
-    if not target_name:
-        print_formatted_text(HTML(f"<ansiyellow>{t('usage_pos')}</ansiyellow>"))
-        return
-
-    resp = await _client.request("nodes")
-    if not resp.get("ok"):
-        print_formatted_text(HTML(
-            f"<ansired>{t('err_nodes_fetch_failed', error=_safe(resp.get('error', '')))}</ansired>"
-        ))
-        return
-    nodes = _enrich_nodes(resp["nodes"])
-    node = _pick_node(nodes, target_name)
-    if not node:
-        return
-    if node.get("lat") is None or node.get("lon") is None:
-        print_formatted_text(HTML(
-            f"<ansiyellow>{t('err_no_position', name=_safe(node.get('display_long') or node.get('long_name') or '?'))}</ansiyellow>"
-        ))
-        return
-
-    ln = node.get("display_long") or node.get("long_name") or "?"
-    sn = node.get("display_short") or node.get("short_name") or "?"
-    alt = node.get("alt")
-    alt_str = f", {alt} {t('unit_m')}" if alt is not None else ""
-    lat_str = f"{node['lat']:.5f}"
-    lon_str = f"{node['lon']:.5f}"
-    print_formatted_text(HTML(
-        f"<ansiwhite>{t('pos_line', ln=_safe(ln), sn=_safe(sn), lat=lat_str, lon=lon_str, alt_str=alt_str)}</ansiwhite>"
-    ))
-
-    me = next((n for n in nodes if n["node_id"] == _client.whoami_id), None) \
-        if _client.whoami_id is not None else None
-    if me and me.get("lat") is not None and me.get("lon") is not None:
-        dist = haversine_km(me["lat"], me["lon"], node["lat"], node["lon"])
-        brng = bearing_deg(me["lat"], me["lon"], node["lat"], node["lon"])
-        dist_str = f"{dist:.1f} {t('unit_km')}" if dist >= 1 else f"{dist * 1000:.0f} {t('unit_m')}"
-        brng_str = f"{brng:.0f}"
-        print_formatted_text(HTML(
-            f"<ansiwhite>{t('pos_distance', dist_str=dist_str, brng=brng_str, compass=compass_point(brng))}</ansiwhite>"
-        ))
-    else:
-        print_formatted_text(HTML(
-            f"<ansigray>{t('pos_no_own_position')}</ansigray>"
         ))
 
 
@@ -1687,7 +1703,7 @@ async def _handle_command(text: str) -> None:
     args = parts[1] if len(parts) > 1 else ""
 
     if   cmd == "nodes":       await _cmd_nodes(args)
-    elif cmd == "who":         _cmd_who()
+    elif cmd == "who":         await _cmd_who(args)
     elif cmd == "dm":          await _cmd_dm(args)
     elif cmd == "reply":       await _cmd_reply(args)
     elif cmd == "react":       await _cmd_react(args)
@@ -1698,7 +1714,6 @@ async def _handle_command(text: str) -> None:
     elif cmd == "stats":       await _cmd_stats(args)
     elif cmd == "trace":       await _cmd_trace(args)
     elif cmd == "ping":        await _cmd_ping(args)
-    elif cmd == "pos":         await _cmd_pos(args)
     elif cmd == "mute":        await _cmd_mute(args)
     elif cmd == "unmute":      await _cmd_unmute(args)
     elif cmd == "updatenames": await _cmd_updatenames()

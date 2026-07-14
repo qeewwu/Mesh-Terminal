@@ -74,7 +74,9 @@ The reply routes itself based on what you're replying to — an incoming DM gets
 Маршрут туда: Я (ME) (?dB) → Relay (RL) (+5.0dB) → Вася Пупкин (VP) (+3.2dB)
 Маршрут обратно: Вася Пупкин (VP) (?dB) → Relay (RL) (+2.8dB) → Я (ME) (+4.1dB)
 
-> /pos Вася
+> /who Вася
+👤 Вася Пупкин (VP) !a1b2c3d4
+  🔋82% SNR:6.5 · 2 хопа · Онлайн
 📍 Вася Пупкин (VP): 55.75800, 37.61730, 180 м
    от меня: 4.2 км, азимут 132° (ЮВ)
 
@@ -189,7 +191,7 @@ sudo systemctl restart mesh-logger
 | Command | Description |
 |---|---|
 | `/nodes [online\|names\|hops]` | List visible nodes: battery, SNR, hops, online status / last seen |
-| `/who` | Info about your own node |
+| `/who [name]` | Info about your own node, or full details on any node — names, hex id, battery/SNR/hops, position |
 | `/dm <name> <text>` | Direct message (matches by name; quote names containing spaces) |
 | `/reply` | List the last 20 receivable messages, numbered #1 (newest)…#20 |
 | `/reply <text>` / `/reply #N <text>` | Reply with a real quote — to the latest message, or to #N |
@@ -201,7 +203,6 @@ sudo systemctl restart mesh-logger
 | `/stats [day\|node]` | Message statistics: overview, by day, or by top senders |
 | `/trace <name>` | Traceroute — SNR for each hop, both directions |
 | `/ping <name>` | Round-trip time and hop count to a node |
-| `/pos <name>` | Node position, distance and bearing from you |
 | `/mute <name>` / `/unmute [name]` | Hide a sender from the live feed (search still finds them) |
 | `/updatenames` | Force an immediate node-name resolution sweep via OneMesh |
 | `/settings [key value]` | View or change local node settings — see [`SETTINGS.md`](SETTINGS.md) |
