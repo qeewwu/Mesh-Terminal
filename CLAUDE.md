@@ -308,10 +308,14 @@ resolution and caching live in **`mesh_logger.py`**, not the client. This used t
 whatever name was known at write time) — moved because that meant resolution only ever ran while
 some chat client happened to be connected. `mesh_logger.py` runs `_run_onemesh_update()`
 continuously (`_periodic_onemesh_update()`: once at startup, then every `ONEMESH_UPDATE_INTERVAL`
-= 30 min, scanning `_interface.nodes` for entries with no `user` data at all and not already
-cached) and — this is the actual point of the move — feeds the result straight into
+= 30 min) and — this is the actual point of the move — feeds the result straight into
 `_node_names()`, so **freshly-written log lines** get the resolved name instead of `!hex (???)`,
-not just how a client happens to render them. Results persist in `onemesh_cache.json`
+not just how a client happens to render them. Targets come from two sources: entries in
+`_interface.nodes` with no `user` data at all, *and* `_unresolved_ids` — a set that `_node_names()`
+itself populates every time it has to fall back to `!hex (???)`, covering senders the device has
+only ever relayed a message from and never received a full NodeInfo for (so they never appear in
+`_interface.nodes` at all, and the first loop alone can't find them — see Fixed bugs below). Either
+way, an id already in `_onemesh_names` is skipped. Results persist in `onemesh_cache.json`
 (`ONEMESH_CACHE_FILE` in `mesh_common.py`), a flat `{node_id: {long, short}}` map — logger-owned,
 logger-written. `mesh_chat.py`'s `/updatenames` is now a thin `updatenames` IPC call that just
 triggers an extra sweep on demand and reloads the shared cache to show the result immediately;
@@ -685,6 +689,17 @@ client would sit silently disconnected until manually restarted. Fixed by assign
 `on_disconnect` before `connect()`, plus a defensive check right after the post-connect `whoami`
 round trip (in case the connection dropped again during that handshake, while `_reconnecting` was
 still `True` and would have swallowed a real disconnect event as a no-op).
+
+### OneMesh resolution missed relayed-only senders
+
+`_run_onemesh_update()` only ever scanned `_interface.nodes` for un-named targets — but a node the
+device has merely *relayed* a text message from, without ever receiving that node's own NodeInfo
+packet, never gets an entry in `_interface.nodes` at all. Such senders stayed `!hex (???)` forever,
+and `/updatenames` reported "nothing to update" even while they were visibly unresolved in the chat
+— there was no target list that included them. Fixed by having `_node_names()` record every id it
+falls back to `!hex (???)` for into `_unresolved_ids`, and having `_run_onemesh_update()` treat that
+set as extra targets alongside the `_interface.nodes`-without-`user` case (see Node name resolution
+above).
 
 ### `_store_msg` dict/deque desync
 
