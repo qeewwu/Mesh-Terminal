@@ -504,6 +504,18 @@ take several seconds — DNS + TCP handshake, or a full BLE scan). It fires the 
 `{"ok": True}` immediately; `mesh_chat.py` reports the eventual result the same way `/reboot`
 does — via the existing `"device"` event (see below), not a synchronous response.
 
+A failed attempt needs its own signal, though — unlike `/reboot` (which always either lands or the
+device comes back regardless), a hard reconnect can keep failing indefinitely (wrong host, device
+still down), and the *plain* automatic retry loop is silent on failure by design (no point
+printing something every 3–60s during a long outage the client already knows about via the earlier
+`"disconnected"` event). But a manually triggered attempt is a one-off action the user is actively
+waiting on, so it gets an explicit answer either way: `_reconnect_loop` tracks whether the
+*current* attempt was hard-triggered (`was_hard`, set both when `_hard_reconnect_event` was already
+set going in, and when it fires mid-sleep), and on a `was_hard` failure broadcasts
+`{"status": "reconnect_failed", "error": ...}` (`_last_connect_error`, stashed by `_do_connect()`'s
+except block since it only returns a bool). `mesh_chat.py` renders this and nothing else — no
+special-casing needed for "attempt 2 of 5", the logger keeps retrying automatically regardless.
+
 ### Device connection status (`"device"` event)
 
 Without this, `/reboot confirm` was a UX dead end: the IPC response only confirms the admin
@@ -511,12 +523,22 @@ packet was *sent*, not that the device actually rebooted and came back — that 
 happens entirely between `mesh_logger.py` and the device, invisible to any client, since a
 client's Unix socket to the logger doesn't drop when the *device* link does. `on_connection_lost`
 broadcasts `{"event": "device", "status": "disconnected"}`; `_do_connect()` broadcasts
-`{"status": "connected", "long_name": ..., "short_name": ...}` on every successful (re)connect,
-not just after a reboot — so it also covers a plain WiFi drop or a manual `systemctl restart
-mesh-logger` mid-connection. `mesh_chat.py` prints both unconditionally (no channel/mute
+`{"status": "connected", "long_name": ..., "short_name": ..., "node_id": ...}` on every successful
+(re)connect, not just after a reboot — so it also covers a plain WiFi drop or a manual `systemctl
+restart mesh-logger` mid-connection. `mesh_chat.py` prints both unconditionally (no channel/mute
 filtering — this is link status, not a chat message). Absent a live client, `/who` or `/nodes`
 still work as a manual check: they round-trip through the logger and report "not connected" until
 the device is actually back.
+
+The `"connected"` branch also refreshes `IPCClient.whoami`/`whoami_id` directly from the event's
+(unescaped) fields, not just the `_safe()`'d copies used for the printed message. Before this, that
+cache was only ever populated in `main()` (once, at client startup) and in `_reconnect_logger()`
+(when the client's own socket to the *logger* reconnects) — neither covers a device-only reconnect
+while the client's logger socket stayed up the whole time (e.g. via `/reconnect`), and if the
+device wasn't reachable yet at client startup, `whoami` was never populated at all, permanently
+breaking `/who` and the "is this my own message" color check in `_render_line()` even after the
+device came back. `node_id` was added to the broadcast payload specifically to make this possible
+without an extra IPC round trip.
 
 ### `/nodes` sorting and online status
 

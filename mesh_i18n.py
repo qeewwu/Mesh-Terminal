@@ -286,6 +286,7 @@ _RU: dict[str, object] = {
     "err_reconnect_failed": "Не удалось запустить переподключение: {error}",
     "reconnect_triggered": "🔌 Принудительное переподключение к устройству запущено",
     "reconnect_triggered_host": "🔌 Переподключаюсь к {host}...",
+    "reconnect_attempt_failed": "✗ Переподключиться не удалось: {error} — логгер продолжит пробовать сам",
 
     # -- mesh_chat.py: /help ------------------------------------------------------------------------------
     "help_lines": [
@@ -580,6 +581,7 @@ _EN: dict[str, object] = {
     "err_reconnect_failed": "Failed to trigger reconnect: {error}",
     "reconnect_triggered": "🔌 Forcing a reconnect to the device",
     "reconnect_triggered_host": "🔌 Reconnecting to {host}...",
+    "reconnect_attempt_failed": "✗ Reconnect attempt failed: {error} — the logger will keep retrying on its own",
 
     "help_lines": [
         "─── Commands ──────────────────────────────────────────────",

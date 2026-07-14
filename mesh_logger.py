@@ -495,8 +495,11 @@ def _open_interface():
     return meshtastic.tcp_interface.TCPInterface(hostname=_hard_reconnect_host or HOST)
 
 
+_last_connect_error: str | None = None  # set on _do_connect() failure, read by _reconnect_loop
+
+
 def _do_connect() -> bool:
-    global _interface, _last_rx
+    global _interface, _last_rx, _last_connect_error
     target = _hard_reconnect_host if (CONN_TYPE == "wifi" and _hard_reconnect_host) else CONN_TARGET
     try:
         _interface = _open_interface()
@@ -505,7 +508,7 @@ def _do_connect() -> bool:
         my_id = _interface.myInfo.my_node_num
         ln, sn = _node_names(my_id)
         print(f"[info] connected via {CONN_TYPE} to {target} as {ln} ({sn})")
-        _broadcast_device_status("connected", long_name=ln, short_name=sn)
+        _broadcast_device_status("connected", long_name=ln, short_name=sn, node_id=my_id)
         if CONN_TYPE == "wifi" and _hard_reconnect_host:
             # sticky for the rest of this process's life either way; persisting
             # to .env means a future restart also starts from the new address,
@@ -517,6 +520,7 @@ def _do_connect() -> bool:
         return True
     except Exception as e:
         print(f"[error] connect failed: {e}", file=sys.stderr)
+        _last_connect_error = str(e)
         return False
 
 
@@ -527,12 +531,14 @@ async def _reconnect_loop() -> None:
         await _reconnect_event.wait()
         _reconnect_event.clear()
         while True:
+            was_hard = False
             if _hard_reconnect_event.is_set():
                 # manual override: skip the backoff wait entirely instead of
                 # just shortening it, so /reconnect feels immediate even if
                 # an unrelated automatic retry left us mid-60s-sleep
                 _hard_reconnect_event.clear()
                 delay = 0
+                was_hard = True
             else:
                 delay = delays[min(attempt, len(delays) - 1)]
             if delay:
@@ -542,6 +548,7 @@ async def _reconnect_loop() -> None:
                     # wakes it early instead of waiting out the rest of delay
                     await asyncio.wait_for(_hard_reconnect_event.wait(), timeout=delay)
                     _hard_reconnect_event.clear()
+                    was_hard = True
                     print("[info] hard reconnect requested, retrying now")
                 except asyncio.TimeoutError:
                     pass
@@ -562,6 +569,13 @@ async def _reconnect_loop() -> None:
                 attempt = 0
                 break
             attempt += 1
+            if was_hard:
+                # a plain failed automatic retry is silent by design (the
+                # client already knows it's disconnected, no need to spam a
+                # message every 3-60s during a long outage) — but a manually
+                # triggered attempt is a one-off action the user is actively
+                # waiting on, so it gets an explicit answer either way
+                _broadcast_device_status("reconnect_failed", error=_last_connect_error or "?")
 
 
 def _trigger_hard_reconnect(host: str | None = None) -> None:

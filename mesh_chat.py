@@ -519,6 +519,15 @@ def _handle_event(obj: dict) -> None:
                 f"<ansired>{t('device_disconnected')}</ansired>"
             ))
         elif status == "connected":
+            # own-identity cache: main()/_reconnect_logger() only ever populate
+            # this when the client's own socket to the *logger* (re)connects —
+            # a device-only reconnect (e.g. /reconnect while the client's
+            # socket stayed up the whole time) would otherwise leave it stale
+            # or, if the device wasn't reachable yet at client startup, never
+            # populated at all. The raw (unescaped) fields, not the _safe()'d
+            # ln/sn below — this gets compared against parsed log-line names.
+            _client.whoami = (obj.get("long_name") or "?", obj.get("short_name") or "?")
+            _client.whoami_id = obj.get("node_id")
             ln = _safe(obj.get("long_name") or "?")
             sn = _safe(obj.get("short_name") or "?")
             print_formatted_text(HTML(
@@ -526,6 +535,13 @@ def _handle_event(obj: dict) -> None:
             ))
             if not _channel_resolved:
                 _loop.create_task(_try_resolve_pending_channel())
+        elif status == "reconnect_failed":
+            # only fired for a manually triggered /reconnect (see
+            # mesh_logger.py's _reconnect_loop) — automatic retries stay
+            # silent so a long outage doesn't spam the chat every few seconds
+            print_formatted_text(HTML(
+                f"<ansired>{t('reconnect_attempt_failed', error=_safe(obj.get('error', '?')))}</ansired>"
+            ))
 
 
 # ── display ───────────────────────────────────────────────────────────────────
