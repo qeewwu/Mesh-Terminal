@@ -6,7 +6,7 @@ A terminal chat client for [Meshtastic](https://meshtastic.org/) mesh radio netw
 
 *(Русская версия: [README.ru.md](README.ru.md))*
 
-> **Note:** the client's own messages and prompts are in Russian — see the screenshots-in-text below for what that actually looks like. Slash-command *names* (`/dm`, `/reply`, ...) are plain ASCII either way.
+> **Note:** the client's own messages and prompts default to Russian — see the screenshots-in-text below for what that actually looks like. Set `MESH_LANG=en` in `.env` for an English interface instead (see [Configuration](#configuration)). Slash-command *names* (`/dm`, `/reply`, ...) are plain ASCII either way.
 
 ## About
 
@@ -34,7 +34,7 @@ This split exists because a Meshtastic device only accepts **one connection at a
 - **Network diagnostics** — node list with battery/SNR/hop count/online status, position and distance/bearing to a node, traceroute, ping (round-trip time)
 - **Device control** — read and change your node's own settings remotely, reboot it, toggle an auto-reply ping-bot
 - **Reliability** — messages sent while the device is offline queue up and go out on reconnect; both the logger↔device and client↔logger links auto-reconnect; delivery is confirmed with ✓/✗
-- **Quality of life** — node names auto-resolved from the public [OneMesh](https://map.onemesh.ru/) map, muting for noisy senders, Tab-completion for commands/names/channels
+- **Quality of life** — node names auto-resolved from the public [OneMesh](https://map.onemesh.ru/) map, muting for noisy senders, Tab-completion for commands/names/channels, interface language switchable between Russian and English (`MESH_LANG`)
 
 ## Chat
 
@@ -209,6 +209,7 @@ All settings live in `.env` (copy from `.env.example`); every key is optional an
 | Key | Default | Purpose |
 |---|---|---|
 | `MESH_CONN_TYPE` | `wifi` | `wifi` \| `usb` \| `ble` — how the logger connects to the device |
+| `MESH_LANG` | `ru` | `ru` \| `en` — interface language (messages, bot replies, settings descriptions) |
 | `MESH_HOST` | `meshtastic.local` | Device address for WiFi |
 | `MESH_USB_PORT` | *(auto-detect)* | Serial port for USB, e.g. `/dev/ttyUSB0` |
 | `MESH_BLE_ADDRESS` | *(auto-detect)* | MAC/UUID for BLE |

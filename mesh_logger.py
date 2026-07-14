@@ -49,6 +49,7 @@ from mesh_common import (
     parse_env_file,
     update_env_file,
 )
+from mesh_i18n import plural, t
 
 STORE_SIZE = 300
 # no mesh traffic at all for this long → probe the link with a heartbeat
@@ -274,8 +275,7 @@ def _set_botping(enabled: bool) -> None:
 
 
 async def _send_botping_reply(reply_id: int, channel_index: int, hops: int) -> None:
-    word = "хоп" if hops == 1 else "хопа" if 2 <= hops <= 4 else "хопов"
-    text = f"{BOTPING_MARKER} {hops} {word} от вас"
+    text = t("botping_reply", marker=BOTPING_MARKER, hops_phrase=plural("hops_forms", hops))
     await _send_message("send", text, channel_index, reply_id=reply_id)
 
 
@@ -311,7 +311,7 @@ async def _periodic_autoping() -> None:
         if idx is None:
             continue
         try:
-            await _send_message("send", "🏓 автопинг: проверка связи", idx)
+            await _send_message("send", t("autoping_text"), idx)
         except Exception as e:
             print(f"[warn] autoping failed: {e}", file=sys.stderr)
 
@@ -673,13 +673,12 @@ async def _send_message(cmd: str, text: str, channel_index: int, reply_id: int =
 
     iface = _interface
     if reply_id and not emoji and "replyId" not in inspect.signature(iface.sendText).parameters:
-        return {"ok": False, "error": "библиотека meshtastic не поддерживает replyId — "
-                                       "обновите: pip install -U meshtastic"}
+        return {"ok": False, "error": t("err_no_replyid_support")}
 
     text_bytes = len(text.encode("utf-8"))
     if text_bytes > MAX_PAYLOAD_BYTES:
-        return {"ok": False, "error": f"сообщение слишком длинное ({text_bytes} байт, "
-                                       f"максимум {MAX_PAYLOAD_BYTES})"}
+        return {"ok": False, "error": t("err_message_too_long", bytes=text_bytes,
+                                        max=MAX_PAYLOAD_BYTES)}
 
     pid_holder = {}
     fired = {"done": False}
@@ -735,7 +734,7 @@ async def _send_message(cmd: str, text: str, channel_index: int, reply_id: int =
         # before anything touches the link, so it's not a disconnect: nothing to
         # retry or reconnect over, and queueing it would just fail identically
         # every time it's flushed
-        return {"ok": False, "error": f"отправка не удалась: {e}"}
+        return {"ok": False, "error": t("err_send_failed", error=e)}
     except Exception as e:
         # линк умер, но connection.lost ещё не прилетел: сообщение — в outbox,
         # соединение — на переподключение (раньше сообщение просто терялось).
@@ -747,7 +746,7 @@ async def _send_message(cmd: str, text: str, channel_index: int, reply_id: int =
                             "writer": notify_writer, "lock": notify_lock,
                             "attempts": attempts + 1, "emoji": emoji})
             return {"ok": True, "queued": True}
-        return {"ok": False, "error": f"отправка не удалась: {e}"}
+        return {"ok": False, "error": t("err_send_failed", error=e)}
     # pid_holder is set inside the worker thread by _send_text_tracked/
     # _send_emoji_packet, before handler() could possibly fire — _packet_id(sent)
     # is only a fallback for the (should-never-happen) case it wasn't
@@ -800,7 +799,7 @@ async def _flush_outbox() -> None:
             # delivery-событием, иначе сообщение пропадёт молча
             if item.get("writer") is not None:
                 event = {"event": "delivery", "ok": False, "text": item["text"],
-                         "error": result.get("error", "не отправлено")}
+                         "error": result.get("error", t("err_not_sent"))}
                 _loop.create_task(_send_json(item["writer"], event, item["lock"]))
 
 
@@ -944,30 +943,17 @@ SETTINGS_REGISTRY: dict[str, tuple] = {
     "mqtt_root": ("mqtt", True, "root", "str", None),
 }
 
-SETTINGS_DESCRIPTIONS = {
-    "owner_long": "Полное имя узла",
-    "owner_short": "Короткое имя узла (обычно до 4 символов)",
-    "role": "Роль узла в сети (CLIENT, ROUTER, REPEATER, ...)",
-    "node_info_broadcast_secs": "Как часто рассылать свой NodeInfo, секунды",
-    "hop_limit": "Максимум хопов для пакетов, отправленных с этого узла",
-    "tx_power": "Мощность передачи, дБм (0 = значение по умолчанию для региона)",
-    "position_broadcast_secs": "Как часто рассылать позицию, секунды",
-    "position_smart_enabled": "Рассылать позицию только при значимом перемещении",
-    "gps_mode": "Режим GPS-приёмника (ENABLED, DISABLED, NOT_PRESENT)",
-    "fixed_position": "Считать текущую позицию фиксированной (узел неподвижен)",
-    "telemetry_device_secs": "Как часто слать телеметрию устройства, секунды",
-    "telemetry_env_enabled": "Слать телеметрию окружающей среды (датчики), если есть",
-    "mqtt_enabled": "Включить отправку сообщений в MQTT (в дополнение к LoRa)",
-    "mqtt_address": "Адрес MQTT-брокера, host[:port] (например map.onemesh.ru)",
-    "mqtt_username": "Логин для подключения к MQTT-брокеру",
-    "mqtt_password": "Пароль для подключения к MQTT-брокеру (в списке — маской)",
-    "mqtt_encryption_enabled": "Шифровать пакеты в MQTT тем же PSK, что и в канале",
-    "mqtt_json_enabled": "Дополнительно публиковать сообщения в виде JSON",
-    "mqtt_tls_enabled": "TLS-соединение с брокером",
-    "mqtt_root": "Корневой топик MQTT (например msh/RU)",
-    "mqtt_uplink": "Ретрансляция канала из LoRa в MQTT: <канал>:on|off, например Primary:on",
-    "mqtt_downlink": "Ретрансляция канала из MQTT в LoRa: <канал>:on|off",
-}
+_SETTINGS_KEYS = [
+    "owner_long", "owner_short", "role", "node_info_broadcast_secs",
+    "hop_limit", "tx_power", "position_broadcast_secs", "position_smart_enabled",
+    "gps_mode", "fixed_position", "telemetry_device_secs", "telemetry_env_enabled",
+    "mqtt_enabled", "mqtt_address", "mqtt_username", "mqtt_password",
+    "mqtt_encryption_enabled", "mqtt_json_enabled", "mqtt_tls_enabled", "mqtt_root",
+    "mqtt_uplink", "mqtt_downlink",
+]
+# see SETTINGS.md / SETTINGS.ru.md for what each one does and why it's safe
+# to expose. Descriptions follow MESH_LANG, same as the rest of the UI.
+SETTINGS_DESCRIPTIONS = {key: t(f"setting_{key}") for key in _SETTINGS_KEYS}
 
 MQTT_PASSWORD_MASK = "••••••••"
 
@@ -1025,22 +1011,22 @@ def _parse_setting_value(raw: str, kind: str, extra) -> object:
             return True
         if low in ("0", "false", "off", "no", "нет", "выкл"):
             return False
-        raise ValueError("ожидалось булево значение (on/off, да/нет, 1/0)")
+        raise ValueError(t("err_bool_expected"))
     if kind == "int":
         try:
             value = int(raw)
         except ValueError:
-            raise ValueError("ожидалось целое число") from None
+            raise ValueError(t("err_int_expected")) from None
         lo, hi = extra
         if not (lo <= value <= hi):
-            raise ValueError(f"вне диапазона {lo}..{hi}")
+            raise ValueError(t("err_out_of_range", lo=lo, hi=hi))
         return value
     if kind == "enum":
         name = raw.strip().upper()
         if name not in extra.keys():
-            raise ValueError(f"допустимые значения: {', '.join(extra.keys())}")
+            raise ValueError(t("err_enum_allowed", values=", ".join(extra.keys())))
         return extra.Value(name)
-    raise ValueError(f"неизвестный тип параметра: {kind}")
+    raise ValueError(t("err_unknown_setting_type", kind=kind))
 
 
 def _apply_channel_link(node, raw_value: str, field: str) -> str:
@@ -1048,7 +1034,7 @@ def _apply_channel_link(node, raw_value: str, field: str) -> str:
     ChannelSettings flag via writeChannel(), not writeConfig(), since uplink/
     downlink live on the channel, not in moduleConfig.mqtt."""
     if ":" not in raw_value:
-        raise ValueError("формат: <канал>:on|off, например Primary:on")
+        raise ValueError(t("err_channel_link_format"))
     channel_name, _, flag_str = raw_value.partition(":")
     channel_name = channel_name.strip()
     flag = _parse_setting_value(flag_str, "bool", None)
@@ -1059,7 +1045,7 @@ def _apply_channel_link(node, raw_value: str, field: str) -> str:
     match = next((c for c in channels if _channel_name(c.index).lower() == channel_name.lower()),
                  None)
     if match is None:
-        raise ValueError(f"канал '{channel_name}' не найден")
+        raise ValueError(t("err_mqtt_channel_not_found", name=channel_name))
     setattr(match.settings, field, flag)
     node.writeChannel(match.index)
     return f"{channel_name}:{'on' if flag else 'off'}"
@@ -1140,7 +1126,7 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
 
                     if not _interface:
                         if len(_outbox) >= OUTBOX_MAX:
-                            resp["error"] = "устройство офлайн, очередь исходящих переполнена"
+                            resp["error"] = t("err_outbox_full")
                         else:
                             _outbox.append({"cmd": cmd, "text": text,
                                             "channel_index": channel_index,
@@ -1165,7 +1151,7 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                                                           req.get("channel", 0))
                             resp = {"req_id": req_id, **result}
                         except asyncio.TimeoutError:
-                            resp["error"] = "узел не ответил (timeout)"
+                            resp["error"] = t("err_traceroute_timeout")
                         except Exception as e:
                             resp["error"] = f"traceroute failed: {e}"
 
@@ -1186,11 +1172,11 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                                 resp = {"req_id": req_id, "ok": True,
                                         "key": key, "value": new_val}
                             except KeyError:
-                                resp["error"] = f"неизвестный параметр: {key}"
+                                resp["error"] = t("err_unknown_param", key=key)
                             except ValueError as e:
                                 resp["error"] = str(e)
                             except Exception as e:
-                                resp["error"] = f"не удалось применить: {e}"
+                                resp["error"] = t("err_apply_failed", error=e)
                         else:
                             resp["error"] = f"unknown settings action: {action}"
 
@@ -1207,7 +1193,7 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                             await asyncio.to_thread(_reboot_node, _interface.localNode)
                             resp = {"req_id": req_id, "ok": True, "secs": REBOOT_DELAY_SECS}
                         except Exception as e:
-                            resp["error"] = f"не удалось перезагрузить: {e}"
+                            resp["error"] = t("err_reboot_failed", error=e)
 
                 elif cmd == "updatenames":
                     if not _interface:
@@ -1219,7 +1205,7 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 elif cmd == "botping":
                     value = req.get("value")
                     if value not in ("0", "1"):
-                        resp["error"] = "ожидается value: '0' или '1'"
+                        resp["error"] = t("err_botping_value")
                     else:
                         _set_botping(value == "1")
                         resp = {"req_id": req_id, "ok": True, "enabled": _botping_enabled,

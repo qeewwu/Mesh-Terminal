@@ -30,6 +30,7 @@ from mesh_common import (
     parse_log_line,
     update_env_file,
 )
+from mesh_i18n import plural, t, t_list
 
 NAME_CACHE_FILE = BASE_DIR / "node_names_cache.json"
 HISTORY_SIZE = 100
@@ -100,13 +101,13 @@ _completion_settings: list[str] = []
 
 def _parse_args() -> tuple[str | None, int]:
     ap = argparse.ArgumentParser(
-        description="Терминальный чат-клиент Meshtastic (работает через mesh_logger.py)",
+        description=t("argparse_description"),
         allow_abbrev=False,
     )
-    ap.add_argument("-c", "--channel", metavar="ИМЯ",
-                    help="показывать и отправлять только в этот канал")
+    ap.add_argument("-c", "--channel", metavar=t("argparse_channel_metavar"),
+                    help=t("argparse_channel_help"))
     ap.add_argument("-n", "--history", type=int, default=HISTORY_SIZE, metavar="N",
-                    help=f"сколько сообщений истории показать (по умолчанию {HISTORY_SIZE})")
+                    help=t("argparse_history_help", default=HISTORY_SIZE))
     args, rest = ap.parse_known_args()
     channel = args.channel
     if channel is None:
@@ -253,7 +254,7 @@ def _pick_node(nodes: list[dict], query: str) -> dict | None:
     matches = _find_node_in_list(nodes, query)
     if not matches:
         print_formatted_text(HTML(
-            f"<ansired>Узел '{_safe(query)}' не найден. Проверьте /nodes</ansired>"
+            f"<ansired>{t('err_node_not_found', query=_safe(query))}</ansired>"
         ))
         return None
     if len(matches) > 1:
@@ -263,8 +264,7 @@ def _pick_node(nodes: list[dict], query: str) -> dict | None:
             for n in matches[:5])
         more = " …" if len(matches) > 5 else ""
         print_formatted_text(HTML(
-            f"<ansiyellow>Имя '{_safe(query)}' неоднозначно, совпадают: "
-            f"{_safe(names)}{more} — уточните запрос</ansiyellow>"
+            f"<ansiyellow>{t('warn_node_ambiguous', query=_safe(query), names=_safe(names), more=more)}</ansiyellow>"
         ))
         return None
     return matches[0]
@@ -321,7 +321,7 @@ class MeshCompleter(Completer):
                     if cand.lower().startswith(arg.lower()):
                         yield Completion(cand, start_position=-len(arg))
         elif cmd == "/stats":
-            for cand in ("день", "узел"):
+            for cand in t_list("stats_completions"):
                 if cand.startswith(arg.lower()):
                     yield Completion(cand, start_position=-len(arg))
         elif cmd == "/botping":
@@ -413,14 +413,14 @@ class IPCClient:
             # не заставляем запросы в полёте ждать свои 10-секундные таймауты
             for fut in self._pending.values():
                 if not fut.done():
-                    fut.set_result({"ok": False, "error": "нет соединения с логгером"})
+                    fut.set_result({"ok": False, "error": t("err_no_logger_connection")})
             self._pending.clear()
             if not self._closing and self.on_disconnect:
                 self.on_disconnect()
 
     async def request(self, cmd: str, timeout: float = 10.0, **fields) -> dict:
         if not self.connected:
-            return {"ok": False, "error": "нет соединения с логгером"}
+            return {"ok": False, "error": t("err_no_logger_connection")}
         self._req_counter += 1
         req_id = self._req_counter
         fut = self._loop.create_future()
@@ -432,7 +432,7 @@ class IPCClient:
         except Exception:
             self.connected = False
             self._pending.pop(req_id, None)
-            return {"ok": False, "error": "нет соединения с логгером"}
+            return {"ok": False, "error": t("err_no_logger_connection")}
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
@@ -471,17 +471,15 @@ def _handle_event(obj: dict) -> None:
         ok = obj.get("ok")
         if ok is True:
             hops = obj.get("hops")
-            hop_str = f" ({hops} хоп{'' if hops == 1 else 'а' if 2 <= hops <= 4 else 'ов'})" \
-                if hops is not None else ""
-            print_formatted_text(HTML(f"<ansigreen>  ✓ Доставлено{hop_str}{ref}</ansigreen>"))
+            hop_str = f" ({plural('hops_forms', hops)})" if hops is not None else ""
+            print_formatted_text(HTML(f"<ansigreen>{t('delivered', hop_str=hop_str, ref=ref)}</ansigreen>"))
         elif ok is False:
             print_formatted_text(HTML(
-                f"<ansired>  ✗ Не доставлено ({_safe(str(obj.get('error', '')))}){ref}</ansired>"
+                f"<ansired>{t('not_delivered', error=_safe(str(obj.get('error', ''))), ref=ref)}</ansired>"
             ))
         else:
             print_formatted_text(HTML(
-                f"<ansiyellow>  ⏳ Нет подтверждения доставки{ref} "
-                f"(мог дойти, но ACK не получен)</ansiyellow>"
+                f"<ansiyellow>{t('delivery_unconfirmed', ref=ref)}</ansiyellow>"
             ))
     elif kind == "message":
         lines = obj.get("lines", [])
@@ -517,13 +515,13 @@ def _handle_event(obj: dict) -> None:
         status = obj.get("status")
         if status == "disconnected":
             print_formatted_text(HTML(
-                "<ansired>⚠ Устройство отключилось — жду переподключения логгера</ansired>"
+                f"<ansired>{t('device_disconnected')}</ansired>"
             ))
         elif status == "connected":
             ln = _safe(obj.get("long_name") or "?")
             sn = _safe(obj.get("short_name") or "?")
             print_formatted_text(HTML(
-                f"<ansigreen>✓ Устройство снова на связи: {ln} ({sn})</ansigreen>"
+                f"<ansigreen>{t('device_reconnected', ln=ln, sn=sn)}</ansigreen>"
             ))
             if not _channel_resolved:
                 _loop.create_task(_try_resolve_pending_channel())
@@ -670,7 +668,7 @@ def _on_logger_lost() -> None:
         return
     _reconnecting = True
     print_formatted_text(HTML(
-        "<ansired>⚠ Соединение с логгером потеряно — переподключаюсь...</ansired>"
+        f"<ansired>{t('logger_lost')}</ansired>"
     ))
     _loop.create_task(_reconnect_logger(datetime.datetime.now()))
 
@@ -740,7 +738,7 @@ async def _reconnect_logger(lost_at: datetime.datetime) -> None:
         _on_logger_lost()
         return
     print_formatted_text(HTML(
-        "<ansigreen>✓ Соединение с логгером восстановлено</ansigreen>"
+        f"<ansigreen>{t('logger_restored')}</ansigreen>"
     ))
     _replay_missed(lost_at)
 
@@ -766,14 +764,13 @@ async def _cmd_nodes(args: str = "") -> None:
     mode = args.strip().lower() or "online"
     if mode not in NODE_SORT_MODES:
         print_formatted_text(HTML(
-            f"<ansiyellow>Неизвестная сортировка '{_safe(mode)}'. "
-            f"Доступные: {', '.join(NODE_SORT_MODES)}</ansiyellow>"
+            f"<ansiyellow>{t('err_unknown_sort', mode=_safe(mode), modes=', '.join(NODE_SORT_MODES))}</ansiyellow>"
         ))
         return
 
     resp = await _client.request("nodes")
     if not resp.get("ok") or not resp.get("nodes"):
-        print_formatted_text(HTML("<ansiyellow>Нет данных об узлах</ansiyellow>"))
+        print_formatted_text(HTML(f"<ansiyellow>{t('err_no_node_data')}</ansiyellow>"))
         return
 
     enriched = _enrich_nodes(resp["nodes"])
@@ -781,7 +778,7 @@ async def _cmd_nodes(args: str = "") -> None:
 
     enriched.sort(key=lambda n: _node_sort_key(n, mode))
 
-    print_formatted_text(HTML("<ansiwhite>─── Видимые узлы ───</ansiwhite>"))
+    print_formatted_text(HTML(f"<ansiwhite>{t('hdr_visible_nodes')}</ansiwhite>"))
     for n in enriched:
         ln, sn = _safe(n["display_long"]), _safe(n["display_short"])
 
@@ -790,19 +787,18 @@ async def _cmd_nodes(args: str = "") -> None:
         snr = n.get("snr")
         snr_str = f" SNR:{snr:.1f}" if snr is not None else ""
         hops = n.get("hops_away")
-        hops_str = f" · {hops} хоп{'' if hops == 1 else 'а' if 2 <= hops <= 4 else 'ов'}" \
-            if hops is not None else ""
+        hops_str = f" · {plural('hops_forms', hops)}" if hops is not None else ""
 
         ago = n["seconds_ago"]
         if ago is not None and ago < ONLINE_THRESHOLD_SECONDS:
-            heard, color = "Онлайн", "ansigreen"
+            heard, color = t("online_now"), "ansigreen"
         elif ago is not None:
             if ago < 3600:
-                heard, color = f"{ago // 60}м назад", "ansiyellow"
+                heard, color = t("ago_minutes", mins=ago // 60), "ansiyellow"
             else:
-                heard, color = f"{ago // 3600}ч назад", "ansigray"
+                heard, color = t("ago_hours", hrs=ago // 3600), "ansigray"
         else:
-            heard, color = "?", "ansigray"
+            heard, color = t("unknown_time"), "ansigray"
 
         print_formatted_text(HTML(
             f"  <b><ansigreen>{ln}</ansigreen></b> <ansigreen>({sn})</ansigreen>"
@@ -813,12 +809,12 @@ async def _cmd_nodes(args: str = "") -> None:
 
 def _cmd_who() -> None:
     if not _client.whoami:
-        print_formatted_text(HTML("<ansiyellow>Информация о себе недоступна</ansiyellow>"))
+        print_formatted_text(HTML(f"<ansiyellow>{t('err_no_self_info')}</ansiyellow>"))
         return
     ln, sn = _client.whoami
     id_str = f"!{_client.whoami_id:08x}" if _client.whoami_id is not None else ""
     print_formatted_text(HTML(
-        f"<ansiwhite>Я: </ansiwhite>"
+        f"<ansiwhite>{t('who_me_label')}</ansiwhite>"
         f"<b><ansicyan>{_safe(ln)}</ansicyan></b> "
         f"<ansicyan>({_safe(sn)})</ansicyan>"
         f"<ansiwhite>{f' {_safe(id_str)}' if id_str else ''}</ansiwhite>"
@@ -835,12 +831,11 @@ def _handle_send_response(resp: dict, text: str) -> None:
     if resp.get("ok"):
         if resp.get("queued"):
             print_formatted_text(HTML(
-                f"<ansiyellow>  ⏳ В очереди: «{_safe(_snippet(text, 60))}» — устройство "
-                f"офлайн, отправлю сразу при переподключении</ansiyellow>"
+                f"<ansiyellow>{t('queued', snippet=_safe(_snippet(text, 60)))}</ansiyellow>"
             ))
         return
     print_formatted_text(HTML(
-        f"<ansired>Ошибка отправки: {_safe(resp.get('error', ''))}</ansired>"
+        f"<ansired>{t('err_send_error', error=_safe(resp.get('error', '')))}</ansired>"
     ))
 
 
@@ -861,15 +856,12 @@ def _split_dm_args(args: str) -> tuple[str | None, str | None]:
 async def _cmd_dm(args: str) -> None:
     target_name, text = _split_dm_args(args)
     if not target_name or not text:
-        print_formatted_text(HTML(
-            "<ansiyellow>Использование: /dm &lt;имя&gt; &lt;текст&gt; "
-            "(имя с пробелами — в кавычках)</ansiyellow>"
-        ))
+        print_formatted_text(HTML(f"<ansiyellow>{t('usage_dm')}</ansiyellow>"))
         return
     resp = await _client.request("nodes")
     if not resp.get("ok"):
         print_formatted_text(HTML(
-            f"<ansired>Не удалось получить список узлов: {_safe(resp.get('error', ''))}</ansired>"
+            f"<ansired>{t('err_nodes_fetch_failed', error=_safe(resp.get('error', '')))}</ansired>"
         ))
         return
 
@@ -895,15 +887,13 @@ def _fmt_trace_hop(h: dict) -> str:
 async def _cmd_trace(args: str) -> None:
     target_name = args.strip()
     if not target_name:
-        print_formatted_text(HTML(
-            "<ansiyellow>Использование: /trace &lt;имя узла&gt;</ansiyellow>"
-        ))
+        print_formatted_text(HTML(f"<ansiyellow>{t('usage_trace')}</ansiyellow>"))
         return
 
     resp = await _client.request("nodes")
     if not resp.get("ok"):
         print_formatted_text(HTML(
-            f"<ansired>Не удалось получить список узлов: {_safe(resp.get('error', ''))}</ansired>"
+            f"<ansired>{t('err_nodes_fetch_failed', error=_safe(resp.get('error', '')))}</ansired>"
         ))
         return
     node = _pick_node(_enrich_nodes(resp["nodes"]), target_name)
@@ -911,15 +901,13 @@ async def _cmd_trace(args: str) -> None:
         return
 
     print_formatted_text(HTML(
-        f"<ansiwhite>Трассирую до "
-        f"{_safe(node.get('display_long') or node.get('long_name') or '?')} — "
-        f"может занять до {int(TRACE_TIMEOUT)}с...</ansiwhite>"
+        f"<ansiwhite>{t('tracing', name=_safe(node.get('display_long') or node.get('long_name') or '?'), timeout=int(TRACE_TIMEOUT))}</ansiwhite>"
     ))
     trace_resp = await _client.request("trace", node_id=node["node_id"],
                                         channel=_channel_index, timeout=TRACE_TIMEOUT)
     if not trace_resp.get("ok"):
         print_formatted_text(HTML(
-            f"<ansired>Traceroute не удался: {_safe(trace_resp.get('error', ''))}</ansired>"
+            f"<ansired>{t('err_traceroute_failed', error=_safe(trace_resp.get('error', '')))}</ansired>"
         ))
         return
 
@@ -927,17 +915,17 @@ async def _cmd_trace(args: str) -> None:
     back = trace_resp.get("back", [])
     if towards:
         print_formatted_text(HTML(
-            f"<ansiwhite>Маршрут туда:</ansiwhite> "
+            f"<ansiwhite>{t('route_there')}</ansiwhite> "
             + " → ".join(_fmt_trace_hop(h) for h in towards)
         ))
     if back:
         print_formatted_text(HTML(
-            f"<ansiwhite>Маршрут обратно:</ansiwhite> "
+            f"<ansiwhite>{t('route_back')}</ansiwhite> "
             + " → ".join(_fmt_trace_hop(h) for h in back)
         ))
     else:
         print_formatted_text(HTML(
-            "<ansigray>(обратный маршрут не получен)</ansigray>"
+            f"<ansigray>{t('no_return_route')}</ansigray>"
         ))
 
 
@@ -947,13 +935,13 @@ async def _cmd_ping(args: str) -> None:
     хопов, которое ACK принёс с собой (см. handler() в mesh_logger.py)."""
     target_name = args.strip()
     if not target_name:
-        print_formatted_text(HTML("<ansiyellow>Использование: /ping &lt;имя узла&gt;</ansiyellow>"))
+        print_formatted_text(HTML(f"<ansiyellow>{t('usage_ping')}</ansiyellow>"))
         return
 
     resp = await _client.request("nodes")
     if not resp.get("ok"):
         print_formatted_text(HTML(
-            f"<ansired>Не удалось получить список узлов: {_safe(resp.get('error', ''))}</ansired>"
+            f"<ansired>{t('err_nodes_fetch_failed', error=_safe(resp.get('error', '')))}</ansired>"
         ))
         return
     node = _pick_node(_enrich_nodes(resp["nodes"]), target_name)
@@ -962,24 +950,24 @@ async def _cmd_ping(args: str) -> None:
 
     ln = node.get("display_long") or node.get("long_name") or "?"
     sn = node.get("display_short") or node.get("short_name") or "?"
-    print_formatted_text(HTML(f"<ansiwhite>🏓 Пингую {_safe(ln)} ({_safe(sn)})...</ansiwhite>"))
+    print_formatted_text(HTML(f"<ansiwhite>{t('pinging', ln=_safe(ln), sn=_safe(sn))}</ansiwhite>"))
 
     start = _loop.time()
     send_resp = await _client.request("dm", node_id=node["node_id"], text="🏓 ping",
                                        channel=_channel_index)
     if not send_resp.get("ok"):
         print_formatted_text(HTML(
-            f"<ansired>Ошибка отправки: {_safe(send_resp.get('error', ''))}</ansired>"
+            f"<ansired>{t('err_send_error', error=_safe(send_resp.get('error', '')))}</ansired>"
         ))
         return
     if send_resp.get("queued"):
         print_formatted_text(HTML(
-            "<ansiyellow>⏳ Устройство офлайн — пинг встал в очередь, RTT не измерить</ansiyellow>"
+            f"<ansiyellow>{t('ping_queued')}</ansiyellow>"
         ))
         return
     pid = send_resp.get("packet_id")
     if not pid:
-        print_formatted_text(HTML("<ansired>Не удалось получить packet_id для пинга</ansired>"))
+        print_formatted_text(HTML(f"<ansired>{t('err_no_packet_id')}</ansired>"))
         return
 
     fut = _loop.create_future()
@@ -989,7 +977,7 @@ async def _cmd_ping(args: str) -> None:
     except asyncio.TimeoutError:
         _pending_pings.pop(pid, None)
         print_formatted_text(HTML(
-            f"<ansired>🏓 {_safe(ln)}: нет ответа за {int(PING_TIMEOUT)}с</ansired>"
+            f"<ansired>{t('ping_no_reply', ln=_safe(ln), timeout=int(PING_TIMEOUT))}</ansired>"
         ))
         return
 
@@ -997,33 +985,30 @@ async def _cmd_ping(args: str) -> None:
     ok = delivery.get("ok")
     if ok is True:
         hops = delivery.get("hops")
-        hop_str = f", {hops} хоп{'' if hops == 1 else 'а' if 2 <= hops <= 4 else 'ов'}" \
-            if hops is not None else ""
+        hop_str = f", {plural('hops_forms', hops)}" if hops is not None else ""
         print_formatted_text(HTML(
-            f"<ansigreen>🏓 {_safe(ln)}: доставлено за {elapsed:.1f}с{hop_str}</ansigreen>"
+            f"<ansigreen>{t('ping_delivered', ln=_safe(ln), elapsed=f'{elapsed:.1f}', hop_str=hop_str)}</ansigreen>"
         ))
     elif ok is False:
         print_formatted_text(HTML(
-            f"<ansired>🏓 {_safe(ln)}: не доставлено "
-            f"({_safe(str(delivery.get('error', '')))})</ansired>"
+            f"<ansired>{t('ping_not_delivered', ln=_safe(ln), error=_safe(str(delivery.get('error', ''))))}</ansired>"
         ))
     else:
         print_formatted_text(HTML(
-            f"<ansiyellow>🏓 {_safe(ln)}: нет подтверждения доставки за {elapsed:.1f}с "
-            "(мог дойти, но ACK не получен)</ansiyellow>"
+            f"<ansiyellow>{t('ping_unconfirmed', ln=_safe(ln), elapsed=f'{elapsed:.1f}')}</ansiyellow>"
         ))
 
 
 async def _cmd_pos(args: str) -> None:
     target_name = args.strip()
     if not target_name:
-        print_formatted_text(HTML("<ansiyellow>Использование: /pos &lt;имя узла&gt;</ansiyellow>"))
+        print_formatted_text(HTML(f"<ansiyellow>{t('usage_pos')}</ansiyellow>"))
         return
 
     resp = await _client.request("nodes")
     if not resp.get("ok"):
         print_formatted_text(HTML(
-            f"<ansired>Не удалось получить список узлов: {_safe(resp.get('error', ''))}</ansired>"
+            f"<ansired>{t('err_nodes_fetch_failed', error=_safe(resp.get('error', '')))}</ansired>"
         ))
         return
     nodes = _enrich_nodes(resp["nodes"])
@@ -1032,19 +1017,18 @@ async def _cmd_pos(args: str) -> None:
         return
     if node.get("lat") is None or node.get("lon") is None:
         print_formatted_text(HTML(
-            f"<ansiyellow>У узла "
-            f"{_safe(node.get('display_long') or node.get('long_name') or '?')} "
-            "нет данных о позиции (не шлёт GPS-координаты)</ansiyellow>"
+            f"<ansiyellow>{t('err_no_position', name=_safe(node.get('display_long') or node.get('long_name') or '?'))}</ansiyellow>"
         ))
         return
 
     ln = node.get("display_long") or node.get("long_name") or "?"
     sn = node.get("display_short") or node.get("short_name") or "?"
     alt = node.get("alt")
-    alt_str = f", {alt} м" if alt is not None else ""
+    alt_str = f", {alt} {t('unit_m')}" if alt is not None else ""
+    lat_str = f"{node['lat']:.5f}"
+    lon_str = f"{node['lon']:.5f}"
     print_formatted_text(HTML(
-        f"<ansiwhite>📍 {_safe(ln)} ({_safe(sn)}): "
-        f"{node['lat']:.5f}, {node['lon']:.5f}{alt_str}</ansiwhite>"
+        f"<ansiwhite>{t('pos_line', ln=_safe(ln), sn=_safe(sn), lat=lat_str, lon=lon_str, alt_str=alt_str)}</ansiwhite>"
     ))
 
     me = next((n for n in nodes if n["node_id"] == _client.whoami_id), None) \
@@ -1052,14 +1036,14 @@ async def _cmd_pos(args: str) -> None:
     if me and me.get("lat") is not None and me.get("lon") is not None:
         dist = haversine_km(me["lat"], me["lon"], node["lat"], node["lon"])
         brng = bearing_deg(me["lat"], me["lon"], node["lat"], node["lon"])
-        dist_str = f"{dist:.1f} км" if dist >= 1 else f"{dist * 1000:.0f} м"
+        dist_str = f"{dist:.1f} {t('unit_km')}" if dist >= 1 else f"{dist * 1000:.0f} {t('unit_m')}"
+        brng_str = f"{brng:.0f}"
         print_formatted_text(HTML(
-            f"<ansiwhite>   от меня: {dist_str}, азимут {brng:.0f}° "
-            f"({compass_point(brng)})</ansiwhite>"
+            f"<ansiwhite>{t('pos_distance', dist_str=dist_str, brng=brng_str, compass=compass_point(brng))}</ansiwhite>"
         ))
     else:
         print_formatted_text(HTML(
-            "<ansigray>   (у моего узла нет своей позиции — расстояние не посчитать)</ansigray>"
+            f"<ansigray>{t('pos_no_own_position')}</ansigray>"
         ))
 
 
@@ -1074,15 +1058,10 @@ def _reply_label(r: dict, num: int) -> str:
 
 
 def _list_replyables() -> None:
-    print_formatted_text(HTML(
-        "<ansiwhite>─── На что можно ответить (#1 — самое свежее) ───</ansiwhite>"
-    ))
+    print_formatted_text(HTML(f"<ansiwhite>{t('hdr_replyables')}</ansiwhite>"))
     for num, r in enumerate(reversed(_replyables), start=1):
         print_formatted_text(HTML(f"<ansiwhite>{_reply_label(r, num)}</ansiwhite>"))
-    print_formatted_text(HTML(
-        "<ansigray>Ответить: /reply #&lt;номер&gt; &lt;текст&gt; — "
-        "или /reply &lt;текст&gt; на #1</ansigray>"
-    ))
+    print_formatted_text(HTML(f"<ansigray>{t('reply_hint')}</ansigray>"))
 
 
 def _parse_target_and_text(args: str, usage_html: str) -> tuple[dict, str] | None:
@@ -1096,7 +1075,7 @@ def _parse_target_and_text(args: str, usage_html: str) -> tuple[dict, str] | Non
         num = int(num_str)
         if not 1 <= num <= len(_replyables):
             print_formatted_text(HTML(
-                f"<ansired>Нет сообщения #{num} — доступны #1…#{len(_replyables)}</ansired>"
+                f"<ansired>{t('err_no_such_reply', num=num, max=len(_replyables))}</ansired>"
             ))
             return None
         return _replyables[-num], text
@@ -1117,20 +1096,14 @@ async def _send_to_reply_target(r: dict, text: str, emoji: bool = False) -> dict
 async def _cmd_reply(args: str) -> None:
     args = args.strip()
     if not _replyables:
-        print_formatted_text(HTML(
-            "<ansiyellow>Пока нечего цитировать: /reply работает для сообщений, "
-            "полученных после запуска клиента</ansiyellow>"
-        ))
+        print_formatted_text(HTML(f"<ansiyellow>{t('err_nothing_to_quote')}</ansiyellow>"))
         return
 
     if not args:
         _list_replyables()
         return
 
-    target = _parse_target_and_text(args, (
-        "<ansiyellow>Использование: /reply #&lt;номер&gt; &lt;текст&gt; "
-        "(номера — в /reply без аргументов)</ansiyellow>"
-    ))
+    target = _parse_target_and_text(args, f"<ansiyellow>{t('usage_reply')}</ansiyellow>")
     if target is None:
         return
     r, text = target
@@ -1138,8 +1111,7 @@ async def _cmd_reply(args: str) -> None:
     parsed = parse_log_line(r["line"])
     if parsed:
         print_formatted_text(HTML(
-            f"<ansigray>Отвечаю на: [{_safe(parsed.time_str)}] {_safe(parsed.long_name)} — "
-            f"{_safe(_snippet(parsed.text))}</ansigray>"
+            f"<ansigray>{t('replying_to', time=_safe(parsed.time_str), name=_safe(parsed.long_name), snippet=_safe(_snippet(parsed.text)))}</ansigray>"
         ))
     resp = await _send_to_reply_target(r, text)
     _handle_send_response(resp, text)
@@ -1148,24 +1120,15 @@ async def _cmd_reply(args: str) -> None:
 async def _cmd_react(args: str) -> None:
     args = args.strip()
     if not _replyables:
-        print_formatted_text(HTML(
-            "<ansiyellow>Пока нечего реактить: /react работает для сообщений, "
-            "полученных после запуска клиента</ansiyellow>"
-        ))
+        print_formatted_text(HTML(f"<ansiyellow>{t('err_nothing_to_react')}</ansiyellow>"))
         return
 
     if not args:
         _list_replyables()
-        print_formatted_text(HTML(
-            "<ansigray>Реакция: /react #&lt;номер&gt; &lt;эмодзи&gt; — "
-            "или /react &lt;эмодзи&gt; на #1</ansigray>"
-        ))
+        print_formatted_text(HTML(f"<ansigray>{t('react_hint')}</ansigray>"))
         return
 
-    target = _parse_target_and_text(args, (
-        "<ansiyellow>Использование: /react #&lt;номер&gt; &lt;эмодзи&gt; "
-        "(номера — в /react без аргументов)</ansiyellow>"
-    ))
+    target = _parse_target_and_text(args, f"<ansiyellow>{t('usage_react')}</ansiyellow>")
     if target is None:
         return
     r, emoji_text = target
@@ -1173,8 +1136,7 @@ async def _cmd_react(args: str) -> None:
     parsed = parse_log_line(r["line"])
     if parsed:
         print_formatted_text(HTML(
-            f"<ansigray>Реагирую на: [{_safe(parsed.time_str)}] {_safe(parsed.long_name)} — "
-            f"{_safe(_snippet(parsed.text))}</ansigray>"
+            f"<ansigray>{t('reacting_to', time=_safe(parsed.time_str), name=_safe(parsed.long_name), snippet=_safe(_snippet(parsed.text)))}</ansigray>"
         ))
     resp = await _send_to_reply_target(r, emoji_text, emoji=True)
     _handle_send_response(resp, emoji_text)
@@ -1199,13 +1161,12 @@ async def _try_resolve_pending_channel() -> None:
         _channel_filter = match["name"]
         _channel_resolved = True
         print_formatted_text(HTML(
-            f"<b><ansicyan>Канал подтверждён: {_safe(_channel_filter)}</ansicyan></b>"
+            f"<b><ansicyan>{t('channel_confirmed', name=_safe(_channel_filter))}</ansicyan></b>"
         ))
     else:
-        available = ", ".join(c["name"] for c in channels) or "нет данных"
+        available = ", ".join(c["name"] for c in channels) or t("no_data")
         print_formatted_text(HTML(
-            f"<ansired>Канал '{_safe(_channel_filter)}' не найден на устройстве. "
-            f"Доступные: {_safe(available)} — показываю все каналы</ansired>"
+            f"<ansired>{t('channel_not_found_device', name=_safe(_channel_filter), available=_safe(available))}</ansired>"
         ))
         _channel_filter = None
         _channel_index = 0
@@ -1221,11 +1182,10 @@ async def _cmd_ch(args: str) -> None:
         _completion_channels = [c["name"] for c in channels]
 
     if not name:
-        current = _channel_filter or "все"
+        current = _channel_filter or t("channel_all_word")
+        channels_str = ", ".join(c["name"] for c in channels) or t("no_data")
         print_formatted_text(HTML(
-            f"<ansiwhite>Сейчас: <b>{_safe(current)}</b>. Каналы: "
-            f"{_safe(', '.join(c['name'] for c in channels) or 'нет данных')}. "
-            f"Переключение: /ch &lt;имя&gt; или /ch all</ansiwhite>"
+            f"<ansiwhite>{t('channel_status', current=_safe(current), channels=_safe(channels_str))}</ansiwhite>"
         ))
         return
 
@@ -1234,16 +1194,15 @@ async def _cmd_ch(args: str) -> None:
         _channel_index = 0
         _channel_resolved = True
         print_formatted_text(HTML(
-            "<b><ansicyan>Все каналы (отправка — в Primary)</ansicyan></b>"
+            f"<b><ansicyan>{t('channel_all_banner')}</ansicyan></b>"
         ))
         return
 
     match = next((c for c in channels if c["name"].lower() == name.lower()), None)
     if not match:
-        available = ", ".join(c["name"] for c in channels) or "нет данных"
+        available = ", ".join(c["name"] for c in channels) or t("no_data")
         print_formatted_text(HTML(
-            f"<ansired>Канал '{_safe(name)}' не найден. "
-            f"Доступные: {_safe(available)}</ansired>"
+            f"<ansired>{t('err_channel_not_found', name=_safe(name), available=_safe(available))}</ansired>"
         ))
         return
 
@@ -1255,7 +1214,7 @@ async def _cmd_ch(args: str) -> None:
     _replyables.clear()
     _replyables.extend(kept)
     print_formatted_text(HTML(
-        f"<b><ansicyan>Канал: {_safe(_channel_filter)}</ansicyan></b>"
+        f"<b><ansicyan>{t('channel_banner', name=_safe(_channel_filter))}</ansicyan></b>"
     ))
     _print_initial_history(CH_SWITCH_HISTORY)
 
@@ -1265,9 +1224,7 @@ async def _cmd_send(args: str) -> None:
     current channel (unlike /ch, which changes what /reply and history filter to)."""
     parts = args.strip().split(None, 1)
     if len(parts) < 2:
-        print_formatted_text(HTML(
-            "<ansiyellow>Использование: /send &lt;канал&gt; &lt;текст&gt;</ansiyellow>"
-        ))
+        print_formatted_text(HTML(f"<ansiyellow>{t('usage_send')}</ansiyellow>"))
         return
     channel_name, text = parts
 
@@ -1275,10 +1232,9 @@ async def _cmd_send(args: str) -> None:
     channels = resp.get("channels", []) if resp.get("ok") else []
     match = next((c for c in channels if c["name"].lower() == channel_name.lower()), None)
     if not match:
-        available = ", ".join(c["name"] for c in channels) or "нет данных"
+        available = ", ".join(c["name"] for c in channels) or t("no_data")
         print_formatted_text(HTML(
-            f"<ansired>Канал '{_safe(channel_name)}' не найден. "
-            f"Доступные: {_safe(available)}</ansired>"
+            f"<ansired>{t('err_channel_not_found', name=_safe(channel_name), available=_safe(available))}</ansired>"
         ))
         return
 
@@ -1318,7 +1274,7 @@ def _print_unit_matches(header: str, matches: list[tuple[str, str | None, str]],
         print_formatted_text(HTML(f"<ansiyellow>{empty_message}</ansiyellow>"))
         return
     shown = matches[-limit:]
-    suffix = f" (показаны последние {limit})" if len(matches) > limit else ""
+    suffix = t("shown_last_n", limit=limit) if len(matches) > limit else ""
     print_formatted_text(HTML(f"<ansiwhite>{header}{_safe(suffix)} ───</ansiwhite>"))
     last_date = None
     for date_str, quote, msg in shown:
@@ -1331,9 +1287,7 @@ def _print_unit_matches(header: str, matches: list[tuple[str, str | None, str]],
 def _cmd_search(args: str) -> None:
     query = args.strip().lower()
     if not query:
-        print_formatted_text(HTML(
-            "<ansiyellow>Использование: /search &lt;текст&gt;</ansiyellow>"
-        ))
+        print_formatted_text(HTML(f"<ansiyellow>{t('usage_search')}</ansiyellow>"))
         return
 
     matches = _scan_units(
@@ -1341,17 +1295,14 @@ def _cmd_search(args: str) -> None:
                    or query in p.short_name.lower()),
         SEARCH_LIMIT,
     )
-    _print_unit_matches(f"─── Поиск: «{_safe(query)}»", matches, SEARCH_LIMIT,
-                        f"По запросу «{_safe(query)}» ничего не найдено")
+    _print_unit_matches(t("hdr_search", query=_safe(query)), matches, SEARCH_LIMIT,
+                        t("search_empty", query=_safe(query)))
 
 
 def _cmd_last(args: str) -> None:
     query = args.strip()
     if not query:
-        print_formatted_text(HTML(
-            "<ansiyellow>Использование: /last &lt;имя узла&gt; (короткое или полное, "
-            "точное совпадение)</ansiyellow>"
-        ))
+        print_formatted_text(HTML(f"<ansiyellow>{t('usage_last')}</ansiyellow>"))
         return
 
     q = query.lower()
@@ -1359,8 +1310,8 @@ def _cmd_last(args: str) -> None:
         lambda p: p.long_name.lower() == q or p.short_name.lower() == q,
         LAST_LIMIT,
     )
-    _print_unit_matches(f"─── Последние сообщения от «{_safe(query)}»", matches, LAST_LIMIT,
-                        f"Сообщений от «{_safe(query)}» не найдено")
+    _print_unit_matches(t("hdr_last_from", query=_safe(query)), matches, LAST_LIMIT,
+                        t("last_empty", query=_safe(query)))
 
 
 def _collect_stats() -> dict:
@@ -1401,11 +1352,11 @@ async def _cmd_stats(args: str = "") -> None:
     mode = args.strip().lower()
     stats = await asyncio.to_thread(_collect_stats)
     if stats["total"] == 0:
-        print_formatted_text(HTML("<ansiyellow>Нет данных для статистики</ansiyellow>"))
+        print_formatted_text(HTML(f"<ansiyellow>{t('err_no_stats')}</ansiyellow>"))
         return
 
     if mode in ("день", "дни", "day", "days"):
-        print_formatted_text(HTML("<ansiwhite>─── Сообщений по дням ───</ansiwhite>"))
+        print_formatted_text(HTML(f"<ansiwhite>{t('hdr_by_day')}</ansiwhite>"))
         days = sorted(stats["per_day"].items())
         max_count = max(c for _, c in days)
         for date_str, count in days:
@@ -1415,7 +1366,7 @@ async def _cmd_stats(args: str = "") -> None:
         return
 
     if mode in ("узел", "узлы", "node", "nodes"):
-        print_formatted_text(HTML("<ansiwhite>─── Топ активных узлов ───</ansiwhite>"))
+        print_formatted_text(HTML(f"<ansiwhite>{t('hdr_top_nodes')}</ansiwhite>"))
         top = stats["per_node"].most_common(15)
         max_count = top[0][1] if top else 0
         for (ln, sn), count in top:
@@ -1429,17 +1380,17 @@ async def _cmd_stats(args: str = "") -> None:
     days_count = len(stats["per_day"])
     top_nodes = stats["per_node"].most_common(5)
     busiest_hour = stats["per_hour"].most_common(1)
-    print_formatted_text(HTML("<ansiwhite>─── Статистика ───</ansiwhite>"))
-    print_formatted_text(HTML(f"  Всего сообщений: <b>{stats['total']}</b> за {days_count} дн."))
+    print_formatted_text(HTML(f"<ansiwhite>{t('hdr_stats')}</ansiwhite>"))
+    print_formatted_text(HTML(t("total_messages", total=stats['total'], days=days_count)))
     if busiest_hour:
         hour, cnt = busiest_hour[0]
-        print_formatted_text(HTML(f"  Самый активный час: {hour:02d}:00 ({cnt} сообщений)"))
+        print_formatted_text(HTML(t("busiest_hour", hour=hour, count=cnt)))
     if top_nodes:
-        print_formatted_text(HTML("  Топ узлов:"))
+        print_formatted_text(HTML(t("top_nodes_label")))
         for (ln, sn), count in top_nodes:
             dln, dsn = _resolve_display_name(ln, sn)
             print_formatted_text(HTML(f"    <b>{_safe(dln)}</b> ({_safe(dsn)}) — {count}"))
-    print_formatted_text(HTML("<ansigray>Подробнее: /stats день · /stats узел</ansigray>"))
+    print_formatted_text(HTML(f"<ansigray>{t('stats_more_hint')}</ansigray>"))
 
 
 def _cmd_clear() -> None:
@@ -1454,29 +1405,27 @@ async def _cmd_updatenames() -> None:
     resp = await _client.request("updatenames")
     if not resp.get("ok"):
         print_formatted_text(HTML(
-            f"<ansired>Не удалось обновить имена: {_safe(resp.get('error', ''))}</ansired>"
+            f"<ansired>{t('err_update_names_failed', error=_safe(resp.get('error', '')))}</ansired>"
         ))
         return
     _reload_onemesh_cache()
     resolved, targets = resp.get("resolved", 0), resp.get("targets", 0)
     if targets == 0:
-        print_formatted_text(HTML(
-            "<ansiyellow>Нечего обновлять — все видимые узлы уже с именами</ansiyellow>"
-        ))
+        print_formatted_text(HTML(f"<ansiyellow>{t('nothing_to_update')}</ansiyellow>"))
     else:
         print_formatted_text(HTML(
-            f"<ansigreen>Готово: обновлено {resolved} из {targets} имён</ansigreen>"
+            f"<ansigreen>{t('update_done', resolved=resolved, targets=targets)}</ansigreen>"
         ))
 
 
 def _list_muted() -> None:
     if not _muted_names:
-        print_formatted_text(HTML("<ansiyellow>Список замьюченных пуст</ansiyellow>"))
+        print_formatted_text(HTML(f"<ansiyellow>{t('empty_muted_list')}</ansiyellow>"))
         return
-    print_formatted_text(HTML("<ansiwhite>─── Замьюченные ───</ansiwhite>"))
+    print_formatted_text(HTML(f"<ansiwhite>{t('hdr_muted')}</ansiwhite>"))
     for name in sorted(_muted_names):
         print_formatted_text(HTML(f"  {_safe(name)}"))
-    print_formatted_text(HTML("<ansigray>Снять: /unmute &lt;имя&gt;</ansigray>"))
+    print_formatted_text(HTML(f"<ansigray>{t('unmute_hint')}</ansigray>"))
 
 
 async def _cmd_mute(args: str) -> None:
@@ -1505,13 +1454,12 @@ async def _cmd_mute(args: str) -> None:
 
     key = target.strip().lower()
     if key in _muted_names:
-        print_formatted_text(HTML(f"<ansiyellow>«{_safe(target)}» уже замьючен</ansiyellow>"))
+        print_formatted_text(HTML(f"<ansiyellow>{t('already_muted', name=_safe(target))}</ansiyellow>"))
         return
     _muted_names.add(key)
     _save_name_cache()
     print_formatted_text(HTML(
-        f"<ansigray>🔇 «{_safe(target)}» замьючен — больше не появится в чате "
-        "(/search и /last по-прежнему находят)</ansigray>"
+        f"<ansigray>{t('muted_msg', name=_safe(target))}</ansigray>"
     ))
 
 
@@ -1523,13 +1471,12 @@ async def _cmd_unmute(args: str) -> None:
     key = query.lower()
     if key not in _muted_names:
         print_formatted_text(HTML(
-            f"<ansiyellow>«{_safe(query)}» не в списке замьюченных — /unmute без аргументов "
-            "покажет список</ansiyellow>"
+            f"<ansiyellow>{t('not_muted', name=_safe(query))}</ansiyellow>"
         ))
         return
     _muted_names.discard(key)
     _save_name_cache()
-    print_formatted_text(HTML(f"<ansigreen>🔊 «{_safe(query)}» размьючен</ansigreen>"))
+    print_formatted_text(HTML(f"<ansigreen>{t('unmuted_msg', name=_safe(query))}</ansigreen>"))
 
 
 async def _cmd_botping(args: str) -> None:
@@ -1540,23 +1487,18 @@ async def _cmd_botping(args: str) -> None:
     хранится в .env."""
     value = args.strip()
     if value not in ("0", "1"):
-        print_formatted_text(HTML(
-            "<ansiyellow>Использование: /botping 0|1 (0 — выключить, 1 — включить)</ansiyellow>"
-        ))
+        print_formatted_text(HTML(f"<ansiyellow>{t('usage_botping')}</ansiyellow>"))
         return
     resp = await _client.request("botping", value=value)
     if not resp.get("ok"):
         print_formatted_text(HTML(
-            f"<ansired>Не удалось изменить: {_safe(resp.get('error', ''))}</ansired>"
+            f"<ansired>{t('err_botping_change_failed', error=_safe(resp.get('error', '')))}</ansired>"
         ))
         return
-    state = "включён" if resp.get("enabled") else "выключен"
-    print_formatted_text(HTML(f"<ansigreen>🤖 botping {state}</ansigreen>"))
+    state = t("botping_on") if resp.get("enabled") else t("botping_off")
+    print_formatted_text(HTML(f"<ansigreen>{t('botping_state', state=state)}</ansigreen>"))
     if resp.get("enabled") and not resp.get("channel_found", True):
-        print_formatted_text(HTML(
-            "<ansiyellow>На устройстве нет канала «Ping» (PING_CHANNEL в .env) — "
-            "бот включён, но реагировать пока не на что</ansiyellow>"
-        ))
+        print_formatted_text(HTML(f"<ansiyellow>{t('botping_no_channel')}</ansiyellow>"))
 
 
 async def _cmd_settings(args: str) -> None:
@@ -1568,38 +1510,33 @@ async def _cmd_settings(args: str) -> None:
         resp = await _client.request("settings", action="list")
         if not resp.get("ok"):
             print_formatted_text(HTML(
-                f"<ansired>Не удалось получить настройки: {_safe(resp.get('error', ''))}</ansired>"
+                f"<ansired>{t('err_settings_fetch_failed', error=_safe(resp.get('error', '')))}</ansired>"
             ))
             return
-        print_formatted_text(HTML("<ansiwhite>─── Настройки узла ───</ansiwhite>"))
+        print_formatted_text(HTML(f"<ansiwhite>{t('hdr_settings')}</ansiwhite>"))
         for item in resp.get("settings", []):
             print_formatted_text(HTML(
                 f"  <b>{_safe(item['key'])}</b> = {_safe(str(item['value']))}  "
                 f"<ansigray>{_safe(item['description'])}</ansigray>"
             ))
         print_formatted_text(HTML(
-            "<ansigray>Изменить: /settings &lt;параметр&gt; &lt;значение&gt;. "
-            "Подробности — SETTINGS.ru.md</ansigray>"
+            f"<ansigray>{t('settings_change_hint', doc=t('settings_doc'))}</ansigray>"
         ))
         return
 
     if len(parts) < 2:
-        print_formatted_text(HTML(
-            "<ansiyellow>Использование: /settings &lt;параметр&gt; &lt;значение&gt; "
-            "(список параметров — /settings без аргументов)</ansiyellow>"
-        ))
+        print_formatted_text(HTML(f"<ansiyellow>{t('usage_settings')}</ansiyellow>"))
         return
     key, value = parts
     resp = await _client.request("settings", action="set", key=key, value=value,
                                   timeout=SETTINGS_SET_TIMEOUT)
     if not resp.get("ok"):
         print_formatted_text(HTML(
-            f"<ansired>Не удалось применить: {_safe(resp.get('error', ''))}</ansired>"
+            f"<ansired>{t('err_settings_apply_failed', error=_safe(resp.get('error', '')))}</ansired>"
         ))
         return
     print_formatted_text(HTML(
-        f"<ansigreen>✓ {_safe(key)} = {_safe(str(resp['value']))}</ansigreen> "
-        "<ansigray>(некоторые параметры требуют /reboot, чтобы вступить в силу)</ansigray>"
+        t("settings_applied", key=_safe(key), value=_safe(str(resp['value'])))
     ))
 
 
@@ -1612,71 +1549,32 @@ async def _cmd_reboot(args: str) -> None:
     global _reboot_confirm_deadline
     arg = args.strip().lower()
     if arg not in ("", "confirm"):
-        print_formatted_text(HTML(
-            "<ansiyellow>Использование: /reboot — предупреждение, "
-            "/reboot confirm — подтвердить перезагрузку</ansiyellow>"
-        ))
+        print_formatted_text(HTML(f"<ansiyellow>{t('usage_reboot')}</ansiyellow>"))
         return
 
     now = _loop.time()
     if arg == "confirm":
         if _reboot_confirm_deadline is None or now > _reboot_confirm_deadline:
-            print_formatted_text(HTML(
-                "<ansiyellow>Нет ожидающего подтверждения — сначала наберите /reboot</ansiyellow>"
-            ))
+            print_formatted_text(HTML(f"<ansiyellow>{t('err_no_pending_confirm')}</ansiyellow>"))
             return
         _reboot_confirm_deadline = None
         resp = await _client.request("reboot")
         if not resp.get("ok"):
             print_formatted_text(HTML(
-                f"<ansired>Не удалось перезагрузить: {_safe(resp.get('error', ''))}</ansired>"
+                f"<ansired>{t('err_reboot_failed_client', error=_safe(resp.get('error', '')))}</ansired>"
             ))
             return
-        print_formatted_text(HTML(
-            "<ansigreen>🔄 Узел перезагружается — соединение на секунду оборвётся, "
-            "логгер переподключится сам</ansigreen>"
-        ))
+        print_formatted_text(HTML(f"<ansigreen>{t('reboot_rebooting')}</ansigreen>"))
         return
 
     _reboot_confirm_deadline = now + REBOOT_CONFIRM_WINDOW
     print_formatted_text(HTML(
-        f"<ansiyellow>⚠ Это перезагрузит устройство (пригодится и после /settings — "
-        f"часть параметров вступает в силу только после перезапуска). Подтвердите: "
-        f"<b>/reboot confirm</b> — окно {int(REBOOT_CONFIRM_WINDOW)}с</ansiyellow>"
+        f"<ansiyellow>{t('reboot_warn', window=int(REBOOT_CONFIRM_WINDOW))}</ansiyellow>"
     ))
 
 
 def _cmd_help() -> None:
-    lines = [
-        "─── Команды ───────────────────────────────────────────────",
-        "  /nodes [online|names|hops]  список видимых узлов (сортировка, по умолчанию online)",
-        "  /who                 информация о себе",
-        "  /dm &lt;имя&gt; &lt;текст&gt;   личное сообщение (имя с пробелами — в кавычках)",
-        "  /reply               список недавних сообщений, на которые можно ответить",
-        "  /reply &lt;текст&gt;       ответ (с цитатой) на последнее полученное сообщение",
-        "  /reply #N &lt;текст&gt;    ответ на сообщение №N из списка /reply",
-        "  /react &lt;эмодзи&gt;      реакция (tapback) на последнее сообщение",
-        "  /react #N &lt;эмодзи&gt;   реакция на сообщение №N из списка /reply",
-        "  /ch [имя|all]        показать/сменить канал",
-        "  /send &lt;канал&gt; &lt;текст&gt; разовая отправка в канал без переключения сессии",
-        "  /search &lt;текст&gt;     поиск по истории (учитывает текущий канал)",
-        "  /last &lt;имя&gt;         последние сообщения узла (точное имя, короткое или полное)",
-        "  /stats [день|узел]   статистика по истории переписки",
-        "  /trace &lt;имя&gt;        маршрут пакетов до узла (traceroute)",
-        "  /ping &lt;имя&gt;         время доставки (RTT) и число хопов до узла",
-        "  /pos &lt;имя&gt;          позиция узла, расстояние и азимут от меня",
-        "  /mute &lt;имя&gt;         скрыть сообщения узла из чата (история — всё ещё в /search)",
-        "  /unmute [имя]        снять мьют (без аргумента — список замьюченных)",
-        "  /updatenames         подтянуть имена узлов с OneMesh (и так — раз в 30 мин фоном)",
-        "  /settings [параметр значение]  настройки локального узла (см. SETTINGS.ru.md)",
-        "  /botping 0|1         бот в канале Ping: отвечает хопами до отправителя",
-        "  /reboot             перезагрузить узел (требует /reboot confirm)",
-        "  /clear               очистить экран",
-        "  /help                эта справка",
-        "  Tab                  автодополнение команд, имён узлов и каналов",
-        "────────────────────────────────────────────────────────────",
-    ]
-    for line in lines:
+    for line in t_list("help_lines"):
         print_formatted_text(HTML(f"<ansiwhite>{line}</ansiwhite>"))
 
 
@@ -1708,7 +1606,7 @@ async def _handle_command(text: str) -> None:
     elif cmd == "help":        _cmd_help()
     else:
         print_formatted_text(HTML(
-            f"<ansiyellow>Неизвестная команда /{_safe(cmd)}. Введите /help</ansiyellow>"
+            f"<ansiyellow>{t('unknown_command', cmd=_safe(cmd))}</ansiyellow>"
         ))
 
 
@@ -1722,8 +1620,7 @@ async def main() -> None:
 
     if not SOCKET_PATH.exists():
         print_formatted_text(HTML(
-            f"<ansired>Логгер не запущен ({SOCKET_PATH} не найден). "
-            f"Запустите mesh_logger.py (или systemctl start mesh-logger).</ansired>"
+            f"<ansired>{t('err_logger_not_running', socket=SOCKET_PATH)}</ansired>"
         ))
         sys.exit(1)
 
@@ -1733,7 +1630,7 @@ async def main() -> None:
         await _client.connect()
     except Exception as e:
         print_formatted_text(HTML(
-            f"<ansired>Не удалось подключиться к логгеру: {_safe(str(e))}</ansired>"
+            f"<ansired>{t('err_logger_connect_failed', error=_safe(str(e)))}</ansired>"
         ))
         sys.exit(1)
 
@@ -1743,12 +1640,11 @@ async def main() -> None:
         _client.whoami = (who["long_name"], who["short_name"])
         _client.whoami_id = who["node_id"]
         print_formatted_text(HTML(
-            f"<b><ansigreen>Подключено к логгеру.</ansigreen></b> "
-            f"Узел: <ansicyan>{_safe(who['long_name'])} ({_safe(who['short_name'])})</ansicyan>"
+            f"<b><ansigreen>{t('connected_banner', ln=_safe(who['long_name']), sn=_safe(who['short_name']))}</ansigreen></b>"
         ))
     else:
         print_formatted_text(HTML(
-            "<ansiyellow>Логгер работает, но устройство пока не подключено</ansiyellow>"
+            f"<ansiyellow>{t('device_not_connected_yet')}</ansiyellow>"
         ))
 
     if _channel_filter is not None:
@@ -1764,26 +1660,23 @@ async def main() -> None:
             # real off the "device: connected" event.
             _channel_resolved = False
             print_formatted_text(HTML(
-                f"<ansiyellow>Канал '{_safe(_channel_filter)}' пока не проверить — устройство "
-                "не подключено. Приму как есть и уточню, когда оно выйдет на связь "
-                "(отправка пока — в Primary)</ansiyellow>"
+                f"<ansiyellow>{t('channel_pending_msg', name=_safe(_channel_filter))}</ansiyellow>"
             ))
         elif not match:
-            available = ", ".join(c["name"] for c in channels) or "нет данных"
+            available = ", ".join(c["name"] for c in channels) or t("no_data")
             print_formatted_text(HTML(
-                f"<ansired>Канал '{_safe(_channel_filter)}' не найден. "
-                f"Доступные каналы: {_safe(available)}</ansired>"
+                f"<ansired>{t('err_channel_not_found_startup', name=_safe(_channel_filter), available=_safe(available))}</ansired>"
             ))
             sys.exit(1)
         else:
             _channel_index = match["index"]
             _channel_filter = match["name"]
             print_formatted_text(HTML(
-                f"<b><ansicyan>Канал: {_safe(_channel_filter)}</ansicyan></b>"
+                f"<b><ansicyan>{t('channel_banner', name=_safe(_channel_filter))}</ansicyan></b>"
             ))
     else:
         print_formatted_text(HTML(
-            "<ansiwhite>Показываю сообщения со всех каналов (отправка — в Primary)</ansiwhite>"
+            f"<ansiwhite>{t('all_channels_banner')}</ansiwhite>"
         ))
 
     _print_initial_history(history_size)
@@ -1797,7 +1690,7 @@ async def main() -> None:
     asyncio.create_task(_periodic_cache_reload())
     session = PromptSession(completer=MeshCompleter(), complete_while_typing=False)
     print_formatted_text(HTML(
-        "\n<ansiwhite>Сообщение или /help. Ctrl+C / Ctrl+D — выход.</ansiwhite>\n"
+        f"\n<ansiwhite>{t('startup_hint')}</ansiwhite>\n"
     ))
 
     with patch_stdout():
@@ -1813,7 +1706,7 @@ async def main() -> None:
                         await _handle_command(text)
                     except Exception as e:
                         print_formatted_text(HTML(
-                            f"<ansired>Ошибка команды: {_safe(str(e))}</ansired>"
+                            f"<ansired>{t('err_command_failed', error=_safe(str(e)))}</ansired>"
                         ))
                     continue
 
@@ -1823,7 +1716,7 @@ async def main() -> None:
             except (KeyboardInterrupt, EOFError):
                 break
 
-    print_formatted_text(HTML("\n<ansiwhite>Отключение...</ansiwhite>"))
+    print_formatted_text(HTML(f"\n<ansiwhite>{t('disconnecting')}</ansiwhite>"))
     await _client.close()
 
 

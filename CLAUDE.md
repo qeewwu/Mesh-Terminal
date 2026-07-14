@@ -117,6 +117,51 @@ identity instead of needing manual upkeep. `PING_CHANNEL_NAME` exists for the pi
 and auto-ping features (see below) to agree on which channel is "the" ping channel without
 hardcoding its name.
 
+### Interface language (`mesh_i18n.py`)
+
+`LANG` (`MESH_LANG` in `.env`, `ru`|`en`, default `ru`) is read once at import in
+`mesh_common.py` next to `HOST`/`CONN_TYPE` — same lifecycle as every other env key, so changing
+it requires restarting both processes. `mesh_common.py` deliberately does **not** import
+`mesh_i18n` (that would be circular, since `mesh_i18n` imports `LANG` from it) — this also keeps
+the log-format module free of UI concerns.
+
+`mesh_i18n.py` is a flat pair of dicts (`_RU`, `_EN`), not a gettext/`.po` setup — this is a
+two-language personal project, not a framework, and a dict pair is easier to diff and keep in
+sync than a translation-file pipeline. `t(key, **kwargs)` looks up the active-language template
+and calls `.format(**kwargs)`; a key missing from the active table falls back to `_RU`, then to
+the key itself — the TUI must never raise over a missing translation. `t_list(key)` is the same
+for list-valued keys (currently only `help_lines`, kept as one full list per language rather than
+atomized per line, since `/help`'s column alignment is something you want to eyeball as a whole
+block per language). `plural(key, n)` renders `"{n} {word}"` from a per-key forms tuple — 2 forms
+(singular/plural) for English, 3 for Russian (the real `n%100`/`n%10` grammatical rule, not the
+`2 <= n <= 4` shortcut that used to be inlined three times in `mesh_chat.py` and once in
+`mesh_logger.py`).
+
+Convention carried over unchanged from the pre-i18n f-strings: templates hold the prompt_toolkit
+HTML markup (`<ansired>`, literal `<b>`, pre-escaped `&lt;name&gt;`) and are trusted; every
+interpolated *value* is `_safe()`-escaped by the caller before being passed as a kwarg to `t()`.
+
+**The log line format is never localized** — `format_message_line`/`format_quote_line`/
+`parse_log_line`, channel names, and the `DM `/`DM → ` tags stay exactly as they were before
+`MESH_LANG` existed, regardless of which language the UI is in. `test_mesh_i18n.py`'s key/
+placeholder-parity tests guard the string tables themselves; the log format's own invariant is
+still guarded the usual way, by `test_mesh_common.py`'s round-trip tests never touching
+`mesh_i18n`. `BOTPING_MARKER` (`"🤖"`) and the other bare status glyphs (`🏓 ✓ ✗ ⏳`, the `───`
+rule characters) are deliberately *not* looked up per-language — `BOTPING_MARKER` in particular
+is the loop-prevention protocol between nodes (see Ping-channel bot below), so a `ru` node and an
+`en` node must still recognize each other's bot replies by the same prefix.
+
+`compass_point()` (`/pos`'s bearing labels) is the one localized string that lives outside
+`mesh_i18n.py`, in `mesh_common.py` itself, purely because of the import direction above — it
+takes an optional `lang` parameter (defaulting to the module-level `LANG`) so tests can pin both
+languages without touching `.env`.
+
+Input parsing stays bilingual regardless of `MESH_LANG` — accepting input in either language costs
+nothing and avoids surprising a user who's used to typing `да`/`нет`: `_parse_setting_value`'s
+bool parser (`да`/`нет`/`вкл`/`выкл` alongside `yes`/`no`/`on`/`off`), `/ch`'s `all`/`*`/`все`, and
+`/stats`'s `день`/`дни`/`узел`/`узлы` alongside `day`/`days`/`node`/`nodes`. Only the *output*
+(prompts, confirmations, tab-completion candidates) follows `MESH_LANG`.
+
 ### IPC protocol (mesh_logger.py ⇄ mesh_chat.py)
 
 Newline-delimited JSON over the Unix socket, in `mesh_logger.py`'s `_handle_client`. Two message
@@ -395,7 +440,8 @@ the same `parse_env_file(ENV_FILE)` call used for `HOST`/`PING_CHANNEL_NAME`.
 
 ### Auto-ping health check
 
-`_periodic_autoping()` broadcasts "🏓 автопинг: проверка связи" into `PING_CHANNEL_NAME` every
+`_periodic_autoping()` broadcasts `t("autoping_text")` (`"🏓 автопинг: проверка связи"` / `"🏓
+autoping: link check"`, see Interface language above) into `PING_CHANNEL_NAME` every
 `AUTOPING_INTERVAL` (2h), unconditionally — independent of `/botping`'s toggle. It's a liveness
 canary (is the mesh link actually carrying traffic), not the reply-bot, so it isn't gated by
 `_botping_enabled`. Sleeps first (doesn't fire immediately on a logger restart, so a crash-loop

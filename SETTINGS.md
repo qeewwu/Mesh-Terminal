@@ -5,7 +5,8 @@
 `/settings` with no arguments shows the current values. `/settings <key> <value>` changes one
 setting and writes it to the device immediately (`node.writeConfig(...)` in `mesh_logger.py`).
 This is the configuration of the **local node** — the one `mesh_logger.py` is connected to — not
-of any other node on the network.
+of any other node on the network. The parameter descriptions `/settings` prints follow `MESH_LANG`
+(see `.env`) — this file documents the English text.
 
 The list of settings is deliberately small and curated (see `SETTINGS_REGISTRY` in
 `mesh_logger.py`), not generic access to an arbitrary protobuf field. Reasons:

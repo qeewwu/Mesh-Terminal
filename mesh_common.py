@@ -71,6 +71,13 @@ CONN_TYPE = _ENV.get("MESH_CONN_TYPE", "wifi").strip().lower()
 USB_PORT = _ENV.get("MESH_USB_PORT", "").strip() or None
 BLE_ADDRESS = _ENV.get("MESH_BLE_ADDRESS", "").strip() or None
 PING_CHANNEL_NAME = _ENV.get("PING_CHANNEL", "Ping")
+# interface language for mesh_i18n.py (ru|en, default ru — unchanged behavior
+# for existing users). Read here, not in mesh_i18n.py itself, to avoid a
+# circular import (mesh_i18n imports LANG from this module); mesh_common must
+# never import mesh_i18n back, since the log format it owns is never localized.
+LANG = _ENV.get("MESH_LANG", "ru").strip().lower()
+if LANG not in ("ru", "en"):
+    LANG = "ru"
 LOG_DIR = BASE_DIR / "logs"
 SOCKET_PATH = Path("/tmp/mesh_chat.sock")
 BROADCAST_ADDR = 0xFFFFFFFF
@@ -219,8 +226,10 @@ def parse_log_line(line: str):
 # ── geo helpers (used by mesh_chat.py's /pos) ─────────────────────────────────
 
 _EARTH_RADIUS_KM = 6371.0088
-_COMPASS_POINTS = ["С", "ССВ", "СВ", "ВСВ", "В", "ВЮВ", "ЮВ", "ЮЮВ",
-                   "Ю", "ЮЮЗ", "ЮЗ", "ЗЮЗ", "З", "ЗСЗ", "СЗ", "ССЗ"]
+_COMPASS_POINTS_RU = ["С", "ССВ", "СВ", "ВСВ", "В", "ВЮВ", "ЮВ", "ЮЮВ",
+                      "Ю", "ЮЮЗ", "ЮЗ", "ЗЮЗ", "З", "ЗСЗ", "СЗ", "ССЗ"]
+_COMPASS_POINTS_EN = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+                      "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -240,5 +249,9 @@ def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return (math.degrees(math.atan2(x, y)) + 360) % 360
 
 
-def compass_point(deg: float) -> str:
-    return _COMPASS_POINTS[round(deg / 22.5) % 16]
+def compass_point(deg: float, lang: str | None = None) -> str:
+    """`lang` defaults to the module-level LANG (set from MESH_LANG); an
+    explicit override exists only so tests can pin both languages without
+    touching the environment."""
+    points = _COMPASS_POINTS_EN if (lang or LANG) == "en" else _COMPASS_POINTS_RU
+    return points[round(deg / 22.5) % 16]

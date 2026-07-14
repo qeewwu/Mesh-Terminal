@@ -225,13 +225,24 @@ class TestGeoHelpers(unittest.TestCase):
         self.assertAlmostEqual(bearing_deg(0, 0, 0, 1), 90.0, places=3)
 
     def test_compass_point_cardinals(self):
-        self.assertEqual(compass_point(0), "С")
-        self.assertEqual(compass_point(90), "В")
-        self.assertEqual(compass_point(180), "Ю")
-        self.assertEqual(compass_point(270), "З")
+        self.assertEqual(compass_point(0, lang="ru"), "С")
+        self.assertEqual(compass_point(90, lang="ru"), "В")
+        self.assertEqual(compass_point(180, lang="ru"), "Ю")
+        self.assertEqual(compass_point(270, lang="ru"), "З")
 
     def test_compass_point_wraps_around(self):
-        self.assertEqual(compass_point(359), "С")
+        self.assertEqual(compass_point(359, lang="ru"), "С")
+
+    def test_compass_point_cardinals_en(self):
+        self.assertEqual(compass_point(0, lang="en"), "N")
+        self.assertEqual(compass_point(90, lang="en"), "E")
+        self.assertEqual(compass_point(180, lang="en"), "S")
+        self.assertEqual(compass_point(270, lang="en"), "W")
+
+    def test_compass_point_both_lists_have_16_entries(self):
+        from mesh_common import _COMPASS_POINTS_EN, _COMPASS_POINTS_RU
+        self.assertEqual(len(_COMPASS_POINTS_RU), 16)
+        self.assertEqual(len(_COMPASS_POINTS_EN), 16)
 
 
 class TestUnparseable(unittest.TestCase):
