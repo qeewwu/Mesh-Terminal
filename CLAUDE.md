@@ -40,9 +40,13 @@ There is no build step or linter. Tests (pure stdlib, no device needed):
 
 ```bash
 python3 -m unittest test_mesh_common -v
+python3 -m unittest test_mesh_i18n -v
 ```
 
-Run them after any change to the log line format or parser in `mesh_common.py`.
+Run `test_mesh_common` after any change to the log line format or parser in `mesh_common.py`.
+Run `test_mesh_i18n` after any change to `mesh_i18n.py` — it guards key/placeholder parity
+between `_RU`/`_EN`, but note it does **not** catch a `t()` call whose kwarg name collides with
+`t`'s own `key` parameter (see Fixed bugs below); that class of bug only surfaces at call time.
 
 ## Architecture
 
@@ -823,6 +827,25 @@ multi-word argument — `args.split(None, 1)` already keeps the whole rest of th
 which is why it looked like an intermittent "node not found" rather than a deterministic bug.
 Fixed by stripping one surrounding `"..."` pair in `_find_node_in_list` itself, matching what the
 completer already assumed.
+
+### `t()` kwarg collision crashed `/settings <key> <value>`
+
+`t(key: str, **kwargs)` in `mesh_i18n.py` names its own first parameter `key` — the translation
+table key. Two call sites also passed a template placeholder named `key` as a kwarg:
+`t("settings_applied", key=_safe(key), ...)` in `mesh_chat.py` (the success message after
+applying a setting) and `t("err_unknown_param", key=key)` in `mesh_logger.py` (the error for an
+unrecognized `SETTINGS_REGISTRY` key). Both raised `TypeError: t() got multiple values for
+argument 'key'` at call time — Python matches a keyword argument to a same-named parameter before
+falling through to `**kwargs`, so passing `key=` again after `key` was already filled positionally
+is a hard conflict, not a shadowing. This meant **every** successful `/settings <key> <value>`
+(e.g. `/settings mqtt_downlink Primary:off`) crashed instead of confirming — the underlying
+`writeConfig()`/`writeChannel()` call had already succeeded on the device by the time the crash
+happened, just never reported back to the user. `test_mesh_i18n.py`'s placeholder-parity tests
+didn't catch it because the mismatch isn't between `_RU`/`_EN` (both used `{key}` symmetrically) —
+it only manifests when `t()` is actually called with that kwarg name. Fixed by renaming the
+placeholder to `{param}` in both language tables (`settings_applied`, `err_unknown_param`) and
+updating both call sites to pass `param=` instead of `key=`. No other `t()` call in the codebase
+uses a kwarg matching `t`'s own parameter name (verified by grep after the fix).
 
 ### Miscellaneous reliability
 

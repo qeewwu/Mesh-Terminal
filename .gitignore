@@ -222,3 +222,6 @@ onemesh_cache.json
 /logs/
 /service-logs/
 /backup/
+
+# Local scratch scripts — not part of the project
+/hops_bot.py

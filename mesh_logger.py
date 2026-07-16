@@ -1281,7 +1281,7 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                                 resp = {"req_id": req_id, "ok": True,
                                         "key": key, "value": new_val}
                             except KeyError:
-                                resp["error"] = t("err_unknown_param", key=key)
+                                resp["error"] = t("err_unknown_param", param=key)
                             except ValueError as e:
                                 resp["error"] = str(e)
                             except Exception as e:

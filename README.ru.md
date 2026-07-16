@@ -238,9 +238,11 @@ sudo systemctl restart mesh-logger
 
 ```
 mesh_common.py        общие константы и формат/парсер строк лога
+mesh_i18n.py           строки интерфейса (MESH_LANG)
 mesh_logger.py         фоновый демон: соединение с устройством + логи + IPC-сервер
 mesh_chat.py           интерактивный клиент: IPC-сокет + история + TUI
 test_mesh_common.py    тесты формата/парсера строк лога
+test_mesh_i18n.py      тесты mesh_i18n.py
 mesh-logger.service    пример systemd-юнита для mesh_logger.py
 ops/                   скрипты для бэкапа логов с сервера — см. CLAUDE.md
 SETTINGS.ru.md         полный справочник параметров /settings (англ. — SETTINGS.md)
@@ -252,6 +254,7 @@ logs/                  логи чата по дням, chat-YYYY-MM-DD.log
 
 ```bash
 python3 -m unittest test_mesh_common -v
+python3 -m unittest test_mesh_i18n -v
 ```
 
 ---

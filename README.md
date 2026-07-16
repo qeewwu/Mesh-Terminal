@@ -238,9 +238,11 @@ All settings live in `.env` (copy from `.env.example`); every key is optional an
 
 ```
 mesh_common.py        shared constants and log line format/parser
+mesh_i18n.py           interface language strings (MESH_LANG)
 mesh_logger.py         background daemon: device connection + logging + IPC server
 mesh_chat.py           interactive client: IPC socket + history + TUI
 test_mesh_common.py    tests for the log line format/parser
+test_mesh_i18n.py      tests for mesh_i18n.py
 mesh-logger.service    example systemd unit for mesh_logger.py
 ops/                   scripts for backing up logs off the server — see CLAUDE.md
 SETTINGS.md            full reference for /settings parameters (ru: SETTINGS.ru.md)
@@ -252,6 +254,7 @@ logs/                  daily chat logs, chat-YYYY-MM-DD.log
 
 ```bash
 python3 -m unittest test_mesh_common -v
+python3 -m unittest test_mesh_i18n -v
 ```
 
 ---

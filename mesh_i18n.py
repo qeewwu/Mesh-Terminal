@@ -66,7 +66,7 @@ _RU: dict[str, object] = {
     # -- mesh_logger.py: IPC handler errors -----------------------------------
     "err_outbox_full": "устройство офлайн, очередь исходящих переполнена",
     "err_traceroute_timeout": "узел не ответил (timeout)",
-    "err_unknown_param": "неизвестный параметр: {key}",
+    "err_unknown_param": "неизвестный параметр: {param}",
     "err_apply_failed": "не удалось применить: {error}",
     "err_reboot_failed": "не удалось перезагрузить: {error}",
     "err_reconnect_wifi_only": (
@@ -246,7 +246,7 @@ _RU: dict[str, object] = {
     ),
     "err_settings_apply_failed": "Не удалось применить: {error}",
     "settings_applied": (
-        "<ansigreen>✓ {key} = {value}</ansigreen> "
+        "<ansigreen>✓ {param} = {value}</ansigreen> "
         "<ansigray>(некоторые параметры требуют /reboot, чтобы вступить в силу)</ansigray>"
     ),
     "settings_doc": "SETTINGS.ru.md",
@@ -368,7 +368,7 @@ _EN: dict[str, object] = {
 
     "err_outbox_full": "device offline, outbox queue is full",
     "err_traceroute_timeout": "node didn't respond (timeout)",
-    "err_unknown_param": "unknown parameter: {key}",
+    "err_unknown_param": "unknown parameter: {param}",
     "err_apply_failed": "failed to apply: {error}",
     "err_reboot_failed": "failed to reboot: {error}",
     "err_reconnect_wifi_only": (
@@ -524,7 +524,7 @@ _EN: dict[str, object] = {
     ),
     "err_settings_apply_failed": "Failed to apply: {error}",
     "settings_applied": (
-        "<ansigreen>✓ {key} = {value}</ansigreen> "
+        "<ansigreen>✓ {param} = {value}</ansigreen> "
         "<ansigray>(some settings require /reboot to take effect)</ansigray>"
     ),
     "settings_doc": "SETTINGS.md",

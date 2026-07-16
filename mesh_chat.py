@@ -1532,7 +1532,7 @@ async def _cmd_settings(args: str) -> None:
         ))
         return
     print_formatted_text(HTML(
-        t("settings_applied", key=_safe(key), value=_safe(str(resp['value'])))
+        t("settings_applied", param=_safe(key), value=_safe(str(resp['value'])))
     ))
 
 
